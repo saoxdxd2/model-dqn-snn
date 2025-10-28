@@ -11,6 +11,8 @@ from models.common import trunc_normal_init_
 from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 from models.dqn_utils import compute_epsilon, select_action_epsilon_greedy
+from models.q_heads import create_q_head
+from models.memory_bank import AssociativeMemoryBank
 
 IGNORE_LABEL_ID = -100
 
@@ -31,7 +33,6 @@ class TinyRecursiveReasoningModel_ACTV1Carry:
     
     # DQN tracking
     prev_accuracy: Optional[torch.Tensor] = None
-    no_improvement_counter: Optional[torch.Tensor] = None
     training_step: int = 0  # Global training step for epsilon decay
 
 
@@ -78,12 +79,25 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     dqn_epsilon_start: float = 0.5
     dqn_epsilon_end: float = 0.05
     dqn_epsilon_decay_steps: int = 100000
-    reward_accuracy_scale: float = 10.0
-    reward_step_penalty: float = 0.02
-    reward_terminal_correct: float = 10.0
-    reward_terminal_incorrect: float = -5.0
-    reward_stagnation_penalty: float = 0.1
-    reward_stagnation_threshold: int = 3
+    
+    # Simplified Reward Shaping (3 parameters)
+    reward_step_penalty: float = 0.01
+    reward_terminal_correct: float = 1.0
+    reward_terminal_incorrect: float = -0.5
+    
+    # Q-Head Architecture
+    q_head_type: str = "mlp"  # Options: "mlp", "rnn", "mini_attention"
+    q_head_hidden_size: int = 128  # Hidden size for RNN/attention Q-head
+    q_head_num_layers: int = 1  # Number of RNN layers or attention heads
+
+    # Memory Bank Configuration
+    enable_memory: bool = False
+    memory_capacity: int = 4096
+    memory_num_heads: int = 8
+    memory_dropout: float = 0.1
+    memory_reward_bonus: float = 0.5
+    memory_reward_threshold: float = 0.05  # Match YAML default
+
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -151,11 +165,13 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
         self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
+        
+        # Q-head: Configurable architecture (MLP/RNN/Mini-Attention)
+        self.q_head = create_q_head(self.config)
         
         # DQN: Target network for stable Q-learning
         if self.config.enable_dqn:
-            self.q_head_target = CastedLinear(self.config.hidden_size, 2, bias=True)
+            self.q_head_target = create_q_head(self.config)
             self.q_head_target.load_state_dict(self.q_head.state_dict())
             # Freeze target network
             for param in self.q_head_target.parameters():
@@ -180,15 +196,19 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # Reasoning Layers
         self.L_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
 
+        # Memory Bank (optional)
+        self.memory = None
+        if self.config.enable_memory:
+            self.memory = AssociativeMemoryBank(
+                capacity=self.config.memory_capacity,
+                hidden_size=self.config.hidden_size,
+                num_heads=self.config.memory_num_heads,
+                dropout=self.config.memory_dropout
+            )
+
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-
-        # Q head special init
-        # Init Q to (almost) zero for faster learning during bootstrapping
-        with torch.no_grad():
-            self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)  # type: ignore
 
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
@@ -235,15 +255,35 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # Forward iterations
         it = 0
         z_H, z_L = carry.z_H, carry.z_L
+        
         # H_cycles-1 without grad
         with torch.no_grad():
             for _H_step in range(self.config.H_cycles-1):
+                # Dynamic memory query at each H-cycle (based on current z_H state)
+                memory_content = None
+                if self.memory is not None:
+                    memory_content = self.memory.read(z_H[:, 0])  # [batch, hidden_size]
+                    memory_content = memory_content.unsqueeze(1)  # [batch, 1, hidden_size]
+                
+                # L-cycles with memory-enhanced input
                 for _L_step in range(self.config.L_cycles):
-                    z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+                    h_input = z_H + input_embeddings
+                    if memory_content is not None:
+                        h_input = h_input + memory_content
+                    z_L = self.L_level(z_L, h_input, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
-        # 1 with grad
+        
+        # Final H-cycle with grad
+        memory_content = None
+        if self.memory is not None:
+            memory_content = self.memory.read(z_H[:, 0])  # [batch, hidden_size]
+            memory_content = memory_content.unsqueeze(1)  # [batch, 1, hidden_size]
+        
         for _L_step in range(self.config.L_cycles):
-            z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
+            h_input = z_H + input_embeddings
+            if memory_content is not None:
+                h_input = h_input + memory_content
+            z_L = self.L_level(z_L, h_input, **seq_info)
         z_H = self.L_level(z_H, z_L, **seq_info)
 
         # LM Outputs
@@ -279,7 +319,6 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             
             # DQN tracking
             prev_accuracy=torch.zeros((batch_size, ), dtype=torch.float32, device=device) if self.config.enable_dqn else None,
-            no_improvement_counter=torch.zeros((batch_size, ), dtype=torch.int32, device=device) if self.config.enable_dqn else None,
             training_step=0
         )
         
@@ -292,13 +331,19 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
+        # Reset RNN Q-head state for halted sequences (prevents contamination)
+        if hasattr(self.inner.q_head, 'reset_hidden') and carry.halted.any():
+            batch_size = batch["inputs"].shape[0]
+            self.inner.q_head.reset_hidden(batch_size, mask=carry.halted)
+
         # Forward inner model
         new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
 
         outputs = {
             "logits": logits,
             "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits
+            "q_continue_logits": q_continue_logits,
+            "z_H": new_inner_carry.z_H  # Needed for memory bank writing
         }
 
         with torch.no_grad():
@@ -344,8 +389,8 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
         # Update DQN tracking fields if enabled
         new_prev_accuracy = carry.prev_accuracy
-        new_no_improvement_counter = carry.no_improvement_counter
-        new_training_step = carry.training_step
+        # Increment training_step for epsilon decay (done here, not in losses)
+        new_training_step = carry.training_step + 1 if self.config.enable_dqn else carry.training_step
         
         return TinyRecursiveReasoningModel_ACTV1Carry(
             new_inner_carry, 
@@ -353,6 +398,5 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             halted, 
             new_current_data,
             prev_accuracy=new_prev_accuracy,
-            no_improvement_counter=new_no_improvement_counter,
             training_step=new_training_step
         ), outputs

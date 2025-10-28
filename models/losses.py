@@ -8,7 +8,6 @@ import math
 from models.replay_buffer import DQNReplayBuffer
 from models.dqn_utils import (
     RunningStats,
-    compute_shaped_reward,
     soft_update_target_network,
 )
 
@@ -130,36 +129,60 @@ class ACTLossHead(nn.Module):
             # Get previous accuracy from carry (or initialize to 0)
             prev_accuracy = new_carry.prev_accuracy if new_carry.prev_accuracy is not None else torch.zeros_like(curr_accuracy)
             
-            # Update no improvement counter
-            improvement = (curr_accuracy > prev_accuracy).long()
-            if new_carry.no_improvement_counter is not None:
-                no_improvement_counter = torch.where(improvement > 0, torch.zeros_like(new_carry.no_improvement_counter), new_carry.no_improvement_counter + 1)
-            else:
-                no_improvement_counter = torch.zeros_like(new_carry.steps)
+            # Simplified reward: accuracy improvement - step penalty
+            # r = Δacc - λ (where λ = 0.01, meaning 1 step = 1% accuracy trade-off)
+            accuracy_improvement = curr_accuracy - prev_accuracy
+            step_penalty = self.model.config.reward_step_penalty
             
-            # Compute shaped rewards
-            rewards = compute_shaped_reward(
-                prev_accuracy=prev_accuracy,
-                curr_accuracy=curr_accuracy,
-                step=new_carry.steps,
-                max_steps=self.model.config.halt_max_steps,
-                is_terminal=new_carry.halted,
-                seq_is_correct=seq_is_correct,
-                no_improvement_counter=no_improvement_counter,
-                reward_accuracy_scale=self.model.config.reward_accuracy_scale,
-                reward_step_penalty=self.model.config.reward_step_penalty,
-                reward_terminal_correct=self.model.config.reward_terminal_correct,
-                reward_terminal_incorrect=self.model.config.reward_terminal_incorrect,
-                reward_stagnation_penalty=self.model.config.reward_stagnation_penalty,
-                reward_stagnation_threshold=self.model.config.reward_stagnation_threshold,
+            # Terminal bonus for correct final answers
+            terminal_bonus = torch.where(
+                new_carry.halted,
+                torch.where(
+                    seq_is_correct,
+                    self.model.config.reward_terminal_correct * (self.model.config.halt_max_steps - new_carry.steps).float() / self.model.config.halt_max_steps,
+                    torch.full_like(curr_accuracy, self.model.config.reward_terminal_incorrect)
+                ),
+                torch.zeros_like(curr_accuracy)
             )
             
-            # Normalize rewards
+            # Memory bonus (if enabled)
+            memory_bonus = torch.zeros_like(curr_accuracy)
+            if self.model.config.enable_memory and self.model.inner.memory is not None:
+                # Store states with positive improvement in memory
+                # Use carry state (will be read in next forward pass) for temporal alignment
+                with torch.no_grad():
+                    # Only write states that actually improved
+                    positive_improvement = accuracy_improvement.clamp(min=0)
+                    self.model.inner.memory.write(
+                        state=new_carry.inner_carry.z_H[:, 0],  # Use carry state, not output
+                        reward=positive_improvement,  # Only positive improvements
+                        threshold=self.model.config.memory_reward_threshold
+                    )
+                
+                # Reward bonus for memory-assisted improvements
+                memory_bonus = torch.where(
+                    accuracy_improvement > 0,
+                    torch.full_like(curr_accuracy, self.model.config.memory_reward_bonus),
+                    torch.zeros_like(curr_accuracy)
+                )
+            
+            rewards = accuracy_improvement - step_penalty + terminal_bonus + memory_bonus
+            
+            # Normalize rewards for stability
             self.reward_stats.update(rewards.detach())
-            normalized_rewards = rewards  # Keep unnormalized for now
+            normalized_rewards = self.reward_stats.normalize(rewards) if self.reward_stats.count > 100 else rewards
             
             # Store transitions in replay buffer
             self._store_transitions(model_kwargs.get('carry'), new_carry, outputs, normalized_rewards)
+            
+            # Compute epsilon for current step
+            from models.dqn_utils import compute_epsilon
+            current_epsilon = compute_epsilon(
+                new_carry.training_step,
+                self.model.config.dqn_epsilon_start,
+                self.model.config.dqn_epsilon_end,
+                self.model.config.dqn_epsilon_decay_steps
+            )
             
             # Train DQN if buffer is ready
             if len(self.replay_buffer) >= self.model.config.dqn_buffer_min_size:
@@ -174,17 +197,23 @@ class ACTLossHead(nn.Module):
                     tau=self.model.config.dqn_target_tau
                 )
             
-            # Update carry with new tracking values
+            # Update carry with new tracking values (training_step incremented in TRM forward)
             new_carry.prev_accuracy = curr_accuracy
-            new_carry.no_improvement_counter = no_improvement_counter
-            new_carry.training_step = new_carry.training_step + 1
             
             self.dqn_step_counter += 1
             
             # Additional DQN metrics
             metrics["dqn_reward_mean"] = rewards.mean().detach()
             metrics["dqn_reward_std"] = rewards.std().detach()
-            metrics["dqn_epsilon"] = compute_shaped_reward.__code__.co_consts[0] if hasattr(self, '_last_epsilon') else 0.0
+            metrics["dqn_epsilon"] = current_epsilon
+            metrics["dqn_accuracy_improvement"] = accuracy_improvement.mean().detach()
+            
+            # Memory bank metrics (if enabled)
+            if self.model.config.enable_memory and self.model.inner.memory is not None:
+                memory_stats = self.model.inner.memory.get_memory_stats()
+                metrics["memory_utilization"] = memory_stats['utilization']
+                metrics["memory_active_slots"] = memory_stats['active_slots']
+                metrics["memory_bonus_mean"] = memory_bonus.mean().detach()
         
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}

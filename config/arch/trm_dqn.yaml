@@ -48,17 +48,31 @@ dqn_epsilon_start: 0.5   # Conservative start (not 1.0)
 dqn_epsilon_end: 0.05
 dqn_epsilon_decay_steps: 100000
 
-# Reward Shaping (Manually Tuned)
-reward_accuracy_scale: 10.0        # +10 per 100% accuracy improvement
-reward_step_penalty: 0.02          # -0.02 per step (encourage efficiency)
-reward_terminal_correct: 10.0      # +10 for correct final answer
-reward_terminal_incorrect: -5.0    # -5 for incorrect early halt
-reward_stagnation_penalty: 0.1     # -0.1 per step without improvement
-reward_stagnation_threshold: 3     # Stagnation kicks in after 3 steps
+# Reward Shaping (Simplified - 3 parameters)
+reward_step_penalty: 0.01          # -0.01 per step (1 step = 1% accuracy trade-off)
+reward_terminal_correct: 1.0       # +1.0 bonus for correct halt, scaled by efficiency
+reward_terminal_incorrect: -0.5    # -0.5 penalty for incorrect early halt
+
+# Q-Head Architecture (Training vs Inference)
+q_head_type: "rnn"  # Options: "mlp" (default), "rnn" (better temporal), "mini_attention"
+q_head_hidden_size: 128  # Hidden size for RNN/attention Q-head
+q_head_num_layers: 1     # Number of RNN layers or attention heads
+
+# Memory Bank Configuration
+enable_memory: True       # Enable associative memory for pattern reuse
+memory_capacity: 4096     # Number of memory slots (increased from 512)
+memory_num_heads: 8       # Multi-head attention for memory retrieval
+memory_dropout: 0.1       # Dropout for memory attention
+memory_reward_bonus: 0.5  # Reward bonus for memory-assisted improvements
+memory_reward_threshold: 0.05  # Minimum improvement (5%) to store in memory
+
+# Export Configuration (for CPU inference)
+export_to_snn: False     # Convert Q-head to Spiking Neural Network
+export_to_bnn: False     # Convert Q-head to Binary Neural Network (1-bit weights)
 
 # Notes:
-# - This config enables DQN-based halting with experience replay and target network
-# - Epsilon starts at 0.5 (conservative) and decays to 0.05 over 100K steps
-# - Rewards are manually tuned for ARC-AGI puzzles
-# - All other parameters identical to baseline trm.yaml
-# - To disable DQN, set enable_dqn: False (reverts to original behavior)
+# - Train with dense MLP/RNN Q-head on GPU for stability
+# - Export to SNN/BNN for 10-100× energy efficiency on CPU/neuromorphic hardware
+# - Simplified reward: r = Δacc - 0.01*step + terminal_bonus
+# - Epsilon decay: 0.5 → 0.05 over 100K steps
+# - To disable DQN, set enable_dqn: False
