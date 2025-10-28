@@ -99,8 +99,19 @@ def compute_heuristic_difficulty(input_grid: np.ndarray, output_grid: np.ndarray
     scores['color_diversity'] = (unique_colors_in + unique_colors_out) / 20.0
     
     # Transformation complexity (how much changed)
-    diff = (input_grid != output_grid).sum() / input_grid.size
-    scores['transformation_magnitude'] = float(diff)
+    # Handle different sizes by comparing overlapping region only
+    min_h = min(input_grid.shape[0], output_grid.shape[0])
+    min_w = min(input_grid.shape[1], output_grid.shape[1])
+    if min_h > 0 and min_w > 0:
+        inp_crop = input_grid[:min_h, :min_w]
+        out_crop = output_grid[:min_h, :min_w]
+        diff = (inp_crop != out_crop).sum() / inp_crop.size
+    else:
+        diff = 1.0  # Completely different if no overlap
+    
+    # Add size difference as additional complexity
+    size_diff = abs(input_grid.size - output_grid.size) / max(input_grid.size, output_grid.size)
+    scores['transformation_magnitude'] = float(0.7 * diff + 0.3 * size_diff)
     
     # Pattern complexity (edge density)
     def edge_density(grid):
