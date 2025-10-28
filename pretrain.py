@@ -354,6 +354,12 @@ def evaluate(
 ):
     reduced_metrics = None
 
+    # Skip evaluation if no eval data
+    if eval_metadata is None:
+        if rank == 0:
+            print("Skipping evaluation: no eval data available")
+        return {}
+
     with torch.inference_mode():
         return_keys = set(config.eval_save_outputs)
         for evaluator in evaluators:
