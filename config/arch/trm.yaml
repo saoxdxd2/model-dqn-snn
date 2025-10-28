@@ -24,3 +24,32 @@ forward_dtype: bfloat16
 mlp_t: False # use mlp on L instead of transformer
 puzzle_emb_len: 16 # if non-zero, its specified to this value
 no_ACT_continue: True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+
+# DQN Halting Control
+enable_dqn: True
+dqn_buffer_capacity: 20000
+dqn_buffer_min_size: 5000
+dqn_batch_size: 256
+dqn_gamma: 0.99
+dqn_target_tau: 0.005  # Soft update rate for target network
+dqn_epsilon_start: 0.5
+dqn_epsilon_end: 0.05
+dqn_epsilon_decay_steps: 100000
+
+# Simplified Reward Shaping (aligned with training strategy)
+reward_step_penalty: 0.01  # 1 step = 1% accuracy trade-off
+reward_terminal_correct: 1.0
+reward_terminal_incorrect: -0.5
+
+# Q-Head Architecture
+q_head_type: mlp  # Options: mlp, rnn, mini_attention
+q_head_hidden_size: 128  # Hidden size for RNN/attention Q-head
+q_head_num_layers: 1  # Number of RNN layers or attention heads
+
+# Memory Bank Configuration
+enable_memory: True
+memory_capacity: 4096
+memory_num_heads: 8
+memory_dropout: 0.1
+memory_reward_bonus: 0.5
+memory_reward_threshold: 0.05

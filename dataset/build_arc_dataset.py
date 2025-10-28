@@ -251,7 +251,7 @@ def inverse_aug(name: str):
     return name.split(PuzzleIdSeparator)[0], _map_grid
 
 
-def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count: int, dest_mapping: Dict[str, Tuple[str, str]], use_scoring: bool = False):
+def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count: int, dest_mapping: Dict[str, Tuple[str, str]], use_scoring: bool = False, pre_generated_augmentations=None):
     # Convert
     dests = set(dest_mapping.values())
     converted = {dest: ARCPuzzle(name, []) for dest in dests}
@@ -277,19 +277,20 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
             }
             puzzle_metadata['original_scores'] = avg_scores
 
-    # Augment with CPU only
+    # Augment with pre-generated GPU augmentations or CPU fallback
     if aug_count > 0:
         hashes = {puzzle_hash(converted)}
+        batch_augs = None
         
-        # Try GPU batch augmentation first
-        if USE_GPU:
+        # Use pre-generated GPU augmentations if available
+        if pre_generated_augmentations is not None:
+            batch_augs = pre_generated_augmentations
+            # Already generated on GPU in main process, just use them
+        
+        # Process augmentations
+        if batch_augs is not None:
             try:
-                # Get examples from first destination (all dests have same examples structure)
                 first_dest = list(converted.values())[0]
-                examples = first_dest.examples
-                
-                # Generate batch augmentations on GPU
-                batch_augs = batch_augment_gpu(examples, aug_count * ARCAugmentRetriesFactor)
                 
                 if batch_augs is not None:
                     for aug_examples in batch_augs:
@@ -350,7 +351,7 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
 
 def convert_puzzle_wrapper(args):
     """Wrapper for parallel processing with SNN coordination."""
-    name, puzzle, aug_count, dest_mapping, train_examples_dest, test_examples_map, subset_name, idx, total_count, worker_id = args
+    name, puzzle, aug_count, dest_mapping, train_examples_dest, test_examples_map, subset_name, idx, total_count, worker_id, pre_generated_augs = args
     
     import time
     start_time = time.time()
@@ -369,8 +370,10 @@ def convert_puzzle_wrapper(args):
     if test_examples_dest[0] == "test":
         test_puzzles_local[name] = puzzle
     
-    # Process with timing for SNN feedback
-    metadata = convert_single_arc_puzzle(results_local, name, puzzle, aug_count, {"train": train_examples_dest, "test": test_examples_dest})
+    # Process with timing for SNN feedback (with pre-generated GPU augs)
+    metadata = convert_single_arc_puzzle(results_local, name, puzzle, aug_count, 
+                                        {"train": train_examples_dest, "test": test_examples_dest},
+                                        pre_generated_augmentations=pre_generated_augs)
     
     task_time = time.time() - start_time
     
@@ -416,8 +419,32 @@ def load_puzzles_arcagi(config: DataProcessConfig):
         puzzles = list(puzzles.items())
         np.random.shuffle(puzzles)
         
-        # Parallel processing with SNN coordination
-        print(f"\nProcessing {subset_name} subset ({len(puzzles)} puzzles) with {NUM_WORKERS} workers...")
+        # Pre-process augmentations on GPU in main process (before workers)
+        print(f"\nPre-generating augmentations on GPU for {subset_name} subset ({len(puzzles)} puzzles)...")
+        
+        gpu_augmented_puzzles = []
+        if USE_GPU and config.num_aug > 0:
+            from tqdm import tqdm as tqdm_gpu
+            for name, puzzle in tqdm_gpu(puzzles, desc=f"GPU augmentation {subset_name}"):
+                try:
+                    # Convert puzzle examples
+                    examples = [(arc_grid_to_np(ex["input"]), arc_grid_to_np(ex["output"])) 
+                               for ex in puzzle.get("train", [])]
+                    
+                    if len(examples) > 0:
+                        # Generate augmentations on GPU in main process
+                        batch_augs = batch_augment_gpu(examples, config.num_aug * ARCAugmentRetriesFactor)
+                        gpu_augmented_puzzles.append((name, puzzle, batch_augs))
+                    else:
+                        gpu_augmented_puzzles.append((name, puzzle, None))
+                except Exception as e:
+                    print(f"GPU aug failed for {name}: {e}")
+                    gpu_augmented_puzzles.append((name, puzzle, None))
+        else:
+            gpu_augmented_puzzles = [(name, puzzle, None) for name, puzzle in puzzles]
+        
+        # Now distribute pre-augmented data to workers
+        print(f"\nDistributing to {NUM_WORKERS} workers for final processing...")
         
         # Use SNN to assign tasks to workers
         if ENABLE_SNN_SCHEDULING:
@@ -439,11 +466,12 @@ def load_puzzles_arcagi(config: DataProcessConfig):
             # Round-robin fallback
             worker_assignments = [idx % NUM_WORKERS for idx in range(len(puzzles))]
         
-        # Prepare arguments with worker assignments
+        # Prepare arguments with pre-generated GPU augmentations
         process_args = [
             (name, puzzle, config.num_aug, {"train": train_examples_dest, "test": None},
-             train_examples_dest, test_examples_map, subset_name, idx, len(puzzles), worker_assignments[idx])
-            for idx, (name, puzzle) in enumerate(puzzles)
+             train_examples_dest, test_examples_map, subset_name, idx, len(gpu_augmented_puzzles), 
+             worker_assignments[idx], gpu_augs)  # Pass pre-generated augmentations
+            for idx, (name, puzzle, gpu_augs) in enumerate(gpu_augmented_puzzles)
         ]
         
         # Process in parallel

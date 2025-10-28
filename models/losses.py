@@ -129,36 +129,27 @@ class ACTLossHead(nn.Module):
             # Get previous accuracy from carry (or initialize to 0)
             prev_accuracy = new_carry.prev_accuracy if new_carry.prev_accuracy is not None else torch.zeros_like(curr_accuracy)
             
-            # Simplified reward: accuracy improvement - step penalty
-            # r = Δacc - λ (where λ = 0.01, meaning 1 step = 1% accuracy trade-off)
+            # Simplified reward: r = Δacc - 0.01*step + terminal_bonus
+            # (aligned with training strategy from memory)
             accuracy_improvement = curr_accuracy - prev_accuracy
             step_penalty = self.model.config.reward_step_penalty
             
-            # Terminal bonus for correct final answers
+            # Terminal bonus: fixed rewards for correct/incorrect
             terminal_bonus = torch.where(
                 new_carry.halted,
                 torch.where(
                     seq_is_correct,
-                    self.model.config.reward_terminal_correct * (self.model.config.halt_max_steps - new_carry.steps).float() / self.model.config.halt_max_steps,
+                    torch.full_like(curr_accuracy, self.model.config.reward_terminal_correct),
                     torch.full_like(curr_accuracy, self.model.config.reward_terminal_incorrect)
                 ),
                 torch.zeros_like(curr_accuracy)
             )
             
             # Memory bonus (if enabled)
+            # Note: Memory write operations are now handled in the model's forward pass
+            # for proper temporal coherence. Here we only compute rewards.
             memory_bonus = torch.zeros_like(curr_accuracy)
             if self.model.config.enable_memory and self.model.inner.memory is not None:
-                # Store states with positive improvement in memory
-                # Use carry state (will be read in next forward pass) for temporal alignment
-                with torch.no_grad():
-                    # Only write states that actually improved
-                    positive_improvement = accuracy_improvement.clamp(min=0)
-                    self.model.inner.memory.write(
-                        state=new_carry.inner_carry.z_H[:, 0],  # Use carry state, not output
-                        reward=positive_improvement,  # Only positive improvements
-                        threshold=self.model.config.memory_reward_threshold
-                    )
-                
                 # Reward bonus for memory-assisted improvements
                 memory_bonus = torch.where(
                     accuracy_improvement > 0,

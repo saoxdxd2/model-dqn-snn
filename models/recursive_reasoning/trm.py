@@ -68,6 +68,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mlp_t: bool = False # use mlp on L instead of transformer
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+    use_learned_halting_eval: bool = True  # Enable learned halting during evaluation
     
     # DQN Enhancement Parameters
     enable_dqn: bool = False  # Enable DQN-based halting
@@ -262,6 +263,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 # Dynamic memory query at each H-cycle (based on current z_H state)
                 memory_content = None
                 if self.memory is not None:
+                    # Read memory based on current state
                     memory_content = self.memory.read(z_H[:, 0])  # [batch, hidden_size]
                     memory_content = memory_content.unsqueeze(1)  # [batch, 1, hidden_size]
                 
@@ -276,6 +278,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # Final H-cycle with grad
         memory_content = None
         if self.memory is not None:
+            # Read memory based on current state
             memory_content = self.memory.read(z_H[:, 0])  # [batch, hidden_size]
             memory_content = memory_content.unsqueeze(1)  # [batch, 1, hidden_size]
         
@@ -331,11 +334,6 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
-        # Reset RNN Q-head state for halted sequences (prevents contamination)
-        if hasattr(self.inner.q_head, 'reset_hidden') and carry.halted.any():
-            batch_size = batch["inputs"].shape[0]
-            self.inner.q_head.reset_hidden(batch_size, mask=carry.halted)
-
         # Forward inner model
         new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
 
@@ -353,11 +351,12 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             
             halted = is_last_step
 
-            # if training, and ACT is enabled
-            if self.training and (self.config.halt_max_steps > 1):
+            # if training or (eval with learned halting enabled), and ACT is enabled
+            use_halting = (self.training or self.config.use_learned_halting_eval) and (self.config.halt_max_steps > 1)
+            if use_halting:
 
                 # Halt signal
-                # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
+                # NOTE: In eval mode with use_learned_halting_eval=False, always use max steps for consistent batching
                 
                 if self.config.enable_dqn:
                     # DQN: Epsilon-greedy exploration
@@ -386,6 +385,11 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     # Similar concept as PQN https://arxiv.org/abs/2407.04811
                     _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
+            
+            # Reset RNN Q-head state for sequences that halted (prevents contamination across puzzles)
+            if hasattr(self.inner.q_head, 'reset_hidden') and halted.any():
+                batch_size = batch["inputs"].shape[0]
+                self.inner.q_head.reset_hidden(batch_size, mask=halted)
 
         # Update DQN tracking fields if enabled
         new_prev_accuracy = carry.prev_accuracy
