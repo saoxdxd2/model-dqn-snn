@@ -3,6 +3,7 @@ import os
 import csv
 import json
 import numpy as np
+import torch
 
 from argdantic import ArgParser
 from pydantic import BaseModel
@@ -10,6 +11,10 @@ from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
 from common import PuzzleDatasetMetadata
+
+# GPU acceleration setup
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Sudoku dataset building using device: {DEVICE}")
 
 
 cli = ArgParser()

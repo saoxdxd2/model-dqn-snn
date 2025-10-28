@@ -95,13 +95,58 @@ class TrainState:
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
-    dataset = PuzzleDataset(PuzzleDatasetConfig(
-        seed=config.seed,
-        dataset_paths=config.data_paths_test if len(config.data_paths_test)>0 and split=="test" else config.data_paths,
-        rank=rank,
-        num_replicas=world_size,
-        **kwargs
-    ), split=split)
+    dataset_paths = config.data_paths_test if len(config.data_paths_test)>0 and split=="test" else config.data_paths
+    
+    try:
+        dataset = PuzzleDataset(PuzzleDatasetConfig(
+            seed=config.seed,
+            dataset_paths=dataset_paths,
+            rank=rank,
+            num_replicas=world_size,
+            **kwargs
+        ), split=split)
+    except FileNotFoundError as e:
+        # Auto-fallback: Build dataset if missing
+        if rank == 0:  # Only build on rank 0 in distributed training
+            print(f"\n{'='*60}")
+            print(f"Dataset not found: {e}")
+            print(f"Auto-building dataset with default configuration...")
+            print(f"{'='*60}\n")
+            
+            import subprocess
+            build_cmd = [
+                "python", "dataset/build_arc_dataset.py",
+                "--input-file-prefix", "kaggle/combined/arc-agi",
+                "--output-dir", "data/arc-aug-5000",
+                "--subsets", "training", "training2",
+                "--test-set-name", "evaluation",
+                "--num-aug", "5000",
+                "--seed", "42"
+            ]
+            
+            print(f"Running: {' '.join(build_cmd)}\n")
+            result = subprocess.run(build_cmd, check=True)
+            
+            if result.returncode == 0:
+                print(f"\n{'='*60}")
+                print(f"Dataset built successfully! Retrying data load...")
+                print(f"{'='*60}\n")
+            else:
+                raise RuntimeError(f"Dataset build failed with code {result.returncode}")
+        
+        # Wait for rank 0 to finish building in distributed mode
+        if world_size > 1:
+            dist.barrier()
+        
+        # Retry loading dataset
+        dataset = PuzzleDataset(PuzzleDatasetConfig(
+            seed=config.seed,
+            dataset_paths=dataset_paths,
+            rank=rank,
+            num_replicas=world_size,
+            **kwargs
+        ), split=split)
+    
     dataloader = DataLoader(
         dataset,
         batch_size=None,

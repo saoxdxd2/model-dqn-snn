@@ -4,11 +4,16 @@ import os
 import json
 import hashlib
 import numpy as np
+import torch
 
 from argdantic import ArgParser
 from pydantic import BaseModel
 
-from dataset.common import PuzzleDatasetMetadata, dihedral_transform, inverse_dihedral_transform
+from common import PuzzleDatasetMetadata, dihedral_transform, inverse_dihedral_transform
+
+# GPU acceleration setup
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Dataset building using device: {DEVICE}")
 
 
 cli = ArgParser()
@@ -165,6 +170,8 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
 
 
 def load_puzzles_arcagi(config: DataProcessConfig):
+    from tqdm import tqdm
+    
     train_examples_dest = ("train", "all")
     test_examples_map = {
         config.test_set_name: [(1.0, ("test", "all"))],
@@ -201,8 +208,9 @@ def load_puzzles_arcagi(config: DataProcessConfig):
         puzzles = list(puzzles.items())
         np.random.shuffle(puzzles)
         
-        # Assign by fraction
-        for idx, (name, puzzle) in enumerate(puzzles):
+        # Assign by fraction with progress bar
+        print(f"\nProcessing {subset_name} subset ({len(puzzles)} puzzles)...")
+        for idx, (name, puzzle) in enumerate(tqdm(puzzles, desc=f"Augmenting {subset_name}")):
             fraction = idx / len(puzzles)
             test_examples_dest = None
             for f, dest in test_examples_map.get(subset_name, test_examples_map["_default"]):
