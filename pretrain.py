@@ -149,7 +149,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         optimizers = [
             AdamAtan2(
                 model.parameters(),
-                lr=0,  # Needs to be set by scheduler
+                lr=1e-8,  # Small positive value, will be set by scheduler
                 weight_decay=config.weight_decay,
                 betas=(config.beta1, config.beta2)
             )
@@ -179,7 +179,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             ),
             AdamAtan2(
                 model.parameters(),
-                lr=0,  # Needs to be set by scheduler
+                lr=1e-8,  # Small positive value, will be set by scheduler
                 weight_decay=config.weight_decay,
                 betas=(config.beta1, config.beta2)
             )
@@ -323,11 +323,11 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     # Reduce metrics
     if len(metrics):
-        assert not any(v.requires_grad for v in metrics.values())
+        assert not any(getattr(v, 'requires_grad', False) for v in metrics.values())
 
         metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
         # Reduce and reconstruct
-        metric_values = torch.stack([metrics[k] for k in metric_keys])
+        metric_values = torch.stack([torch.as_tensor(metrics[k]) if not isinstance(metrics[k], torch.Tensor) else metrics[k] for k in metric_keys])
         if world_size > 1:
             dist.reduce(metric_values, dst=0)
 
