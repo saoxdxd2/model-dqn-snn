@@ -141,24 +141,36 @@ class DatasetQualityEnhancer:
             print("Using heuristic difficulty scoring (CPU)")
     
     def score_puzzle(self, input_grid: np.ndarray, output_grid: np.ndarray) -> dict:
-        """
-        Score a single puzzle's difficulty and quality.
+        """Score a single puzzle's difficulty and quality.
         
         Returns:
             scores: dict with difficulty, complexity, solvability metrics
         """
         if self.use_neural:
             with torch.no_grad():
-                inp_tensor = torch.from_numpy(input_grid).unsqueeze(0).to(self.device)
-                out_tensor = torch.from_numpy(output_grid).unsqueeze(0).to(self.device)
+                # Pad to common size if needed
+                max_h = max(input_grid.shape[0], output_grid.shape[0])
+                max_w = max(input_grid.shape[1], output_grid.shape[1])
+                
+                def pad_grid(arr, h, w):
+                    if arr.shape[0] == h and arr.shape[1] == w:
+                        return arr
+                    padded = np.zeros((h, w), dtype=arr.dtype)
+                    padded[:arr.shape[0], :arr.shape[1]] = arr
+                    return padded
+                
+                inp_padded = pad_grid(input_grid, max_h, max_w)
+                out_padded = pad_grid(output_grid, max_h, max_w)
+                
+                inp_tensor = torch.from_numpy(inp_padded).unsqueeze(0).to(self.device)
+                out_tensor = torch.from_numpy(out_padded).unsqueeze(0).to(self.device)
                 scores = self.scorer(inp_tensor, out_tensor)
                 return {k: v.cpu().item() for k, v in scores.items()}
         else:
             return compute_heuristic_difficulty(input_grid, output_grid)
     
     def score_batch(self, examples: List[Tuple[np.ndarray, np.ndarray]]) -> List[dict]:
-        """
-        Score multiple puzzles in batch (GPU efficient).
+        """Score multiple puzzles in batch (GPU efficient).
         
         Args:
             examples: List of (input_grid, output_grid) tuples
@@ -168,9 +180,21 @@ class DatasetQualityEnhancer:
         """
         if self.use_neural and len(examples) > 0:
             with torch.no_grad():
-                # Batch process on GPU
-                inputs = torch.stack([torch.from_numpy(inp) for inp, _ in examples]).to(self.device)
-                outputs = torch.stack([torch.from_numpy(out) for _, out in examples]).to(self.device)
+                # Find max dimensions across all examples
+                max_h = max(max(inp.shape[0], out.shape[0]) for inp, out in examples)
+                max_w = max(max(inp.shape[1], out.shape[1]) for inp, out in examples)
+                
+                # Pad all grids to same size
+                def pad_to_size(arr, h, w):
+                    if arr.shape[0] == h and arr.shape[1] == w:
+                        return arr
+                    padded = np.zeros((h, w), dtype=arr.dtype)
+                    padded[:arr.shape[0], :arr.shape[1]] = arr
+                    return padded
+                
+                # Batch process on GPU with padded tensors
+                inputs = torch.stack([torch.from_numpy(pad_to_size(inp, max_h, max_w)) for inp, _ in examples]).to(self.device)
+                outputs = torch.stack([torch.from_numpy(pad_to_size(out, max_h, max_w)) for _, out in examples]).to(self.device)
                 
                 batch_scores = self.scorer(inputs, outputs)
                 

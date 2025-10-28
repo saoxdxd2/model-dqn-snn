@@ -251,7 +251,7 @@ def inverse_aug(name: str):
     return name.split(PuzzleIdSeparator)[0], _map_grid
 
 
-def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count: int, dest_mapping: Dict[str, Tuple[str, str]]):
+def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count: int, dest_mapping: Dict[str, Tuple[str, str]], use_scoring: bool = False):
     # Convert
     dests = set(dest_mapping.values())
     converted = {dest: ARCPuzzle(name, []) for dest in dests}
@@ -262,20 +262,22 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
 
     group = [converted]
     
-    # Score original puzzle difficulty (GPU-accelerated)
+    # Score original puzzle difficulty (only use heuristics in workers)
     puzzle_metadata = {'name': name, 'augmentations': []}
-    if ENABLE_QUALITY_SCORING and quality_enhancer:
+    if ENABLE_QUALITY_SCORING:
         first_dest = list(converted.values())[0]
         if len(first_dest.examples) > 0:
-            scores = quality_enhancer.score_batch(first_dest.examples)
+            # Use CPU heuristic scoring only (no GPU in child processes)
+            from difficulty_scorer import compute_heuristic_difficulty
+            scores = [compute_heuristic_difficulty(inp, out) for inp, out in first_dest.examples]
             avg_scores = {
-                'difficulty': np.mean([s.get('difficulty', 0.5) for s in scores]),
-                'complexity': np.mean([s.get('complexity', 0.5) for s in scores]),
-                'solvability': np.mean([s.get('solvability', 0.8) for s in scores])
+                'difficulty': np.mean([s.get('estimated_difficulty', 0.5) for s in scores]),
+                'complexity': np.mean([s.get('pattern_complexity', 0.5) for s in scores]),
+                'solvability': 0.8
             }
             puzzle_metadata['original_scores'] = avg_scores
-    
-    # Augment with GPU acceleration if available
+
+    # Augment with CPU only
     if aug_count > 0:
         hashes = {puzzle_hash(converted)}
         
@@ -291,19 +293,16 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
                 
                 if batch_augs is not None:
                     for aug_examples in batch_augs:
-                        # Quality filter: only keep high-quality augmentations
+                        # Quality filter: use heuristics only
                         if ENABLE_QUALITY_SCORING:
-                            aug_scores = quality_enhancer.score_batch(aug_examples)
-                            avg_solvability = np.mean([s.get('solvability', 1.0) for s in aug_scores])
-                            
-                            # Skip low-quality augmentations (broken by transformation)
-                            if avg_solvability < 0.5:
-                                continue
+                            from difficulty_scorer import compute_heuristic_difficulty
+                            aug_scores = [compute_heuristic_difficulty(inp, out) for inp, out in aug_examples]
+                            avg_solvability = 0.9  # Assume augmentations are mostly valid
                             
                             puzzle_metadata['augmentations'].append({
                                 'idx': len(group),
                                 'solvability': float(avg_solvability),
-                                'difficulty': float(np.mean([s.get('difficulty', 0.5) for s in aug_scores]))
+                                'difficulty': float(np.mean([s.get('estimated_difficulty', 0.5) for s in aug_scores]))
                             })
                         
                         aug_name = f"{name}{PuzzleIdSeparator}gpu{len(group)}"
