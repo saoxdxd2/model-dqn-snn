@@ -3,6 +3,7 @@ GPU-based puzzle difficulty estimation and quality scoring.
 Provides real value by enabling curriculum learning and dataset balancing.
 """
 
+from typing import List, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

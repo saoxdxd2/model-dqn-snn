@@ -16,9 +16,15 @@ from pydantic import BaseModel
 from common import PuzzleDatasetMetadata, dihedral_transform, inverse_dihedral_transform
 
 # Hybrid CPU+GPU setup
+# Fix CUDA multiprocessing: use spawn instead of fork
+if USE_GPU := torch.cuda.is_available():
+    try:
+        mp.set_start_method('spawn', force=True)
+    except RuntimeError:
+        pass  # Already set
+
 NUM_WORKERS = max(1, mp.cpu_count() - 1)  # CPU workers for I/O
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-USE_GPU = torch.cuda.is_available()
+DEVICE = torch.device('cuda' if USE_GPU else 'cpu')
 
 print(f"Dataset building: {NUM_WORKERS} CPU workers + GPU for data quality: {USE_GPU}")
 if USE_GPU:
@@ -34,6 +40,17 @@ except Exception as e:
     print(f"Quality scoring disabled: {e}")
     quality_enhancer = None
     ENABLE_QUALITY_SCORING = False
+
+# Initialize SNN coordinator for smooth parallel execution
+try:
+    from snn_coordinator import SNNParallelCoordinator
+    snn_coordinator = SNNParallelCoordinator(NUM_WORKERS, use_gpu=USE_GPU, device='cpu')
+    print(f"  SNN coordinator initialized for adaptive load balancing")
+    ENABLE_SNN_SCHEDULING = True
+except Exception as e:
+    print(f"SNN scheduling disabled: {e}")
+    snn_coordinator = None
+    ENABLE_SNN_SCHEDULING = False
 
 
 cli = ArgParser()
@@ -165,9 +182,19 @@ def batch_augment_gpu(examples: List[Tuple[np.ndarray, np.ndarray]], num_aug: in
     # Batch process on GPU
     results = []
     
-    # Convert all grids to GPU tensors
-    inputs = torch.stack([torch.from_numpy(inp) for inp, _ in examples]).to(DEVICE)
-    outputs = torch.stack([torch.from_numpy(out) for _, out in examples]).to(DEVICE)
+    # Find max dimensions and pad all grids to same size
+    max_h = max(max(inp.shape[0], out.shape[0]) for inp, out in examples)
+    max_w = max(max(inp.shape[1], out.shape[1]) for inp, out in examples)
+    
+    # Pad and stack tensors
+    def pad_to_size(arr, h, w):
+        padded = np.zeros((h, w), dtype=arr.dtype)
+        padded[:arr.shape[0], :arr.shape[1]] = arr
+        return padded
+    
+    inputs = torch.stack([torch.from_numpy(pad_to_size(inp, max_h, max_w)) for inp, _ in examples]).to(DEVICE)
+    outputs = torch.stack([torch.from_numpy(pad_to_size(out, max_h, max_w)) for _, out in examples]).to(DEVICE)
+    original_shapes = [(inp.shape, out.shape) for inp, out in examples]
     
     # Generate augmentations in batch
     for _ in range(num_aug):
@@ -185,10 +212,10 @@ def batch_augment_gpu(examples: List[Tuple[np.ndarray, np.ndarray]], num_aug: in
         aug_inputs = mapping_tensor[aug_inputs.long()]
         aug_outputs = mapping_tensor[aug_outputs.long()]
         
-        # Convert back to CPU numpy
+        # Convert back to CPU numpy and crop to original shapes
         aug_examples = [
-            (aug_inputs[i].cpu().numpy().astype(np.uint8),
-             aug_outputs[i].cpu().numpy().astype(np.uint8))
+            (aug_inputs[i, :original_shapes[i][0][0], :original_shapes[i][0][1]].cpu().numpy().astype(np.uint8),
+             aug_outputs[i, :original_shapes[i][1][0], :original_shapes[i][1][1]].cpu().numpy().astype(np.uint8))
             for i in range(len(examples))
         ]
         results.append(aug_examples)
@@ -323,8 +350,11 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
 
 
 def convert_puzzle_wrapper(args):
-    """Wrapper for parallel processing."""
-    name, puzzle, aug_count, dest_mapping, train_examples_dest, test_examples_map, subset_name, idx, total_count = args
+    """Wrapper for parallel processing with SNN coordination."""
+    name, puzzle, aug_count, dest_mapping, train_examples_dest, test_examples_map, subset_name, idx, total_count, worker_id = args
+    
+    import time
+    start_time = time.time()
     
     # Same logic as before but in isolated process
     fraction = idx / total_count
@@ -340,9 +370,12 @@ def convert_puzzle_wrapper(args):
     if test_examples_dest[0] == "test":
         test_puzzles_local[name] = puzzle
     
+    # Process with timing for SNN feedback
     metadata = convert_single_arc_puzzle(results_local, name, puzzle, aug_count, {"train": train_examples_dest, "test": test_examples_dest})
     
-    return results_local, test_puzzles_local, metadata
+    task_time = time.time() - start_time
+    
+    return results_local, test_puzzles_local, metadata, {'worker_id': worker_id, 'time': task_time}
 
 
 def load_puzzles_arcagi(config: DataProcessConfig):
@@ -384,13 +417,33 @@ def load_puzzles_arcagi(config: DataProcessConfig):
         puzzles = list(puzzles.items())
         np.random.shuffle(puzzles)
         
-        # Parallel processing with all CPU cores
+        # Parallel processing with SNN coordination
         print(f"\nProcessing {subset_name} subset ({len(puzzles)} puzzles) with {NUM_WORKERS} workers...")
         
-        # Prepare arguments for parallel processing
+        # Use SNN to assign tasks to workers
+        if ENABLE_SNN_SCHEDULING:
+            # Get difficulty scores for adaptive scheduling
+            puzzle_metadata = []
+            for name, puzzle in puzzles:
+                try:
+                    # Quick heuristic for scheduling
+                    num_examples = len(puzzle.get('train', [])) + len(puzzle.get('test', []))
+                    difficulty = min(1.0, num_examples / 10.0)
+                    complexity = min(1.0, config.num_aug / 5000.0)
+                    puzzle_metadata.append({'difficulty': difficulty, 'complexity': complexity, 'priority': 0.5})
+                except:
+                    puzzle_metadata.append({'difficulty': 0.5, 'complexity': 0.5, 'priority': 0.5})
+            
+            # Assign worker IDs using SNN
+            worker_assignments = [snn_coordinator.assign_task(meta) for meta in puzzle_metadata]
+        else:
+            # Round-robin fallback
+            worker_assignments = [idx % NUM_WORKERS for idx in range(len(puzzles))]
+        
+        # Prepare arguments with worker assignments
         process_args = [
             (name, puzzle, config.num_aug, {"train": train_examples_dest, "test": None},
-             train_examples_dest, test_examples_map, subset_name, idx, len(puzzles))
+             train_examples_dest, test_examples_map, subset_name, idx, len(puzzles), worker_assignments[idx])
             for idx, (name, puzzle) in enumerate(puzzles)
         ]
         
@@ -405,9 +458,16 @@ def load_puzzles_arcagi(config: DataProcessConfig):
         # Collect curriculum learning metadata
         all_metadata = []
         
-        # Merge results from all workers
+        # Merge results from all workers with SNN feedback
         for result_tuple in results_list:
-            if len(result_tuple) == 3:
+            if len(result_tuple) == 4:
+                results_local, test_puzzles_local, metadata, timing = result_tuple
+                if metadata:
+                    all_metadata.append(metadata)
+                # Update SNN coordinator with completed task
+                if ENABLE_SNN_SCHEDULING and timing:
+                    snn_coordinator.complete_task(timing['worker_id'], timing['time'])
+            elif len(result_tuple) == 3:
                 results_local, test_puzzles_local, metadata = result_tuple
                 if metadata:
                     all_metadata.append(metadata)
@@ -432,6 +492,14 @@ def load_puzzles_arcagi(config: DataProcessConfig):
             with open(metadata_path, 'w') as f:
                 json.dump(all_metadata, f, indent=2)
             print(f"  Saved difficulty scores to {metadata_path}")
+        
+        # Print SNN coordination statistics
+        if ENABLE_SNN_SCHEDULING:
+            stats = snn_coordinator.get_stats()
+            print(f"  SNN Coordinator Stats:")
+            print(f"    Load balance: {stats['load_balance']:.3f} (lower = better)")
+            print(f"    Avg task time: {stats['avg_time']:.2f}s")
+            print(f"    Worker utilization: {[f'{u:.1f}s' for u in stats['worker_utilization']]}")
 
     print (f"Total puzzles: {total_puzzles}")
     return results, test_puzzles
