@@ -4,16 +4,36 @@ import os
 import json
 import hashlib
 import numpy as np
+import multiprocessing as mp
+from functools import partial
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from argdantic import ArgParser
 from pydantic import BaseModel
 
 from common import PuzzleDatasetMetadata, dihedral_transform, inverse_dihedral_transform
 
-# GPU acceleration setup
+# Hybrid CPU+GPU setup
+NUM_WORKERS = max(1, mp.cpu_count() - 1)  # CPU workers for I/O
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Dataset building using device: {DEVICE}")
+USE_GPU = torch.cuda.is_available()
+
+print(f"Dataset building: {NUM_WORKERS} CPU workers + GPU for data quality: {USE_GPU}")
+if USE_GPU:
+    print(f"  GPU: {torch.cuda.get_device_name(0)}")
+    print(f"  GPU will be used for: Difficulty scoring, Quality filtering, Curriculum balancing")
+
+# Initialize quality enhancer
+try:
+    from difficulty_scorer import DatasetQualityEnhancer
+    quality_enhancer = DatasetQualityEnhancer(device=DEVICE, use_neural_scorer=USE_GPU)
+    ENABLE_QUALITY_SCORING = True
+except Exception as e:
+    print(f"Quality scoring disabled: {e}")
+    quality_enhancer = None
+    ENABLE_QUALITY_SCORING = False
 
 
 cli = ArgParser()
@@ -100,8 +120,84 @@ def puzzle_hash(puzzle: dict):
     return hashlib.sha256("|".join(hashes).encode()).hexdigest()
 
 
+def dihedral_transform_gpu(grids: torch.Tensor, tid: int) -> torch.Tensor:
+    """GPU-accelerated dihedral transform for batch of grids.
+    Args:
+        grids: [batch, H, W] tensor on GPU
+        tid: transform ID (0-7)
+    Returns:
+        transformed: [batch, H, W] tensor on GPU
+    """
+    if tid == 0:
+        return grids
+    elif tid == 1:
+        return torch.rot90(grids, k=1, dims=(-2, -1))
+    elif tid == 2:
+        return torch.rot90(grids, k=2, dims=(-2, -1))
+    elif tid == 3:
+        return torch.rot90(grids, k=3, dims=(-2, -1))
+    elif tid == 4:
+        return torch.flip(grids, dims=[-1])  # horizontal flip
+    elif tid == 5:
+        return torch.flip(grids, dims=[-2])  # vertical flip
+    elif tid == 6:
+        return torch.transpose(grids, -2, -1)  # transpose
+    elif tid == 7:
+        return torch.flip(torch.rot90(grids, k=1, dims=(-2, -1)), dims=[-1])
+    else:
+        return grids
+
+
+def batch_augment_gpu(examples: List[Tuple[np.ndarray, np.ndarray]], num_aug: int) -> List[List[Tuple[np.ndarray, np.ndarray]]]:
+    """GPU-accelerated batch augmentation.
+    
+    Args:
+        examples: List of (input, output) pairs as numpy arrays
+        num_aug: Number of augmentations to generate
+    
+    Returns:
+        List of augmented example groups
+    """
+    if not USE_GPU or num_aug == 0:
+        # Fallback to CPU
+        return None
+    
+    # Batch process on GPU
+    results = []
+    
+    # Convert all grids to GPU tensors
+    inputs = torch.stack([torch.from_numpy(inp) for inp, _ in examples]).to(DEVICE)
+    outputs = torch.stack([torch.from_numpy(out) for _, out in examples]).to(DEVICE)
+    
+    # Generate augmentations in batch
+    for _ in range(num_aug):
+        trans_id = np.random.randint(0, 8)
+        # Color permutation (keep on CPU for now, small operation)
+        mapping = np.concatenate([np.arange(0, 1, dtype=np.uint8), 
+                                 np.random.permutation(np.arange(1, 10, dtype=np.uint8))])
+        mapping_tensor = torch.from_numpy(mapping).to(DEVICE)
+        
+        # Apply transformations on GPU (batched)
+        aug_inputs = dihedral_transform_gpu(inputs, trans_id)
+        aug_outputs = dihedral_transform_gpu(outputs, trans_id)
+        
+        # Apply color mapping (vectorized on GPU)
+        aug_inputs = mapping_tensor[aug_inputs.long()]
+        aug_outputs = mapping_tensor[aug_outputs.long()]
+        
+        # Convert back to CPU numpy
+        aug_examples = [
+            (aug_inputs[i].cpu().numpy().astype(np.uint8),
+             aug_outputs[i].cpu().numpy().astype(np.uint8))
+            for i in range(len(examples))
+        ]
+        results.append(aug_examples)
+    
+    return results
+
+
 def aug(name: str):
-    # Augment plan
+    # Augment plan (CPU version - kept for compatibility)
     trans_id = np.random.randint(0, 8)
     mapping = np.concatenate([np.arange(0, 1, dtype=np.uint8), np.random.permutation(np.arange(1, 10, dtype=np.uint8))])  # Permute colors, Excluding "0" (black)
     
@@ -139,22 +235,76 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
 
     group = [converted]
     
-    # Augment
+    # Score original puzzle difficulty (GPU-accelerated)
+    puzzle_metadata = {'name': name, 'augmentations': []}
+    if ENABLE_QUALITY_SCORING and quality_enhancer:
+        first_dest = list(converted.values())[0]
+        if len(first_dest.examples) > 0:
+            scores = quality_enhancer.score_batch(first_dest.examples)
+            avg_scores = {
+                'difficulty': np.mean([s.get('difficulty', 0.5) for s in scores]),
+                'complexity': np.mean([s.get('complexity', 0.5) for s in scores]),
+                'solvability': np.mean([s.get('solvability', 0.8) for s in scores])
+            }
+            puzzle_metadata['original_scores'] = avg_scores
+    
+    # Augment with GPU acceleration if available
     if aug_count > 0:
         hashes = {puzzle_hash(converted)}
-
-        for _trial in range(ARCAugmentRetriesFactor * aug_count):
-            aug_name, _map_grid = aug(name)
-
-            # Check duplicate
-            augmented = {dest: ARCPuzzle(aug_name, [(_map_grid(input), _map_grid(label)) for (input, label) in puzzle.examples]) for dest, puzzle in converted.items()}
-            h = puzzle_hash(augmented)
-            if h not in hashes:
-                hashes.add(h)
-                group.append(augmented)
+        
+        # Try GPU batch augmentation first
+        if USE_GPU:
+            try:
+                # Get examples from first destination (all dests have same examples structure)
+                first_dest = list(converted.values())[0]
+                examples = first_dest.examples
                 
-            if len(group) >= aug_count + 1:
-                break
+                # Generate batch augmentations on GPU
+                batch_augs = batch_augment_gpu(examples, aug_count * ARCAugmentRetriesFactor)
+                
+                if batch_augs is not None:
+                    for aug_examples in batch_augs:
+                        # Quality filter: only keep high-quality augmentations
+                        if ENABLE_QUALITY_SCORING:
+                            aug_scores = quality_enhancer.score_batch(aug_examples)
+                            avg_solvability = np.mean([s.get('solvability', 1.0) for s in aug_scores])
+                            
+                            # Skip low-quality augmentations (broken by transformation)
+                            if avg_solvability < 0.5:
+                                continue
+                            
+                            puzzle_metadata['augmentations'].append({
+                                'idx': len(group),
+                                'solvability': float(avg_solvability),
+                                'difficulty': float(np.mean([s.get('difficulty', 0.5) for s in aug_scores]))
+                            })
+                        
+                        aug_name = f"{name}{PuzzleIdSeparator}gpu{len(group)}"
+                        augmented = {dest: ARCPuzzle(aug_name, aug_examples) for dest in converted.keys()}
+                        h = puzzle_hash(augmented)
+                        if h not in hashes:
+                            hashes.add(h)
+                            group.append(augmented)
+                        
+                        if len(group) >= aug_count + 1:
+                            break
+            except Exception as e:
+                # Fallback to CPU if GPU fails
+                print(f"GPU augmentation failed for {name}, falling back to CPU: {e}")
+                USE_GPU_LOCAL = False
+        
+        # CPU fallback or if GPU not available
+        if not USE_GPU or len(group) < aug_count + 1:
+            for _trial in range(ARCAugmentRetriesFactor * aug_count):
+                if len(group) >= aug_count + 1:
+                    break
+                    
+                aug_name, _map_grid = aug(name)
+                augmented = {dest: ARCPuzzle(aug_name, [(_map_grid(input), _map_grid(label)) for (input, label) in puzzle.examples]) for dest, puzzle in converted.items()}
+                h = puzzle_hash(augmented)
+                if h not in hashes:
+                    hashes.add(h)
+                    group.append(augmented)
             
         if len(group) < aug_count + 1:
             print (f"[Puzzle {name}] augmentation not full, only {len(group)}")
@@ -167,6 +317,32 @@ def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count:
         results.setdefault(dest_split, {})
         results[dest_split].setdefault(dest_set, [])
         results[dest_split][dest_set].append([converted[dest] for converted in group])
+    
+    # Return metadata for curriculum learning
+    return puzzle_metadata if ENABLE_QUALITY_SCORING else None
+
+
+def convert_puzzle_wrapper(args):
+    """Wrapper for parallel processing."""
+    name, puzzle, aug_count, dest_mapping, train_examples_dest, test_examples_map, subset_name, idx, total_count = args
+    
+    # Same logic as before but in isolated process
+    fraction = idx / total_count
+    test_examples_dest = None
+    for f, dest in test_examples_map.get(subset_name, test_examples_map["_default"]):
+        if fraction < f:
+            test_examples_dest = dest
+            break
+    
+    results_local = {}
+    test_puzzles_local = {}
+    
+    if test_examples_dest[0] == "test":
+        test_puzzles_local[name] = puzzle
+    
+    metadata = convert_single_arc_puzzle(results_local, name, puzzle, aug_count, {"train": train_examples_dest, "test": test_examples_dest})
+    
+    return results_local, test_puzzles_local, metadata
 
 
 def load_puzzles_arcagi(config: DataProcessConfig):
@@ -208,23 +384,54 @@ def load_puzzles_arcagi(config: DataProcessConfig):
         puzzles = list(puzzles.items())
         np.random.shuffle(puzzles)
         
-        # Assign by fraction with progress bar
-        print(f"\nProcessing {subset_name} subset ({len(puzzles)} puzzles)...")
-        for idx, (name, puzzle) in enumerate(tqdm(puzzles, desc=f"Augmenting {subset_name}")):
-            fraction = idx / len(puzzles)
-            test_examples_dest = None
-            for f, dest in test_examples_map.get(subset_name, test_examples_map["_default"]):
-                if fraction < f:
-                    test_examples_dest = dest
-                    break
-                    
-            assert test_examples_dest is not None
+        # Parallel processing with all CPU cores
+        print(f"\nProcessing {subset_name} subset ({len(puzzles)} puzzles) with {NUM_WORKERS} workers...")
+        
+        # Prepare arguments for parallel processing
+        process_args = [
+            (name, puzzle, config.num_aug, {"train": train_examples_dest, "test": None},
+             train_examples_dest, test_examples_map, subset_name, idx, len(puzzles))
+            for idx, (name, puzzle) in enumerate(puzzles)
+        ]
+        
+        # Process in parallel
+        with mp.Pool(processes=NUM_WORKERS) as pool:
+            results_list = list(tqdm(
+                pool.imap(convert_puzzle_wrapper, process_args),
+                total=len(puzzles),
+                desc=f"Augmenting {subset_name}"
+            ))
+        
+        # Collect curriculum learning metadata
+        all_metadata = []
+        
+        # Merge results from all workers
+        for result_tuple in results_list:
+            if len(result_tuple) == 3:
+                results_local, test_puzzles_local, metadata = result_tuple
+                if metadata:
+                    all_metadata.append(metadata)
+            else:
+                results_local, test_puzzles_local = result_tuple
             
-            if test_examples_dest[0] == "test":
-                test_puzzles[name] = puzzle
-                
-            convert_single_arc_puzzle(results, name, puzzle, config.num_aug, {"train": train_examples_dest, "test": test_examples_dest})
+            # Merge results
+            for split_name, split_data in results_local.items():
+                results.setdefault(split_name, {})
+                for set_name, set_data in split_data.items():
+                    results[split_name].setdefault(set_name, [])
+                    results[split_name][set_name].extend(set_data)
+            
+            # Merge test puzzles
+            test_puzzles.update(test_puzzles_local)
             total_puzzles += 1
+        
+        # Save difficulty metadata for curriculum learning
+        if ENABLE_QUALITY_SCORING and len(all_metadata) > 0:
+            metadata_path = f"{config.output_dir}/{subset_name}_difficulty_scores.json"
+            os.makedirs(config.output_dir, exist_ok=True)
+            with open(metadata_path, 'w') as f:
+                json.dump(all_metadata, f, indent=2)
+            print(f"  Saved difficulty scores to {metadata_path}")
 
     print (f"Total puzzles: {total_puzzles}")
     return results, test_puzzles
