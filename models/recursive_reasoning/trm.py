@@ -10,6 +10,7 @@ import random
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
+from models.dqn_utils import compute_epsilon, select_action_epsilon_greedy
 
 IGNORE_LABEL_ID = -100
 
@@ -27,6 +28,11 @@ class TinyRecursiveReasoningModel_ACTV1Carry:
     halted: torch.Tensor
     
     current_data: Dict[str, torch.Tensor]
+    
+    # DQN tracking
+    prev_accuracy: Optional[torch.Tensor] = None
+    no_improvement_counter: Optional[torch.Tensor] = None
+    training_step: int = 0  # Global training step for epsilon decay
 
 
 class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
@@ -61,6 +67,23 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     mlp_t: bool = False # use mlp on L instead of transformer
     puzzle_emb_len: int = 16 # if non-zero, its specified to this value
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
+    
+    # DQN Enhancement Parameters
+    enable_dqn: bool = False  # Enable DQN-based halting
+    dqn_buffer_capacity: int = 20000
+    dqn_buffer_min_size: int = 5000
+    dqn_batch_size: int = 256
+    dqn_gamma: float = 0.99
+    dqn_target_tau: float = 0.005  # Soft update rate
+    dqn_epsilon_start: float = 0.5
+    dqn_epsilon_end: float = 0.05
+    dqn_epsilon_decay_steps: int = 100000
+    reward_accuracy_scale: float = 10.0
+    reward_step_penalty: float = 0.02
+    reward_terminal_correct: float = 10.0
+    reward_terminal_incorrect: float = -5.0
+    reward_stagnation_penalty: float = 0.1
+    reward_stagnation_threshold: int = 3
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
     def __init__(self, config: TinyRecursiveReasoningModel_ACTV1Config) -> None:
@@ -129,6 +152,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
         self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
+        
+        # DQN: Target network for stable Q-learning
+        if self.config.enable_dqn:
+            self.q_head_target = CastedLinear(self.config.hidden_size, 2, bias=True)
+            self.q_head_target.load_state_dict(self.q_head.state_dict())
+            # Freeze target network
+            for param in self.q_head_target.parameters():
+                param.requires_grad = False
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
         if self.config.puzzle_emb_ndim > 0:
@@ -236,14 +267,20 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
+        device = batch["inputs"].device
 
         return TinyRecursiveReasoningModel_ACTV1Carry(
             inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
             
-            steps=torch.zeros((batch_size, ), dtype=torch.int32),
-            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
+            steps=torch.zeros((batch_size, ), dtype=torch.int32, device=device),
+            halted=torch.ones((batch_size, ), dtype=torch.bool, device=device),  # Default to halted
             
-            current_data={k: torch.empty_like(v) for k, v in batch.items()}
+            current_data={k: torch.empty_like(v) for k, v in batch.items()},
+            
+            # DQN tracking
+            prev_accuracy=torch.zeros((batch_size, ), dtype=torch.float32, device=device) if self.config.enable_dqn else None,
+            no_improvement_counter=torch.zeros((batch_size, ), dtype=torch.int32, device=device) if self.config.enable_dqn else None,
+            training_step=0
         )
         
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
@@ -277,14 +314,25 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                 # Halt signal
                 # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
                 
-                if self.config.no_ACT_continue:
-                    halted = halted | (q_halt_logits > 0)
+                if self.config.enable_dqn:
+                    # DQN: Epsilon-greedy exploration
+                    epsilon = compute_epsilon(
+                        carry.training_step,
+                        self.config.dqn_epsilon_start,
+                        self.config.dqn_epsilon_end,
+                        self.config.dqn_epsilon_decay_steps
+                    )
+                    halted = halted | select_action_epsilon_greedy(q_halt_logits, epsilon, self.training)
                 else:
-                    halted = halted | (q_halt_logits > q_continue_logits)
+                    # Original: random exploration
+                    if self.config.no_ACT_continue:
+                        halted = halted | (q_halt_logits > 0)
+                    else:
+                        halted = halted | (q_halt_logits > q_continue_logits)
 
-                # Exploration
-                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
-                halted = halted & (new_steps >= min_halt_steps)
+                    # Exploration
+                    min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
+                    halted = halted & (new_steps >= min_halt_steps)
 
                 if not self.config.no_ACT_continue:
                     # Compute target Q
@@ -294,4 +342,17 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
 
-        return TinyRecursiveReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+        # Update DQN tracking fields if enabled
+        new_prev_accuracy = carry.prev_accuracy
+        new_no_improvement_counter = carry.no_improvement_counter
+        new_training_step = carry.training_step
+        
+        return TinyRecursiveReasoningModel_ACTV1Carry(
+            new_inner_carry, 
+            new_steps, 
+            halted, 
+            new_current_data,
+            prev_accuracy=new_prev_accuracy,
+            no_improvement_counter=new_no_improvement_counter,
+            training_step=new_training_step
+        ), outputs

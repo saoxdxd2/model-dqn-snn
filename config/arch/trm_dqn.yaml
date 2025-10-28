@@ -1,0 +1,64 @@
+name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+  enable_dqn: True  # Enable DQN enhancement
+
+# ===== TRM Architecture (same as baseline) =====
+halt_exploration_prob: 0.1  # Not used when DQN enabled
+halt_max_steps: 16
+
+H_cycles: 3
+L_cycles: 6
+
+H_layers: 0
+L_layers: 2
+
+hidden_size: 512
+num_heads: 8
+expansion: 4
+
+puzzle_emb_ndim: ${.hidden_size}
+
+pos_encodings: rope
+forward_dtype: bfloat16
+
+mlp_t: False
+puzzle_emb_len: 16
+no_ACT_continue: True
+
+# ===== DQN Enhancement Parameters =====
+
+# Enable DQN
+enable_dqn: True
+
+# Replay Buffer
+dqn_buffer_capacity: 20000
+dqn_buffer_min_size: 5000
+dqn_batch_size: 256
+
+# Learning Parameters
+dqn_gamma: 0.99  # Discount factor
+
+# Target Network (Soft Polyak Update)
+dqn_target_tau: 0.005  # Soft update rate (0.5% online, 99.5% target)
+
+# Exploration (Epsilon-Greedy)
+dqn_epsilon_start: 0.5   # Conservative start (not 1.0)
+dqn_epsilon_end: 0.05
+dqn_epsilon_decay_steps: 100000
+
+# Reward Shaping (Manually Tuned)
+reward_accuracy_scale: 10.0        # +10 per 100% accuracy improvement
+reward_step_penalty: 0.02          # -0.02 per step (encourage efficiency)
+reward_terminal_correct: 10.0      # +10 for correct final answer
+reward_terminal_incorrect: -5.0    # -5 for incorrect early halt
+reward_stagnation_penalty: 0.1     # -0.1 per step without improvement
+reward_stagnation_threshold: 3     # Stagnation kicks in after 3 steps
+
+# Notes:
+# - This config enables DQN-based halting with experience replay and target network
+# - Epsilon starts at 0.5 (conservative) and decays to 0.05 over 100K steps
+# - Rewards are manually tuned for ARC-AGI puzzles
+# - All other parameters identical to baseline trm.yaml
+# - To disable DQN, set enable_dqn: False (reverts to original behavior)

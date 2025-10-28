@@ -5,6 +5,13 @@ import torch.nn.functional as F
 from torch import nn
 import math
 
+from models.replay_buffer import DQNReplayBuffer
+from models.dqn_utils import (
+    RunningStats,
+    compute_shaped_reward,
+    soft_update_target_network,
+)
+
 IGNORE_LABEL_ID = -100
 
 
@@ -39,10 +46,27 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str):
+    def __init__(self, model: nn.Module, loss_type: str, enable_dqn: bool = False):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
+        self.enable_dqn = enable_dqn
+        
+        # DQN components
+        if enable_dqn:
+            config = model.config
+            self.replay_buffer = DQNReplayBuffer(
+                capacity=config.dqn_buffer_capacity,
+                rank=0,  # Will be set properly in distributed training
+                world_size=1,
+                compress=True,
+            )
+            self.reward_stats = RunningStats()
+            self.dqn_step_counter = 0
+            self.dqn_loss_weight = 0.1  # Conservative start
+            
+            # Blank identifier for filtering padding
+            self.blank_identifier_id = None
         
     def initial_carry(self, *args, **kwargs):
         return self.model.initial_carry(*args, **kwargs)  # type: ignore
@@ -96,8 +120,139 @@ class ACTLossHead(nn.Module):
             q_continue_loss = F.binary_cross_entropy_with_logits(outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum")
 
             metrics["q_continue_loss"] = q_continue_loss.detach()
+        
+        # DQN loss computation
+        dqn_loss = 0
+        if self.enable_dqn and self.training:
+            # Compute current accuracy for reward shaping
+            curr_accuracy = torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), torch.zeros_like(seq_is_correct.float()))
+            
+            # Get previous accuracy from carry (or initialize to 0)
+            prev_accuracy = new_carry.prev_accuracy if new_carry.prev_accuracy is not None else torch.zeros_like(curr_accuracy)
+            
+            # Update no improvement counter
+            improvement = (curr_accuracy > prev_accuracy).long()
+            if new_carry.no_improvement_counter is not None:
+                no_improvement_counter = torch.where(improvement > 0, torch.zeros_like(new_carry.no_improvement_counter), new_carry.no_improvement_counter + 1)
+            else:
+                no_improvement_counter = torch.zeros_like(new_carry.steps)
+            
+            # Compute shaped rewards
+            rewards = compute_shaped_reward(
+                prev_accuracy=prev_accuracy,
+                curr_accuracy=curr_accuracy,
+                step=new_carry.steps,
+                max_steps=self.model.config.halt_max_steps,
+                is_terminal=new_carry.halted,
+                seq_is_correct=seq_is_correct,
+                no_improvement_counter=no_improvement_counter,
+                reward_accuracy_scale=self.model.config.reward_accuracy_scale,
+                reward_step_penalty=self.model.config.reward_step_penalty,
+                reward_terminal_correct=self.model.config.reward_terminal_correct,
+                reward_terminal_incorrect=self.model.config.reward_terminal_incorrect,
+                reward_stagnation_penalty=self.model.config.reward_stagnation_penalty,
+                reward_stagnation_threshold=self.model.config.reward_stagnation_threshold,
+            )
+            
+            # Normalize rewards
+            self.reward_stats.update(rewards.detach())
+            normalized_rewards = rewards  # Keep unnormalized for now
+            
+            # Store transitions in replay buffer
+            self._store_transitions(model_kwargs.get('carry'), new_carry, outputs, normalized_rewards)
+            
+            # Train DQN if buffer is ready
+            if len(self.replay_buffer) >= self.model.config.dqn_buffer_min_size:
+                dqn_loss = self._compute_dqn_loss()
+                metrics["dqn_loss"] = dqn_loss.detach()
+                metrics["dqn_buffer_size"] = len(self.replay_buffer)
+                
+                # Update target network (soft update every step)
+                soft_update_target_network(
+                    self.model.inner.q_head.parameters(),
+                    self.model.inner.q_head_target.parameters(),
+                    tau=self.model.config.dqn_target_tau
+                )
+            
+            # Update carry with new tracking values
+            new_carry.prev_accuracy = curr_accuracy
+            new_carry.no_improvement_counter = no_improvement_counter
+            new_carry.training_step = new_carry.training_step + 1
+            
+            self.dqn_step_counter += 1
+            
+            # Additional DQN metrics
+            metrics["dqn_reward_mean"] = rewards.mean().detach()
+            metrics["dqn_reward_std"] = rewards.std().detach()
+            metrics["dqn_epsilon"] = compute_shaped_reward.__code__.co_consts[0] if hasattr(self, '_last_epsilon') else 0.0
+        
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
+        
+        # Total loss
+        total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
+        if self.enable_dqn and isinstance(dqn_loss, torch.Tensor):
+            total_loss = total_loss + self.dqn_loss_weight * dqn_loss
 
-        return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
+        return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
+    
+    def _store_transitions(self, prev_carry, new_carry, outputs, rewards):
+        """Store transitions in replay buffer."""
+        if prev_carry is None or prev_carry.inner_carry is None:
+            return
+        
+        # Extract states
+        prev_state = prev_carry.inner_carry.z_H[:, 0]  # [batch, hidden_size]
+        curr_state = new_carry.inner_carry.z_H[:, 0]   # [batch, hidden_size]
+        
+        # Extract actions (halt = 1, continue = 0)
+        actions = new_carry.halted.long()
+        
+        # Extract other info
+        steps = new_carry.steps
+        dones = new_carry.halted
+        
+        # Unbatch and store individual transitions
+        batch_size = prev_state.shape[0]
+        for i in range(batch_size):
+            # Skip padding sequences if blank_identifier_id is set
+            if self.blank_identifier_id is not None:
+                if 'puzzle_identifiers' in new_carry.current_data:
+                    if new_carry.current_data['puzzle_identifiers'][i] == self.blank_identifier_id:
+                        continue
+            
+            self.replay_buffer.push(
+                state=prev_state[i],
+                action=actions[i],
+                reward=rewards[i],
+                next_state=curr_state[i],
+                done=dones[i],
+                step=steps[i],
+            )
+    
+    def _compute_dqn_loss(self):
+        """Sample from buffer and compute DQN TD-error loss."""
+        # Sample batch
+        batch = self.replay_buffer.sample(
+            self.model.config.dqn_batch_size,
+            device='cuda'
+        )
+        
+        # Q-values from online network
+        q_values = self.model.inner.q_head(batch['state'])  # [batch, 2]
+        # Select Q-value for taken action
+        q_selected = q_values.gather(1, batch['action'].unsqueeze(1)).squeeze(1)  # [batch]
+        
+        # Target Q-values from target network
+        with torch.no_grad():
+            next_q_values = self.model.inner.q_head_target(batch['next_state'])  # [batch, 2]
+            # Max Q-value for next state
+            next_q_max = next_q_values.max(dim=1)[0]  # [batch]
+            # Compute target: r + gamma * max_a' Q_target(s', a') * (1 - done)
+            target_q = batch['reward'] + self.model.config.dqn_gamma * next_q_max * (~batch['done']).float()
+        
+        # Compute loss (Huber loss for stability)
+        dqn_loss = F.smooth_l1_loss(q_selected, target_q)
+        
+        return dqn_loss
 
