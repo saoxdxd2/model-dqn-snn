@@ -327,7 +327,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
         metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
         # Reduce and reconstruct
-        metric_values = torch.stack([torch.as_tensor(metrics[k]) if not isinstance(metrics[k], torch.Tensor) else metrics[k] for k in metric_keys])
+        metric_values = torch.stack([torch.as_tensor(metrics[k], device='cuda') if not isinstance(metrics[k], torch.Tensor) else metrics[k] for k in metric_keys])
         if world_size > 1:
             dist.reduce(metric_values, dst=0)
 
