@@ -117,6 +117,109 @@ def tokenize_and_chunk(text: str, tokenizer, max_seq_len: int, stride: int):
     return sequences
 
 
+def create_tinystories_dataset_batched(config: TextDatasetConfig, dataset, tokenizer, vocab_size: int, pad_token_id: int, eos_token_id: int):
+    """
+    Process TinyStories in batches to avoid memory exhaustion.
+    Uses iterative processing instead of loading all text at once.
+    """
+    os.makedirs(config.output_dir, exist_ok=True)
+    
+    # Process in batches to avoid memory issues
+    # Optimized for Colab (12GB RAM): 4000 stories = ~8GB peak usage
+    batch_size = 4000  # Process 4000 stories at a time
+    max_train_stories = 100000
+    max_val_stories = 10000
+    
+    for split_name, split_data, max_stories in [
+        ("train", dataset['train'], max_train_stories),
+        ("test", dataset['validation'], max_val_stories)
+    ]:
+        print(f"\nTokenizing {split_name} set (batched processing)...")
+        os.makedirs(os.path.join(config.output_dir, split_name), exist_ok=True)
+        
+        all_inputs = []
+        all_labels = []
+        
+        story_count = 0
+        batch_texts = []
+        
+        # Process stories in batches
+        for idx, example in enumerate(tqdm(split_data, total=max_stories, desc=f"Processing {split_name}")):
+            if story_count >= max_stories:
+                break
+            
+            batch_texts.append(example['text'])
+            story_count += 1
+            
+            # Process batch when it reaches batch_size or end of data
+            if len(batch_texts) >= batch_size or story_count >= max_stories:
+                # Tokenize batch efficiently
+                batch_tokens = tokenizer(batch_texts, truncation=True, max_length=config.max_seq_len, 
+                                        return_attention_mask=False, return_token_type_ids=False)
+                
+                # Process each story's tokens
+                for tokens in batch_tokens['input_ids']:
+                    # Create overlapping chunks from this story
+                    for i in range(0, len(tokens) - config.max_seq_len + 1, config.stride):
+                        chunk = tokens[i:i + config.max_seq_len]
+                        if len(chunk) == config.max_seq_len:
+                            all_inputs.append(chunk)
+                            # Labels: shift by 1 for next-token prediction
+                            labels = chunk[1:] + [eos_token_id]
+                            all_labels.append(labels)
+                
+                # Clear batch
+                batch_texts = []
+        
+        # Process any remaining texts in partial batch
+        if batch_texts:
+            batch_tokens = tokenizer(batch_texts, truncation=True, max_length=config.max_seq_len,
+                                    return_attention_mask=False, return_token_type_ids=False)
+            for tokens in batch_tokens['input_ids']:
+                for i in range(0, len(tokens) - config.max_seq_len + 1, config.stride):
+                    chunk = tokens[i:i + config.max_seq_len]
+                    if len(chunk) == config.max_seq_len:
+                        all_inputs.append(chunk)
+                        labels = chunk[1:] + [eos_token_id]
+                        all_labels.append(labels)
+        
+        print(f"Created {len(all_inputs)} sequences from {story_count} stories")
+        
+        # Save as numpy arrays
+        results = {
+            "inputs": np.array(all_inputs, dtype=np.int32),
+            "labels": np.array(all_labels, dtype=np.int32),
+            "puzzle_identifiers": np.zeros(len(all_inputs), dtype=np.int32),
+            "puzzle_indices": np.arange(len(all_inputs) + 1, dtype=np.int32),
+            "group_indices": np.array([0, len(all_inputs)], dtype=np.int32)
+        }
+        
+        for k, v in results.items():
+            np.save(os.path.join(config.output_dir, split_name, f"all__{k}.npy"), v)
+        
+        # Save metadata
+        metadata = PuzzleDatasetMetadata(
+            seq_len=config.max_seq_len,
+            vocab_size=vocab_size,
+            pad_id=pad_token_id,
+            ignore_label_id=-100,
+            blank_identifier_id=0,
+            num_puzzle_identifiers=1,
+            total_groups=1,
+            mean_puzzle_examples=1.0,
+            total_puzzles=len(all_inputs),
+            sets=["all"]
+        )
+        
+        with open(os.path.join(config.output_dir, split_name, "dataset.json"), "w") as f:
+            json.dump(metadata.model_dump(), f, indent=2)
+    
+    print(f"\n✅ TinyStories dataset created successfully!")
+    print(f"   Output: {config.output_dir}")
+    print(f"   Vocab size: {vocab_size}")
+    print(f"   Sequence length: {config.max_seq_len}")
+
+
 def create_text_dataset(config: TextDatasetConfig):
     """Create tokenized text dataset for TRM training."""
     
@@ -145,9 +248,10 @@ def create_text_dataset(config: TextDatasetConfig):
         dataset = download_tinystories()
         if dataset is None:
             raise RuntimeError("Failed to download TinyStories")
-        # TinyStories has 'train' and 'validation' splits
-        train_text = "\n".join(dataset['train']['text'][:100000])  # Use first 100k stories
-        test_text = "\n".join(dataset['validation']['text'][:10000])  # Use first 10k for test
+        # TinyStories: Use batched processing to avoid memory exhaustion
+        print("Using 100k train stories, 10k validation stories")
+        create_tinystories_dataset_batched(config, dataset, tokenizer, vocab_size, pad_token_id, eos_token_id)
+        return
         print(f"Using 100k train stories, 10k validation stories")
     elif config.input_file == "code-python":
         dataset = download_code_python()

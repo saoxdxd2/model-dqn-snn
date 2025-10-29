@@ -163,8 +163,13 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     # Build model config: merge YAML arch config with dataset metadata
     # __pydantic_extra__ contains all extra YAML fields (causal, input_vocab_size, etc.)
     # Dataset metadata overrides seq_len/vocab_size/num_puzzle_identifiers
+    
+    # Filter out keys that will be explicitly set to avoid duplicate keyword argument error
+    extra_config = {k: v for k, v in config.arch.__pydantic_extra__.items() 
+                   if k not in ['batch_size', 'vocab_size', 'seq_len', 'num_puzzle_identifiers']}
+    
     model_cfg = dict(
-        **config.arch.__pydantic_extra__,  # type: ignore
+        **extra_config,
         batch_size=config.global_batch_size // world_size,
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
