@@ -5,14 +5,19 @@ loss:
   enable_dqn: True  # Enable DQN for adaptive reasoning
   deep_supervision_steps: 6
 
-# Image dataset parameters
-seq_len: 196  # 14×14 patches from ViT (224×224 image, 16×16 patch size)
-vocab_size: 1000  # ImageNet-1K classes (or 10 for CIFAR-10)
-batch_size: 64  # Good for image training
+# Dataset parameters
+seq_len: 64  # 8x8 spatial grid from CNN stem (was 16 for patch tokens)
+vocab_size: 10  # CIFAR-10 classes (output)
+batch_size: 32
 
-# Halting parameters (more aggressive for vision)
-halt_exploration_prob: 0.15
-halt_max_steps: 10  # Images may need more reasoning
+# CNN Tokenizer (CCT-style convolutional stem)
+use_cnn_tokenizer: True  # Use CNN instead of K-Means patch embedding
+cnn_in_channels: 3  # RGB images
+cnn_conv_channels: [64, 128, 256]  # Progressive feature extraction
+
+# Halting parameters
+halt_exploration_prob: 0.05
+halt_max_steps: 10  # Vision tasks converge faster with CNN features
 
 # Recursion Depth (balanced for vision)
 H_cycles: 3
@@ -21,18 +26,18 @@ L_cycles: 2
 H_layers: 0
 L_layers: 2
 
-# Model size
-hidden_size: 384  # ViT-Small standard
-num_heads: 6
-num_key_value_heads: 6
-expansion: 4  # Standard FFN expansion
+# Model size (optimized for patch tokens)
+hidden_size: 256  # Medium size (each patch token is rich)
+num_heads: 8
+num_key_value_heads: 8
+expansion: 4  # Standard expansion
 
-# No puzzle embeddings (using ViT patch embeddings instead)
+# No puzzle embeddings (patches are the tokens)
 puzzle_emb_ndim: 0
 num_puzzle_identifiers: 1
 
 # Vision-specific settings
-pos_encodings: learned  # ViT uses learned position embeddings
+pos_encodings: rope  # RoPE works well for spatial relationships
 rope_theta: 10000
 rms_norm_eps: 1e-6
 forward_dtype: bfloat16
@@ -40,7 +45,7 @@ causal: False  # CRITICAL: Bidirectional for image understanding
 
 # Optimizations
 mlp_t: False
-puzzle_emb_len: 1  # CLS token for classification
+puzzle_emb_len: 0  # CRITICAL: Must be 0 when puzzle_emb_ndim=0
 no_ACT_continue: True
 use_learned_halting_eval: True
 
@@ -62,6 +67,9 @@ dqn_target_tau: 0.005
 dqn_epsilon_start: 0.3
 dqn_epsilon_end: 0.05
 dqn_epsilon_decay_steps: 50000
+
+# Selective storage (Schaul et al., 2015: 20-40% memory savings)
+dqn_td_threshold: 0.01  # Only store transitions with |TD-error| > threshold (0.0 = disabled)
 
 # Reward shaping for vision
 reward_step_penalty: 0.02

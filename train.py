@@ -71,17 +71,18 @@ MODELS = {
         "description": "Train on Python code from The Stack (deduplicated)"
     },
     "vision": {
-        "name": "Image Understanding (ViT + TRM + DQN)",
+        "name": "Image Understanding (Patch Tokens + TRM + DQN)",
         "config": "cfg_vision",
         "dataset_builder": "dataset/build_image_dataset.py",
         "dataset_args": {
             "dataset_name": "cifar10",
             "output_dir": "data/vision-cifar10",
-            "patch_size": 16,
-            "image_size": 224,
+            "patch_size": 8,  # 8×8 patches (4×4 grid = 16 tokens)
+            "vocab_size": 2048,  # Patch vocabulary (learned codebook)
+            "image_size": 32,  # CIFAR-10 native size
             "seed": 42
         },
-        "description": "Train on CIFAR-10 images with ViT patches + recursive reasoning + DQN"
+        "description": "Train on CIFAR-10 with patch tokenization (like BPE for images) + DQN"
     }
 }
 

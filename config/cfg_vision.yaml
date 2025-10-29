@@ -14,8 +14,8 @@ data_paths_test: []
 
 evaluators: []
 
-# Training hyperparams (optimized for vision)
-global_batch_size: 64
+# Training hyperparams (optimized for patch tokens)
+global_batch_size: 32  # Match trm_vision.yaml batch_size
 epochs: 200
 eval_interval: 10
 checkpoint_every_eval: True

@@ -12,9 +12,12 @@ import random
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
+from models.common import *
+from models.base_types import *
 from models.dqn_utils import compute_epsilon, select_action_epsilon_greedy
 from models.q_heads import create_q_head
 from models.memory_bank import AssociativeMemoryBank
+from models.cnn_tokenizer import CNNTokenizer
 
 # Selective checkpointing policy: save matmuls, recompute cheap ops
 try:
@@ -69,7 +72,8 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     seq_len: int
     puzzle_emb_ndim: int = 0
     num_puzzle_identifiers: int
-    vocab_size: int
+    vocab_size: int  # Output vocabulary (classes for vision, tokens for text)
+    input_vocab_size: Optional[int] = None  # Input vocabulary (patch tokens for vision, same as vocab_size for text)
 
     H_cycles: int
     L_cycles: int
@@ -215,8 +219,33 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.embed_scale = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
-        self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # Support separate input/output vocabularies (for vision classification)
+        # input_vocab_size: patch tokens (e.g., 2048 for VQ-VAE)
+        # output_vocab_size: classes (e.g., 10 for CIFAR-10)
+        input_vocab_size = getattr(self.config, 'input_vocab_size', self.config.vocab_size)
+        output_vocab_size = self.config.vocab_size  # Always use vocab_size for output
+        
+        # Vision: CNN tokenizer or embedding table
+        use_cnn_tokenizer = getattr(self.config, 'use_cnn_tokenizer', False)
+        if use_cnn_tokenizer:
+            # CNN stem for vision (CCT-style)
+            cnn_in_channels = getattr(self.config, 'cnn_in_channels', 3)
+            cnn_conv_channels = getattr(self.config, 'cnn_conv_channels', [64, 128, self.config.hidden_size])
+            self.cnn_tokenizer = CNNTokenizer(
+                in_channels=cnn_in_channels,
+                hidden_size=self.config.hidden_size,
+                num_conv_layers=len(cnn_conv_channels),
+                conv_channels=cnn_conv_channels,
+                use_batch_norm=True,
+                activation='relu'
+            )
+            self.embed_tokens = None  # No embedding table needed
+        else:
+            # Standard embedding table
+            self.embed_tokens = CastedEmbedding(input_vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+            self.cnn_tokenizer = None
+        
+        self.lm_head = CastedLinear(self.config.hidden_size, output_vocab_size, bias=False)
         
         # Q-head: Configurable architecture (MLP/RNN/Mini-Attention)
         self.q_head = create_q_head(self.config)
@@ -296,13 +325,18 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         
         return MTPDepthModule(
             self.config,
-            self.embed_tokens,
+            self.embed_tokens if self.embed_tokens is not None else None,
             self.lm_head
         )
     
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
-        # Token embedding
-        embedding = self.embed_tokens(input.to(torch.int32))
+        # Token embedding: CNN tokenizer or embedding table
+        if self.cnn_tokenizer is not None:
+            # CNN tokenizer: input is raw images [B, C, H, W]
+            embedding = self.cnn_tokenizer(input)  # -> [B, seq_len, hidden_size]
+        else:
+            # Standard embedding: input is token IDs [B, seq_len]
+            embedding = self.embed_tokens(input.to(torch.int32))
 
         # Puzzle embeddings
         if self.config.puzzle_emb_ndim > 0:

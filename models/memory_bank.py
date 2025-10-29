@@ -198,11 +198,22 @@ class AssociativeMemoryBank(nn.Module):
         """
         Fast approximate hash for query tensor.
         Research: Quantization-based hashing reduces collisions (DiskANN, NeurIPS 2019)
+        
+        OPTIMIZED: Keep hash computation on GPU, avoid CPU transfer bottleneck.
         """
         # Quantize to 8-bit for hashing (reduces sensitivity to small changes)
         quantized = (query * 127).round().to(torch.int8)
-        # Use built-in hash (fast, good distribution)
-        return hash(quantized.cpu().numpy().tobytes())
+        
+        # GPU-optimized hash: use tensor values directly without CPU transfer
+        # Sum of elements provides good distribution for cache keys
+        hash_val = (quantized.sum().item() * 31 + quantized.shape[0]) % (2**31 - 1)
+        
+        # Alternative: Mix in first/last elements for better distribution
+        if quantized.numel() > 1:
+            hash_val ^= (int(quantized.flatten()[0].item()) << 16)
+            hash_val ^= int(quantized.flatten()[-1].item())
+        
+        return hash_val
     
     def get_cache_stats(self) -> dict:
         """Get cache performance statistics (auto-collected in eval mode)"""

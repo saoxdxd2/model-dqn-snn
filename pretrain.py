@@ -160,13 +160,15 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
 
 
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+    # Build model config: merge YAML arch config with dataset metadata
+    # __pydantic_extra__ contains all extra YAML fields (causal, input_vocab_size, etc.)
+    # Dataset metadata overrides seq_len/vocab_size/num_puzzle_identifiers
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
         batch_size=config.global_batch_size // world_size,
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
-        causal=False  # Non-autoregressive
     )
 
     # Instantiate model with loss head
@@ -191,7 +193,9 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                     dist.broadcast(param, src=0)
 
     # Optimizers and lr
-    if config.arch.puzzle_emb_ndim == 0:
+    # Handle puzzle_emb_ndim=0 case: no puzzle embeddings, only main optimizer
+    if config.arch.puzzle_emb_ndim == 0 or not hasattr(model.model, 'puzzle_emb'):
+        # Text/Code/Vision models without puzzle-specific embeddings
         optimizers = [
             AdamAtan2(
                 model.parameters(),
@@ -204,6 +208,9 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             config.lr
         ]
     elif config.freeze_weights:
+        # Only train puzzle embeddings (freeze main model)
+        if not hasattr(model.model, 'puzzle_emb'):
+            raise ValueError("freeze_weights=True requires puzzle_emb_ndim > 0")
         optimizers = [
             CastedSparseEmbeddingSignSGD_Distributed(
                 model.model.puzzle_emb.buffers(),  # type: ignore
@@ -216,6 +223,9 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             config.puzzle_emb_lr
         ]
     else:
+        # ARC models: train both puzzle embeddings and main model
+        if not hasattr(model.model, 'puzzle_emb'):
+            raise ValueError("Dual optimizer mode requires puzzle_emb_ndim > 0")
         optimizers = [
             CastedSparseEmbeddingSignSGD_Distributed(
                 model.model.puzzle_emb.buffers(),  # type: ignore

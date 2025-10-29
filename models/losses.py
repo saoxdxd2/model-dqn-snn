@@ -64,6 +64,7 @@ class ACTLossHead(nn.Module):
                 prioritized=getattr(config, 'enable_prioritized_replay', False),
                 alpha=getattr(config, 'per_alpha', 0.6),
                 beta=getattr(config, 'per_beta', 0.4),
+                td_threshold=getattr(config, 'dqn_td_threshold', 0.0),  # Selective storage
             )
             self.reward_stats = RunningStats()
             self.dqn_step_counter = 0
@@ -366,6 +367,14 @@ class ACTLossHead(nn.Module):
                 metrics["memory_cache_entries"] = cache_stats['cache_entries']
                 metrics["memory_cache_hits"] = cache_stats['cache_hits']
                 metrics["memory_cache_misses"] = cache_stats['cache_misses']
+            
+            # Replay buffer statistics (monitor selective storage)
+            if len(self.replay_buffer) > 0:
+                buffer_stats = self.replay_buffer.get_stats()
+                metrics["replay_buffer_size"] = buffer_stats['size']
+                metrics["replay_buffer_utilization"] = buffer_stats['utilization']
+                metrics["replay_buffer_rejection_rate"] = buffer_stats['rejection_rate']
+                metrics["replay_buffer_rejected_count"] = buffer_stats['rejected_count']
         
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
@@ -384,7 +393,7 @@ class ACTLossHead(nn.Module):
         return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
     
     def _store_transitions(self, prev_carry, new_carry, outputs, rewards):
-        """Store transitions in replay buffer."""
+        """Store transitions in replay buffer with TD-error for selective storage."""
         if prev_carry is None or prev_carry.inner_carry is None:
             return
         
@@ -399,6 +408,27 @@ class ACTLossHead(nn.Module):
         steps = new_carry.steps
         dones = new_carry.halted
         
+        # Compute TD-error for selective storage (Schaul et al., 2015)
+        # TD-error = |Q(s,a) - (r + γ * max_a' Q(s',a'))|
+        td_errors = None
+        if hasattr(self.model.inner, 'q_head'):
+            with torch.no_grad():
+                # Current Q-values
+                q_values = self.model.inner.q_head(prev_state)  # [batch, 2]
+                current_q = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)  # [batch]
+                
+                # Target Q-values (use target network if available)
+                q_head_target = getattr(self.model.inner, 'q_head_target', self.model.inner.q_head)
+                next_q_values = q_head_target(curr_state)  # [batch, 2]
+                next_q_max = next_q_values.max(dim=1)[0]  # [batch]
+                
+                # TD target
+                gamma = self.model.config.dqn_gamma if hasattr(self.model.config, 'dqn_gamma') else 0.99
+                targets = rewards + gamma * next_q_max * (~dones).float()
+                
+                # TD-error (absolute)
+                td_errors = (current_q - targets).abs().cpu().numpy()
+        
         # Unbatch and store individual transitions
         batch_size = prev_state.shape[0]
         for i in range(batch_size):
@@ -408,6 +438,9 @@ class ACTLossHead(nn.Module):
                     if new_carry.current_data['puzzle_identifiers'][i] == self.blank_identifier_id:
                         continue
             
+            # Extract TD-error for this sample (if available)
+            td_error_val = float(td_errors[i]) if td_errors is not None else None
+            
             self.replay_buffer.push(
                 state=prev_state[i],
                 action=actions[i],
@@ -415,6 +448,7 @@ class ACTLossHead(nn.Module):
                 next_state=curr_state[i],
                 done=dones[i],
                 step=steps[i],
+                td_error=td_error_val,  # Pass TD-error for selective storage
             )
     
     def _compute_dqn_loss(self):
