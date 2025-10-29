@@ -259,7 +259,11 @@ def process_puzzle_direct(name: str, puzzle: dict, examples: List[Tuple[np.ndarr
     Converts augmentations to examples immediately.
     """
     processed_examples = []
-    hashes = {puzzle_hash({"train": [{'input': inp.tolist(), 'output': out.tolist()} for inp, out in examples]})}
+    # Use simple hash for uniqueness checking (puzzle_hash expects ARCPuzzle objects)
+    def simple_hash(inp, out):
+        return hashlib.sha256(inp.tobytes() + out.tobytes()).hexdigest()
+    
+    hashes = {simple_hash(inp, out) for inp, out in examples}
     
     # Add original examples
     for inp, out in examples:
@@ -277,9 +281,8 @@ def process_puzzle_direct(name: str, puzzle: dict, examples: List[Tuple[np.ndarr
             if aug_added >= aug_count:
                 break
             for inp_aug, out_aug in aug_group:
-                # Check uniqueness
-                puzzle_dict = {"train": [{'input': inp_aug.tolist(), 'output': out_aug.tolist()}]}
-                h = puzzle_hash(puzzle_dict)
+                # Check uniqueness using simple hash
+                h = simple_hash(inp_aug, out_aug)
                 if h not in hashes:
                     hashes.add(h)
                     converted = np_grid_to_seq_translational_augment(inp_aug, out_aug, do_translation=True)
