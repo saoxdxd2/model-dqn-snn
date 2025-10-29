@@ -171,13 +171,13 @@ class ACTLossHead(nn.Module):
             }
 
         # Losses
-        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor).sum()
         
         # Deep supervision: add intermediate losses (TRM paper: +20% accuracy)
         if intermediate_logits is not None and self.training:
             deep_supervision_losses = []
             for inter_logits in intermediate_logits:
-                inter_loss = (self.loss_fn(inter_logits, labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+                inter_loss = (self.loss_fn(inter_logits, labels, ignore_index=IGNORE_LABEL_ID) / loss_divisor).sum()
                 deep_supervision_losses.append(inter_loss)
             
             # Average intermediate losses with final loss
@@ -192,7 +192,7 @@ class ACTLossHead(nn.Module):
             for depth, depth_logits in enumerate(mtp_logits):
                 # Target is shifted labels (predict future tokens)
                 depth_targets = torch.cat([labels[:, depth+1:], torch.full((labels.size(0), depth+1), IGNORE_LABEL_ID, dtype=labels.dtype, device=labels.device)], dim=1)
-                depth_loss = (self.loss_fn(depth_logits, depth_targets, ignore_index=IGNORE_LABEL_ID, valid_mask=(depth_targets != IGNORE_LABEL_ID)) / loss_divisor).sum()
+                depth_loss = (self.loss_fn(depth_logits, depth_targets, ignore_index=IGNORE_LABEL_ID) / loss_divisor).sum()
                 mtp_losses.append(depth_loss)
             
             # Average across depths (as per DeepSeek paper)
