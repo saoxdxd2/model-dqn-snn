@@ -176,6 +176,13 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
     )
+    
+    # Debug: Check critical parameters
+    print(f"\n🔍 Model Config Debug:")
+    print(f"   vocab_size: {model_cfg.get('vocab_size')}")
+    print(f"   input_vocab_size: {model_cfg.get('input_vocab_size', 'NOT SET')}")
+    print(f"   hidden_size: {model_cfg.get('hidden_size', 'NOT SET')}")
+    print(f"   seq_len: {model_cfg.get('seq_len')}")
 
     # Instantiate model with loss head
     model_cls = load_model_class(config.arch.name)
