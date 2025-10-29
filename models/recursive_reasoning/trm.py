@@ -339,7 +339,10 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding: CNN tokenizer or embedding table
         if self.cnn_tokenizer is not None:
-            # CNN tokenizer: input is raw images [B, C, H, W]
+            # CNN tokenizer: input is raw images
+            # Transpose from [B, H, W, C] to [B, C, H, W] (PyTorch convention)
+            if input.dim() == 4 and input.shape[-1] in [1, 3]:  # Detect [B, H, W, C]
+                input = input.permute(0, 3, 1, 2)  # -> [B, C, H, W]
             embedding = self.cnn_tokenizer(input)  # -> [B, seq_len, hidden_size]
         else:
             # Standard embedding: input is token IDs [B, seq_len]
