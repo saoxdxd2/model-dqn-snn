@@ -77,17 +77,29 @@ class AssociativeMemoryBank(nn.Module):
             if cache_hit:
                 return cached_output
         
+        # Store original dtype
+        original_dtype = query.dtype
+        
         # Expand keys/values for batch
         keys = self.memory_keys.unsqueeze(0).expand(batch_size, -1, -1)
         values = self.memory_values.unsqueeze(0).expand(batch_size, -1, -1)
         
         # Attention-based retrieval (dropout respects training mode)
         query_expanded = query.unsqueeze(1)  # [batch, 1, hidden]
+        
+        # Cast to float32 for attention (nn.MultiheadAttention uses float32 weights)
+        query_expanded = query_expanded.float()
+        keys = keys.float()
+        values = values.float()
+        
         attn_output, attn_weights = self.attention(
             query_expanded, keys, values,
             need_weights=True
         )  # attn_output: [batch, 1, hidden]
         # Note: nn.MultiheadAttention automatically respects self.training for dropout
+        
+        # Cast back to original dtype
+        attn_output = attn_output.to(original_dtype)
         
         # Update usage statistics (LRU tracking)
         with torch.no_grad():
