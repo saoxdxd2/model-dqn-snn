@@ -34,6 +34,9 @@ class TinyRecursiveReasoningModel_ACTV1Carry:
     # DQN tracking
     prev_accuracy: Optional[torch.Tensor] = None
     training_step: int = 0  # Global training step for epsilon decay
+    
+    # Puzzle boundary tracking (for RNN Q-head state reset)
+    puzzle_ids: Optional[torch.Tensor] = None  # Track current puzzle IDs to detect changes
 
 
 class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
@@ -90,6 +93,14 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     q_head_type: str = "mlp"  # Options: "mlp", "rnn", "mini_attention"
     q_head_hidden_size: int = 128  # Hidden size for RNN/attention Q-head
     q_head_num_layers: int = 1  # Number of RNN layers or attention heads
+
+    # Exploration Enhancement
+    entropy_regularization_weight: float = 0.01  # Weight for entropy bonus in Q-value loss
+    enable_entropy_regularization: bool = True   # Enable entropy regularization for exploration
+    
+    # Export Configuration (for CPU inference)
+    export_to_snn: bool = False     # Convert Q-head to Spiking Neural Network
+    export_to_bnn: bool = False     # Convert Q-head to Binary Neural Network (1-bit weights)
 
     # Memory Bank Configuration
     enable_memory: bool = False
@@ -245,7 +256,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
         )
 
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], 
+                enable_deep_supervision: bool = False, supervision_steps: int = 4) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
@@ -254,16 +266,25 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
 
         # Forward iterations
-        it = 0
         z_H, z_L = carry.z_H, carry.z_L
         
-        # H_cycles-1 without grad
-        with torch.no_grad():
-            for _H_step in range(self.config.H_cycles-1):
-                # Dynamic memory query at each H-cycle (based on current z_H state)
+        # Deep supervision: collect intermediate outputs
+        intermediate_outputs = [] if enable_deep_supervision else None
+        supervision_interval = max(1, self.config.H_cycles // supervision_steps) if enable_deep_supervision else self.config.H_cycles
+        
+        # Process H-cycles (with selective gradient computation)
+        for h_step in range(self.config.H_cycles):
+            # Determine if this step should have gradients
+            is_supervision_step = enable_deep_supervision and (h_step % supervision_interval == 0 or h_step == self.config.H_cycles - 1)
+            is_final_step = (h_step == self.config.H_cycles - 1)
+            
+            # Context manager for gradient control
+            context = torch.enable_grad() if (is_supervision_step or is_final_step) else torch.no_grad()
+            
+            with context:
+                # Dynamic memory query at each H-cycle
                 memory_content = None
                 if self.memory is not None:
-                    # Read memory based on current state
                     memory_content = self.memory.read(z_H[:, 0])  # [batch, hidden_size]
                     memory_content = memory_content.unsqueeze(1)  # [batch, 1, hidden_size]
                 
@@ -274,25 +295,27 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                         h_input = h_input + memory_content
                     z_L = self.L_level(z_L, h_input, **seq_info)
                 z_H = self.L_level(z_H, z_L, **seq_info)
-        
-        # Final H-cycle with grad
-        memory_content = None
-        if self.memory is not None:
-            # Read memory based on current state
-            memory_content = self.memory.read(z_H[:, 0])  # [batch, hidden_size]
-            memory_content = memory_content.unsqueeze(1)  # [batch, 1, hidden_size]
-        
-        for _L_step in range(self.config.L_cycles):
-            h_input = z_H + input_embeddings
-            if memory_content is not None:
-                h_input = h_input + memory_content
-            z_L = self.L_level(z_L, h_input, **seq_info)
-        z_H = self.L_level(z_H, z_L, **seq_info)
+                
+                # Collect intermediate output for supervision
+                if is_supervision_step and intermediate_outputs is not None:
+                    intermediate_output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+                    intermediate_outputs.append(intermediate_output)
+                
+                # Detach for next iteration (unless final or supervision step)
+                if not is_final_step:
+                    z_H = z_H.detach()
+                    z_L = z_L.detach()
 
-        # LM Outputs
-        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
+        # Final outputs
+        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32) # Q-head; uses the first puzzle_emb position
+        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
+        
+        # Store intermediate outputs in extra field
+        if intermediate_outputs:
+            # Return intermediate outputs for deep supervision loss
+            output = {'final': output, 'intermediate': intermediate_outputs}
+        
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
 
@@ -322,7 +345,10 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             
             # DQN tracking
             prev_accuracy=torch.zeros((batch_size, ), dtype=torch.float32, device=device) if self.config.enable_dqn else None,
-            training_step=0
+            training_step=0,
+            
+            # Puzzle boundary tracking
+            puzzle_ids=torch.zeros((batch_size, ), dtype=torch.int64, device=device) if hasattr(self.inner, 'q_head') and hasattr(self.inner.q_head, 'reset_hidden') else None
         )
         
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
@@ -334,17 +360,49 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
         new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
 
-        # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
+        # Forward inner model (enable deep supervision in training)
+        enable_deep_supervision = self.training and hasattr(self.config, 'deep_supervision_steps')
+        supervision_steps = getattr(self.config, 'deep_supervision_steps', 1)
+        new_inner_carry, logits_or_dict, (q_halt_logits, q_continue_logits) = self.inner(
+            new_inner_carry, new_current_data, 
+            enable_deep_supervision=enable_deep_supervision,
+            supervision_steps=supervision_steps
+        )
 
-        outputs = {
-            "logits": logits,
-            "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits,
-            "z_H": new_inner_carry.z_H  # Needed for memory bank writing
-        }
+        # Unwrap deep supervision outputs (critical for workflow)
+        if isinstance(logits_or_dict, dict) and 'final' in logits_or_dict:
+            # Deep supervision: pass through as-is for loss computation
+            outputs = logits_or_dict  # Contains 'final' and 'intermediate'
+            outputs['q_halt_logits'] = q_halt_logits
+            outputs['q_continue_logits'] = q_continue_logits
+            outputs['z_H'] = new_inner_carry.z_H
+        else:
+            # Normal: just tensor
+            outputs = {
+                "logits": logits_or_dict,
+                "q_halt_logits": q_halt_logits,
+                "q_continue_logits": q_continue_logits,
+                "z_H": new_inner_carry.z_H
+            }
 
         with torch.no_grad():
+            # Initialize halted flag
+            halted = carry.halted
+            
+            # Detect puzzle boundary changes (new puzzle started)
+            puzzle_changed = torch.zeros_like(halted)
+            if carry.puzzle_ids is not None and 'puzzle_identifiers' in new_current_data:
+                current_puzzle_ids = new_current_data['puzzle_identifiers'].view(-1)
+                puzzle_changed = (carry.puzzle_ids != current_puzzle_ids) & (carry.puzzle_ids != 0)
+                # Update tracked puzzle IDs
+                new_puzzle_ids = torch.where(carry.halted, current_puzzle_ids, carry.puzzle_ids)
+            
+            # Reset RNN Q-head state for puzzle boundaries (CRITICAL FIX)
+            # This prevents state contamination when a new puzzle starts
+            if hasattr(self.inner.q_head, 'reset_hidden') and puzzle_changed.any():
+                batch_size = batch["inputs"].shape[0]
+                self.inner.q_head.reset_hidden(batch_size, mask=puzzle_changed)
+            
             # Step
             new_steps = new_steps + 1
             is_last_step = new_steps >= self.config.halt_max_steps
@@ -386,7 +444,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                     _, _, (next_q_halt_logits, next_q_continue_logits), _, _ = self.inner(new_inner_carry, new_current_data)
                     outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
             
-            # Reset RNN Q-head state for sequences that halted (prevents contamination across puzzles)
+            # Reset RNN Q-head state for sequences that halted (prevents contamination across episodes within same puzzle)
             if hasattr(self.inner.q_head, 'reset_hidden') and halted.any():
                 batch_size = batch["inputs"].shape[0]
                 self.inner.q_head.reset_hidden(batch_size, mask=halted)
@@ -396,11 +454,15 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         # Increment training_step for epsilon decay (done here, not in losses)
         new_training_step = carry.training_step + 1 if self.config.enable_dqn else carry.training_step
         
+        # Update puzzle_ids if tracked
+        final_puzzle_ids = new_puzzle_ids if carry.puzzle_ids is not None and 'puzzle_identifiers' in new_current_data else None
+        
         return TinyRecursiveReasoningModel_ACTV1Carry(
             new_inner_carry, 
             new_steps, 
             halted, 
             new_current_data,
             prev_accuracy=new_prev_accuracy,
-            training_step=new_training_step
+            training_step=new_training_step,
+            puzzle_ids=final_puzzle_ids
         ), outputs

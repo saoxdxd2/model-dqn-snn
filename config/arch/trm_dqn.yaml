@@ -3,19 +3,22 @@ loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
   enable_dqn: True  # Enable DQN enhancement
+  deep_supervision_steps: 4  # TRM paper: multi-step supervision (+20% accuracy)
 
 # ===== TRM Architecture (same as baseline) =====
 halt_exploration_prob: 0.1  # Not used when DQN enabled
 halt_max_steps: 16
 
-H_cycles: 3
-L_cycles: 6
+# OPTIMAL (TRM paper): Deep recursion + small model
+H_cycles: 16  # Paper: 16 H-cycles (from 3) → +7.9% accuracy
+L_cycles: 1   # Paper: 1 L-cycle (from 6) → optimal
 
 H_layers: 0
-L_layers: 2
+L_layers: 2   # Paper: 2 layers optimal (tested 2,4,8)
 
-hidden_size: 512
-num_heads: 8
+# CRITICAL: Smaller prevents overfitting on small datasets
+hidden_size: 128  # Paper: 64-128 optimal (from 512)
+num_heads: 4      # Scaled proportionally
 expansion: 4
 
 puzzle_emb_ndim: ${.hidden_size}
@@ -29,8 +32,8 @@ no_ACT_continue: True
 
 # ===== DQN Enhancement Parameters =====
 
-# Enable DQN
-enable_dqn: True
+# Disable DQN (paper: simple BCE > Q-learning for small datasets)
+enable_dqn: False
 
 # Replay Buffer
 dqn_buffer_capacity: 20000
@@ -53,15 +56,15 @@ reward_step_penalty: 0.01          # -0.01 per step (1 step = 1% accuracy trade-
 reward_terminal_correct: 1.0       # +1.0 bonus for correct halt, scaled by efficiency
 reward_terminal_incorrect: -0.5    # -0.5 penalty for incorrect early halt
 
-# Q-Head Architecture (Training vs Inference)
-q_head_type: "rnn"  # Options: "mlp" (default), "rnn" (better temporal), "mini_attention"
-q_head_hidden_size: 128  # Hidden size for RNN/attention Q-head
-q_head_num_layers: 1     # Number of RNN layers or attention heads
+# Q-Head Architecture (simplified)
+q_head_type: "mlp"  # Simplified (RNN adds complexity for halting)
+q_head_hidden_size: 64   # Scaled down with model
+q_head_num_layers: 1
 
-# Memory Bank Configuration
+# Memory Bank Configuration (few-shot learning ready)
 enable_memory: True       # Enable associative memory for pattern reuse
-memory_capacity: 4096     # Number of memory slots (increased from 512)
-memory_num_heads: 8       # Multi-head attention for memory retrieval
+memory_capacity: 4096     # Number of memory slots
+memory_num_heads: 4       # Scaled down with model
 memory_dropout: 0.1       # Dropout for memory attention
 memory_reward_bonus: 0.5  # Reward bonus for memory-assisted improvements
 memory_reward_threshold: 0.05  # Minimum improvement (5%) to store in memory

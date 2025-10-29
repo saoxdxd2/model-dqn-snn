@@ -44,16 +44,17 @@ class DQNReplayBuffer:
         self.compress = compress
         self.storage_dtype = storage_dtype
         
-        # Storage on CPU (BF16 for states, native types for others)
-        self.states = []        # List of tensors [hidden_size]
-        self.actions = []       # List of int (0=continue, 1=halt)
-        self.rewards = []       # List of float
-        self.next_states = []   # List of tensors [hidden_size]
-        self.dones = []         # List of bool
-        self.steps = []         # List of int
+        # Pre-allocated storage on CPU (eliminates memory fragmentation)
+        self.states = None           # Will be [capacity, hidden_size]
+        self.actions = np.zeros(capacity, dtype=np.int8)  # 0=continue, 1=halt
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.next_states = None      # Will be [capacity, hidden_size]
+        self.dones = np.zeros(capacity, dtype=bool)
+        self.steps = np.zeros(capacity, dtype=np.int32)
         
         self.position = 0
         self.size = 0
+        self.hidden_size = None  # Will be initialized on first push
     
     def push(
         self,
@@ -75,6 +76,13 @@ class DQNReplayBuffer:
             done: Whether episode ended (bool)
             step: Current step number (int)
         """
+        # Initialize storage on first push (lazy initialization)
+        if self.states is None:
+            self.hidden_size = state.shape[0]
+            dtype = self.storage_dtype if self.compress else torch.float32
+            self.states = torch.zeros(self.capacity, self.hidden_size, dtype=dtype)
+            self.next_states = torch.zeros(self.capacity, self.hidden_size, dtype=dtype)
+        
         # Move to CPU and compress
         if self.compress:
             state = state.detach().cpu().to(self.storage_dtype)
@@ -89,26 +97,19 @@ class DQNReplayBuffer:
         done_val = done.item() if isinstance(done, Tensor) else done
         step_val = step.item() if isinstance(step, Tensor) else step
         
-        # Store
-        if self.size < self.capacity:
-            # Append
-            self.states.append(state)
-            self.actions.append(action_val)
-            self.rewards.append(reward_val)
-            self.next_states.append(next_state)
-            self.dones.append(done_val)
-            self.steps.append(step_val)
-            self.size += 1
-        else:
-            # Circular replacement
-            idx = self.position % self.capacity
-            self.states[idx] = state
-            self.actions[idx] = action_val
-            self.rewards[idx] = reward_val
-            self.next_states[idx] = next_state
-            self.dones[idx] = done_val
-            self.steps[idx] = step_val
+        # Circular buffer index
+        idx = self.position % self.capacity
         
+        # Store (in-place, no append - eliminates fragmentation)
+        self.states[idx] = state
+        self.actions[idx] = action_val
+        self.rewards[idx] = reward_val
+        self.next_states[idx] = next_state
+        self.dones[idx] = done_val
+        self.steps[idx] = step_val
+        
+        # Update counters
+        self.size = min(self.size + 1, self.capacity)
         self.position += 1
     
     def sample(self, batch_size: int, device: str = 'cuda') -> Dict[str, Tensor]:
@@ -128,14 +129,14 @@ class DQNReplayBuffer:
         # Random indices
         indices = np.random.choice(self.size, size=min(batch_size, self.size), replace=False)
         
-        # Gather samples
+        # Gather samples (vectorized operations on pre-allocated arrays)
         batch = {
-            'state': torch.stack([self.states[i] for i in indices]).to(device=device, dtype=torch.float32),
-            'action': torch.tensor([self.actions[i] for i in indices], device=device, dtype=torch.long),
-            'reward': torch.tensor([self.rewards[i] for i in indices], device=device, dtype=torch.float32),
-            'next_state': torch.stack([self.next_states[i] for i in indices]).to(device=device, dtype=torch.float32),
-            'done': torch.tensor([self.dones[i] for i in indices], device=device, dtype=torch.bool),
-            'step': torch.tensor([self.steps[i] for i in indices], device=device, dtype=torch.int32),
+            'state': self.states[indices].to(device=device, dtype=torch.float32),
+            'action': torch.from_numpy(self.actions[indices]).to(device=device, dtype=torch.long),
+            'reward': torch.from_numpy(self.rewards[indices]).to(device=device, dtype=torch.float32),
+            'next_state': self.next_states[indices].to(device=device, dtype=torch.float32),
+            'done': torch.from_numpy(self.dones[indices]).to(device=device, dtype=torch.bool),
+            'step': torch.from_numpy(self.steps[indices]).to(device=device, dtype=torch.int32),
         }
         
         return batch
@@ -146,12 +147,14 @@ class DQNReplayBuffer:
     
     def clear(self):
         """Clear all stored transitions."""
-        self.states.clear()
-        self.actions.clear()
-        self.rewards.clear()
-        self.next_states.clear()
-        self.dones.clear()
-        self.steps.clear()
+        # Reset arrays to zero (no need to reallocate)
+        if self.states is not None:
+            self.states.zero_()
+            self.next_states.zero_()
+        self.actions.fill(0)
+        self.rewards.fill(0.0)
+        self.dones.fill(False)
+        self.steps.fill(0)
         self.position = 0
         self.size = 0
     

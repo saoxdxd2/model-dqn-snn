@@ -23,6 +23,7 @@ from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMeta
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
+from utils.gradient_monitor import GradientFlowMonitor
 
 
 class LossConfig(pydantic.BaseModel):
@@ -331,7 +332,7 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 
     return evaluators
 
-def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
+def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int, gradient_monitor=None):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
         return
@@ -355,8 +356,13 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             if param.grad is not None:
                 dist.all_reduce(param.grad)
     
+    # Track gradients before clipping (for monitoring)
+    grad_stats = None
+    if gradient_monitor is not None and rank == 0:
+        grad_stats = gradient_monitor.update()
+    
     # Gradient clipping for stability
-    torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), max_norm=1.0)
+    grad_norm = torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), max_norm=1.0)
             
     # Apply optimizer
     lr_this_step = None    
@@ -388,6 +394,13 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
 
             reduced_metrics["train/lr"] = lr_this_step
+            reduced_metrics["train/grad_norm"] = grad_norm.item()
+            
+            # Add gradient flow statistics if available
+            if grad_stats is not None:
+                for key, value in grad_stats.items():
+                    reduced_metrics[f"train/grad/{key}"] = value
+            
             return reduced_metrics
 
 def evaluate(
@@ -639,11 +652,17 @@ def launch(hydra_config: DictConfig):
     # Progress bar and logger
     progress_bar = None
     ema_helper = None
+    gradient_monitor = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
         save_code_and_config(config)
+        
+        # Initialize gradient flow monitor
+        gradient_monitor = GradientFlowMonitor(train_state.model, track_every_n_steps=100)
+        print('Initialized gradient flow monitor (tracking every 100 steps)')
+        
     if config.ema:
         print('Setup EMA')
         ema_helper = EMAHelper(mu=config.ema_rate)
@@ -658,7 +677,7 @@ def launch(hydra_config: DictConfig):
             print("TRAIN")
         train_state.model.train()
         for set_name, batch, global_batch_size in train_loader:
-            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, gradient_monitor=gradient_monitor)
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)

@@ -10,6 +10,7 @@ from models.dqn_utils import (
     RunningStats,
     soft_update_target_network,
 )
+from models.intrinsic_reward import IntrinsicRewardModule
 
 IGNORE_LABEL_ID = -100
 
@@ -45,11 +46,12 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str, enable_dqn: bool = False):
+    def __init__(self, model: nn.Module, loss_type: str, enable_dqn: bool = False, deep_supervision_steps: int = 1):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
         self.enable_dqn = enable_dqn
+        self.deep_supervision_steps = deep_supervision_steps  # Multi-step supervision (TRM paper: +20%)
         
         # DQN components
         if enable_dqn:
@@ -63,6 +65,16 @@ class ACTLossHead(nn.Module):
             self.reward_stats = RunningStats()
             self.dqn_step_counter = 0
             self.dqn_loss_weight = 0.1  # Conservative start
+            
+            # Intrinsic motivation for improved exploration
+            self.intrinsic_reward = IntrinsicRewardModule(
+                hidden_size=config.hidden_size,
+                enable_count=getattr(config, 'enable_count_curiosity', True),
+                enable_rnd=getattr(config, 'enable_rnd_curiosity', True),
+                enable_dynamics=False,  # Disabled by default (more complex)
+                count_beta=getattr(config, 'curiosity_count_beta', 0.05),
+                rnd_weight=getattr(config, 'curiosity_rnd_weight', 0.1)
+            )
             
             # Blank identifier for filtering padding
             self.blank_identifier_id = None
@@ -80,6 +92,29 @@ class ACTLossHead(nn.Module):
         # B x SeqLen x D
         new_carry, outputs = self.model(**model_kwargs)
         labels = new_carry.current_data["labels"]
+        
+        # Handle deep supervision outputs
+        if isinstance(outputs, dict) and 'intermediate' in outputs:
+            logits = outputs['final']
+            intermediate_logits = outputs['intermediate']
+            # Preserve critical keys: q_halt_logits, q_continue_logits, z_H
+            q_halt_logits = outputs.get('q_halt_logits')
+            q_continue_logits = outputs.get('q_continue_logits')
+            z_H = outputs.get('z_H')
+            # Rebuild outputs dict with proper structure
+            outputs = {'logits': logits}
+            if q_halt_logits is not None:
+                outputs['q_halt_logits'] = q_halt_logits
+            if q_continue_logits is not None:
+                outputs['q_continue_logits'] = q_continue_logits
+            if z_H is not None:
+                outputs['z_H'] = z_H
+        else:
+            logits = outputs if not isinstance(outputs, dict) else outputs.get('logits', outputs)
+            intermediate_logits = None
+            # Replace outputs with proper structure if needed
+            if not isinstance(outputs, dict) or 'logits' not in outputs:
+                outputs = {'logits': logits}
 
         with torch.no_grad():
             # Preds
@@ -92,6 +127,16 @@ class ACTLossHead(nn.Module):
 
             is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
             seq_is_correct = is_correct.sum(-1) == loss_counts
+            
+            # Deep supervision: compute correctness for intermediate outputs
+            if intermediate_logits is not None:
+                intermediate_correct = []
+                for inter_logits in intermediate_logits:
+                    inter_is_correct = mask & (torch.argmax(inter_logits, dim=-1) == labels)
+                    inter_seq_correct = inter_is_correct.sum(-1) == loss_counts
+                    intermediate_correct.append(inter_seq_correct)
+            else:
+                intermediate_correct = None
             
             # Metrics (halted)
             valid_metrics = new_carry.halted & (loss_counts > 0)
@@ -106,9 +151,32 @@ class ACTLossHead(nn.Module):
             }
 
         # Losses
-
         lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+        
+        # Deep supervision: add intermediate losses (TRM paper: +20% accuracy)
+        if intermediate_logits is not None and self.training:
+            deep_supervision_losses = []
+            for inter_logits in intermediate_logits:
+                inter_loss = (self.loss_fn(inter_logits, labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+                deep_supervision_losses.append(inter_loss)
+            
+            # Average intermediate losses with final loss
+            total_supervision_loss = sum(deep_supervision_losses) / len(deep_supervision_losses)
+            lm_loss = (lm_loss + total_supervision_loss) / 2.0  # Balance final and intermediate
+            metrics["deep_supervision_loss"] = total_supervision_loss.detach()
+        
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
+        
+        # Entropy regularization for exploration (encourage diverse Q-value distributions)
+        entropy_bonus = 0
+        if self.enable_dqn and self.model.config.enable_entropy_regularization:
+            # Compute entropy of Q-value distribution: H(π) = -Σ π(a) log π(a)
+            # where π(a) = softmax(Q(s,a) / temperature)
+            q_probs = torch.softmax(torch.stack([outputs["q_continue_logits"], outputs["q_halt_logits"]], dim=-1), dim=-1)
+            entropy = -(q_probs * torch.log(q_probs + 1e-8)).sum(-1)  # [batch]
+            entropy_bonus = -self.model.config.entropy_regularization_weight * entropy.sum()  # Negative because we want to maximize entropy
+            metrics["q_entropy"] = entropy.mean().detach()
+        
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
@@ -145,9 +213,7 @@ class ACTLossHead(nn.Module):
                 torch.zeros_like(curr_accuracy)
             )
             
-            # Memory bonus (if enabled)
-            # Note: Memory write operations are now handled in the model's forward pass
-            # for proper temporal coherence. Here we only compute rewards.
+            # Memory bonus (if enabled) - write to memory AFTER rewards computed
             memory_bonus = torch.zeros_like(curr_accuracy)
             if self.model.config.enable_memory and self.model.inner.memory is not None:
                 # Reward bonus for memory-assisted improvements
@@ -156,8 +222,29 @@ class ACTLossHead(nn.Module):
                     torch.full_like(curr_accuracy, self.model.config.memory_reward_bonus),
                     torch.zeros_like(curr_accuracy)
                 )
+                
+                # Write high-reward states to memory (TEMPORAL COHERENCE FIX)
+                # This happens AFTER accuracy is computed, so memory is ready for NEXT step
+                if 'z_H' in outputs:
+                    state_for_memory = outputs['z_H'][:, 0].detach()  # [batch, hidden_size]
+                    # Normalized reward for storage decision
+                    reward_for_memory = accuracy_improvement + terminal_bonus
+                    self.model.inner.memory.write(
+                        state_for_memory,
+                        reward_for_memory,
+                        threshold=self.model.config.memory_reward_threshold
+                    )
             
-            rewards = accuracy_improvement - step_penalty + terminal_bonus + memory_bonus
+            # Compute intrinsic curiosity bonus for exploration
+            intrinsic_bonus = torch.zeros_like(curr_accuracy)
+            if hasattr(self, 'intrinsic_reward') and 'z_H' in outputs:
+                current_state = outputs['z_H'][:, 0].detach()  # [batch, hidden_size]
+                intrinsic_bonus = self.intrinsic_reward.compute_intrinsic_reward(current_state)
+            
+            # Combined reward: extrinsic + intrinsic
+            # r_total = r_extrinsic + β * r_intrinsic
+            extrinsic_reward = accuracy_improvement - step_penalty + terminal_bonus + memory_bonus
+            rewards = extrinsic_reward + intrinsic_bonus
             
             # Normalize rewards for stability
             self.reward_stats.update(rewards.detach())
@@ -189,13 +276,20 @@ class ACTLossHead(nn.Module):
                 )
             
             # Update carry with new tracking values (training_step incremented in TRM forward)
-            new_carry.prev_accuracy = curr_accuracy
+            # CRITICAL: This modifies new_carry in-place, ensuring prev_accuracy propagates correctly
+            if new_carry.prev_accuracy is not None:
+                new_carry.prev_accuracy[:] = curr_accuracy  # In-place update to ensure propagation
+            else:
+                # Initialize if not already present
+                new_carry = new_carry._replace(prev_accuracy=curr_accuracy) if hasattr(new_carry, '_replace') else new_carry
             
             self.dqn_step_counter += 1
             
             # Additional DQN metrics
             metrics["dqn_reward_mean"] = rewards.mean().detach()
             metrics["dqn_reward_std"] = rewards.std().detach()
+            metrics["dqn_reward_extrinsic"] = extrinsic_reward.mean().detach()
+            metrics["dqn_reward_intrinsic"] = intrinsic_bonus.mean().detach()
             metrics["dqn_epsilon"] = current_epsilon
             metrics["dqn_accuracy_improvement"] = accuracy_improvement.mean().detach()
             
@@ -210,7 +304,7 @@ class ACTLossHead(nn.Module):
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
         
         # Total loss
-        total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
+        total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + entropy_bonus
         if self.enable_dqn and isinstance(dqn_loss, torch.Tensor):
             total_loss = total_loss + self.dqn_loss_weight * dqn_loss
 
