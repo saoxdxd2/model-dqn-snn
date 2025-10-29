@@ -738,7 +738,18 @@ def launch(hydra_config: DictConfig):
         ema_helper.register(train_state.model)
 
     # Training Loop
-    for _iter_id in range(total_iters):
+    # Calculate starting iteration from restored step (for auto-resume)
+    steps_per_iter = train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size
+    start_iter = int(train_state.step / steps_per_iter) if train_state.step > 0 else 0
+    
+    if RANK == 0 and start_iter > 0:
+        print(f"\n{'='*70}")
+        print(f"  📍 Resuming from iteration {start_iter}/{total_iters}")
+        print(f"  📍 Epoch: {start_iter * train_epochs_per_iter}/{config.epochs}")
+        print(f"  📍 Step: {train_state.step}/{train_state.total_steps}")
+        print(f"{'='*70}\n")
+    
+    for _iter_id in range(start_iter, total_iters):
         print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
 
         ############ Train Iter
