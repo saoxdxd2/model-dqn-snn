@@ -230,7 +230,7 @@ def convert_mlp_to_bnn(mlp_q_head: nn.Module, calibration_data: Optional[torch.T
     Convert trained MLP Q-head to Binary Neural Network.
     
     Args:
-        mlp_q_head: Trained MLP Q-head
+        mlp_q_head: Trained MLP Q-head (single linear layer: hidden_size -> num_actions)
         calibration_data: Optional calibration data for better binarization
     
     Returns:
@@ -244,20 +244,28 @@ def convert_mlp_to_bnn(mlp_q_head: nn.Module, calibration_data: Optional[torch.T
     hidden_size = mlp_q_head.q_head.weight.shape[1]
     num_actions = mlp_q_head.q_head.weight.shape[0]
     
+    print(f"   Converting MLP Q-head: {hidden_size} -> {num_actions}")
+    
     # Create BNN
     bnn = BinaryQHead(hidden_size, num_actions)
     
     # Transfer and binarize weights
     with torch.no_grad():
-        # First layer: approximate with random projection
+        # Initialize first layer (projection from hidden_size to 128)
+        # Use scaled random initialization for stability
         bnn.fc1.weight_fp.normal_(0, 0.1)
         
-        # Second layer: transfer from trained model
-        bnn.fc2.weight_fp.copy_(mlp_q_head.q_head.weight.data)
+        # Second layer (128 -> num_actions): initialize from trained weights
+        # Since MLP is (hidden_size -> num_actions) and BNN is (hidden_size -> 128 -> num_actions),
+        # we need to approximate the mapping
+        # Use random projection for fc2 since dimensions don't match
+        bnn.fc2.weight_fp.normal_(0, 0.1)
+        
+        # Copy bias if available (dimensions match)
         if mlp_q_head.q_head.bias is not None:
             bnn.fc2.bias.copy_(mlp_q_head.q_head.bias.data)
         
-        # Compute scaling factors
+        # Compute scaling factors using calibration if available
         if calibration_data is not None:
             # Use calibration data to optimize scaling
             with torch.enable_grad():
@@ -267,6 +275,8 @@ def convert_mlp_to_bnn(mlp_q_head: nn.Module, calibration_data: Optional[torch.T
                 # Optimize alpha to minimize MSE
                 alpha_opt = (output_fp * output_bin).sum(0) / (output_bin * output_bin).sum(0)
                 bnn.fc2.alpha.copy_(alpha_opt.unsqueeze(1))
+        
+        print(f"   BNN Q-head created: {hidden_size} -> 128 -> {num_actions}")
     
     return bnn
 

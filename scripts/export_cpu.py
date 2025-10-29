@@ -16,6 +16,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.export_utils import quantize_model_int8, convert_mlp_to_bnn, benchmark_inference
 
+# Import ModelLoader from same directory
+try:
+    from load_model import ModelLoader
+except ImportError:
+    # If running as module
+    from scripts.load_model import ModelLoader
+
 
 def export_cpu_optimized(
     model_path: str,
@@ -31,22 +38,12 @@ def export_cpu_optimized(
         quantization: Type of quantization to apply
     """
     print(f"Loading model from {model_path}...")
-    checkpoint = torch.load(model_path, map_location='cpu')
     
-    # Extract model state
-    if 'model' in checkpoint:
-        model_state = checkpoint['model']
-    elif 'model_state_dict' in checkpoint:
-        model_state = checkpoint['model_state_dict']
-    else:
-        model_state = checkpoint
+    # Load model using ModelLoader
+    loader = ModelLoader(model_path, device='cpu')
+    model = loader.load_model(quantized=False)
     
-    # Load model (assumes model class is available)
-    # You'll need to instantiate your TRM model here with config
-    # model = TinyRecursiveReasoningModel_ACTV1(config)
-    # model.load_state_dict(model_state)
-    
-    print(f"Applying {quantization} quantization...")
+    print(f"\nApplying {quantization} quantization...")
     
     if quantization == 'int8':
         # Use existing INT8 quantization

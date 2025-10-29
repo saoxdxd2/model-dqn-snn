@@ -2,11 +2,16 @@
 Unified training script for TRM models.
 Supports: Text, Visual (ARC), Coding, and Multi-Modal.
 
+Features:
+  - Auto-resume: Automatically continues from latest checkpoint
+  - Auto-dataset: Builds datasets if missing
+  - Multi-modal: Text, visual, code generation
+
 Usage:
-    python train.py --model text
-    python train.py --model arc
-    python train.py --model code
-    python train.py  # Interactive mode
+    python train.py                  # Interactive mode + auto-resume
+    python train.py --model text     # Train text model (auto-resumes if checkpoint exists)
+    python train.py --model arc      # Train ARC model
+    python train.py --model code     # Train code model
 """
 
 import os
@@ -208,11 +213,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python train.py                    # Interactive mode
-  python train.py --model text       # Train text model
+  python train.py                    # Interactive mode (auto-resumes if checkpoint exists)
+  python train.py --model text       # Train text model (auto-resumes from epoch 100 -> 500)
   python train.py --model arc        # Train ARC visual model
   python train.py --model code       # Train code model
-  python train.py --skip-dataset     # Skip dataset building
+  python train.py --rebuild-dataset  # Force rebuild dataset
+
+Auto-Resume:
+  Training automatically resumes from checkpoints/MODEL/latest.pt if it exists.
+  No need to manually specify --load-checkpoint!
         """
     )
     

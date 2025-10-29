@@ -682,6 +682,17 @@ def launch(hydra_config: DictConfig):
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
 
+    # Auto-resume: Check if checkpoint exists and auto-load if not specified
+    if config.load_checkpoint is None and config.checkpoint_path is not None:
+        latest_checkpoint = os.path.join(config.checkpoint_path, "latest.pt")
+        if os.path.exists(latest_checkpoint):
+            if RANK == 0:
+                print(f"\n{'='*70}")
+                print(f"  🔄 AUTO-RESUME: Found existing checkpoint")
+                print(f"  📁 Loading from: {latest_checkpoint}")
+                print(f"{'='*70}\n")
+            config.load_checkpoint = latest_checkpoint
+    
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
 
