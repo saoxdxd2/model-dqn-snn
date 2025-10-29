@@ -19,6 +19,7 @@ import sys
 import subprocess
 from pathlib import Path
 import argparse
+import torch
 
 
 # Communication Training Roadmap (optimized for chat quality)
@@ -158,6 +159,37 @@ MODELS = {
 }
 
 
+def check_phase_completion(checkpoint_path: str) -> dict:
+    """Check if training phase is complete."""
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        current_step = checkpoint.get('step', 0)
+        target_steps = checkpoint.get('total_steps', 0)
+        config_epochs = checkpoint.get('config_epochs', 0)
+        dataset = checkpoint.get('dataset', 'unknown')
+        
+        if target_steps > 0:
+            progress = (current_step / target_steps) * 100
+            is_complete = current_step >= target_steps
+        else:
+            # Legacy checkpoint without metadata - assume incomplete
+            progress = 0
+            is_complete = False
+        
+        return {
+            'current_step': current_step,
+            'target_steps': target_steps,
+            'config_epochs': config_epochs,
+            'dataset': dataset,
+            'progress_pct': progress,
+            'is_complete': is_complete
+        }
+    except Exception as e:
+        print(f"   ⚠️  Could not read checkpoint metadata: {e}")
+        return {'is_complete': False, 'progress_pct': 0}
+
+
 def detect_checkpoints():
     """Detect all available checkpoints in checkpoints/ directory."""
     checkpoint_dir = Path("checkpoints")
@@ -169,10 +201,14 @@ def detect_checkpoints():
         if subdir.is_dir():
             latest_pt = subdir / "latest.pt"
             if latest_pt.exists():
+                # Check completion status
+                status = check_phase_completion(str(latest_pt))
+                
                 checkpoints.append({
                     "name": subdir.name,
                     "path": str(latest_pt),
-                    "dir": str(subdir)
+                    "dir": str(subdir),
+                    "status": status
                 })
     return checkpoints
 
@@ -243,8 +279,19 @@ def select_continual_learning_mode():
     print("\nAvailable checkpoints:\n")
     
     for idx, ckpt in enumerate(checkpoints, 1):
-        print(f"  [{idx}] {ckpt['name']}")
+        status = ckpt['status']
+        completion_icon = "✅" if status.get('is_complete') else "⚠️"
+        progress = status.get('progress_pct', 0)
+        
+        print(f"  [{idx}] {ckpt['name']} {completion_icon}")
         print(f"      Path: {ckpt['path']}")
+        print(f"      Progress: {progress:.1f}% ({status.get('current_step', 0):,}/{status.get('target_steps', 0):,} steps)")
+        
+        if status.get('is_complete'):
+            print(f"      Status: ✅ COMPLETE - Ready for next phase")
+        else:
+            remaining = status.get('target_steps', 0) - status.get('current_step', 0)
+            print(f"      Status: ⚠️  INCOMPLETE - {remaining:,} steps remaining")
         print()
     
     # Select checkpoint
@@ -263,13 +310,44 @@ def select_continual_learning_mode():
     
     print(f"\n✅ Selected: {selected_ckpt['name']}")
     
+    # Check if selected phase is complete
+    selected_status = selected_ckpt['status']
+    if not selected_status.get('is_complete', False):
+        print("\n" + "="*70)
+        print("  ⚠️  WARNING: Selected phase is INCOMPLETE!")
+        print("="*70)
+        print(f"\nCurrent progress: {selected_status.get('progress_pct', 0):.1f}%")
+        print(f"Steps: {selected_status.get('current_step', 0):,} / {selected_status.get('target_steps', 0):,}")
+        print(f"Remaining: {selected_status.get('target_steps', 0) - selected_status.get('current_step', 0):,} steps\n")
+        
+        print("Options:")
+        print("  [1] Continue training this phase (recommended)")
+        print("  [2] Move to next phase anyway (not recommended)")
+        print("  [3] Cancel\n")
+        
+        choice = input("Select option [1-3]: ").strip()
+        
+        if choice == "1":
+            # Continue current phase
+            remaining_epochs = selected_status.get('config_epochs', 0)
+            return selected_ckpt['path'], selected_status.get('dataset', 'text').split('/')[-1], remaining_epochs
+        elif choice == "2":
+            print("\n⚠️  Proceeding to next phase with incomplete base...")
+        else:
+            print("\nCancelled.")
+            return None, None, None
+    
     # Extract completed datasets from checkpoint names
     completed_datasets = []
     for ckpt in checkpoints:
         name = ckpt['name'].lower()
-        for dataset_key in MODELS.keys():
-            if dataset_key in name:
-                completed_datasets.append(dataset_key)
+        status = ckpt['status']
+        
+        # Only count as completed if phase is done
+        if status.get('is_complete', False):
+            for dataset_key in MODELS.keys():
+                if dataset_key in name:
+                    completed_datasets.append(dataset_key)
     
     # Recommend next phase
     next_phase = recommend_next_phase(completed_datasets)

@@ -375,6 +375,11 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
         'model_state_dict': train_state.model.state_dict(),
         'optimizer_states': [opt.state_dict() for opt in train_state.optimizers],
         'carry': train_state.carry,  # Save RNN/memory states
+        
+        # Training metadata for phase completion tracking
+        'config_epochs': config.epochs,
+        'total_steps': train_state.total_steps,
+        'dataset': config.data_paths[0] if config.data_paths else 'unknown',
     }
     
     # Save DQN-specific state if enabled
