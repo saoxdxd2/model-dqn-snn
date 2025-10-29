@@ -16,7 +16,7 @@ evaluators: []  # Can add perplexity evaluator later
 
 # Hyperparams - Training (scaled for local hardware)
 global_batch_size: 32  # Small for 8GB RAM
-epochs: 500  # Extended for better convergence on small dataset
+epochs: 5000  # Extended for better convergence on small dataset
 eval_interval: 25  # Check less frequently with more epochs
 checkpoint_every_eval: True
 
