@@ -165,6 +165,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     # Dataset metadata overrides seq_len/vocab_size/num_puzzle_identifiers
     
     # Filter out keys that will be explicitly set to avoid duplicate keyword argument error
+    # IMPORTANT: Keep input_vocab_size from YAML (for vision with separate input/output vocabs)
     extra_config = {k: v for k, v in config.arch.__pydantic_extra__.items() 
                    if k not in ['batch_size', 'vocab_size', 'seq_len', 'num_puzzle_identifiers']}
     

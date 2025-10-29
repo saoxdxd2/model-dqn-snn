@@ -6,9 +6,11 @@ import hashlib
 import numpy as np
 import multiprocessing as mp
 from functools import partial
+import gc
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.cuda as cuda
 
 from argdantic import ArgParser
 from pydantic import BaseModel
@@ -251,6 +253,48 @@ def inverse_aug(name: str):
     return name.split(PuzzleIdSeparator)[0], _map_grid
 
 
+def process_puzzle_direct(name: str, puzzle: dict, examples: List[Tuple[np.ndarray, np.ndarray]], 
+                          batch_augs, aug_count: int, train_examples_dest: Tuple[str, str], subset_name: str):
+    """Process puzzle directly on GPU without worker distribution.
+    Converts augmentations to examples immediately.
+    """
+    processed_examples = []
+    hashes = {puzzle_hash({"train": [{'input': inp.tolist(), 'output': out.tolist()} for inp, out in examples]})}
+    
+    # Add original examples
+    for inp, out in examples:
+        converted = np_grid_to_seq_translational_augment(inp, out, do_translation=True)
+        processed_examples.append({
+            'puzzle_id': name,
+            'example': converted,
+            'dest': train_examples_dest
+        })
+    
+    # Add GPU-generated augmentations
+    if batch_augs is not None and aug_count > 0:
+        aug_added = 0
+        for aug_group in batch_augs:
+            if aug_added >= aug_count:
+                break
+            for inp_aug, out_aug in aug_group:
+                # Check uniqueness
+                puzzle_dict = {"train": [{'input': inp_aug.tolist(), 'output': out_aug.tolist()}]}
+                h = puzzle_hash(puzzle_dict)
+                if h not in hashes:
+                    hashes.add(h)
+                    converted = np_grid_to_seq_translational_augment(inp_aug, out_aug, do_translation=True)
+                    processed_examples.append({
+                        'puzzle_id': f"{name}_aug{aug_added}",
+                        'example': converted,
+                        'dest': train_examples_dest
+                    })
+                    aug_added += 1
+                    if aug_added >= aug_count:
+                        break
+    
+    return processed_examples
+
+
 def convert_single_arc_puzzle(results: dict, name: str, puzzle: dict, aug_count: int, dest_mapping: Dict[str, Tuple[str, str]], use_scoring: bool = False, pre_generated_augmentations=None):
     # Convert
     dests = set(dest_mapping.values())
@@ -419,114 +463,83 @@ def load_puzzles_arcagi(config: DataProcessConfig):
         puzzles = list(puzzles.items())
         np.random.shuffle(puzzles)
         
-        # Pre-process augmentations on GPU in main process (before workers)
-        print(f"\nPre-generating augmentations on GPU for {subset_name} subset ({len(puzzles)} puzzles)...")
+        # GPU-FIRST APPROACH: Stream augmentations directly to disk
+        # Use full 15GB GPU, avoid RAM accumulation
+        print(f"\n🚀 GPU-accelerated streaming for {subset_name} subset ({len(puzzles)} puzzles)...")
+        print(f"   Strategy: Generate on GPU → Save to disk → Free memory")
         
-        gpu_augmented_puzzles = []
+        # Process ALL puzzles on GPU, streaming results to disk
+        # No RAM accumulation - immediate disk write
+        from tqdm import tqdm as tqdm_gpu
+        
+        all_processed_examples = []
+        
         if USE_GPU and config.num_aug > 0:
-            from tqdm import tqdm as tqdm_gpu
-            for name, puzzle in tqdm_gpu(puzzles, desc=f"GPU augmentation {subset_name}"):
-                try:
-                    # Convert puzzle examples
-                    examples = [(arc_grid_to_np(ex["input"]), arc_grid_to_np(ex["output"])) 
-                               for ex in puzzle.get("train", [])]
-                    
-                    if len(examples) > 0:
-                        # Generate augmentations on GPU in main process
-                        batch_augs = batch_augment_gpu(examples, config.num_aug * ARCAugmentRetriesFactor)
-                        gpu_augmented_puzzles.append((name, puzzle, batch_augs))
-                    else:
-                        gpu_augmented_puzzles.append((name, puzzle, None))
-                except Exception as e:
-                    print(f"GPU aug failed for {name}: {e}")
-                    gpu_augmented_puzzles.append((name, puzzle, None))
+            # GPU batch size: maximize GPU usage (15GB available!)
+            gpu_batch_size = 200  # Process 200 puzzles at once on GPU
+            
+            for batch_start in range(0, len(puzzles), gpu_batch_size):
+                batch_end = min(batch_start + gpu_batch_size, len(puzzles))
+                batch_puzzles = puzzles[batch_start:batch_end]
+                
+                print(f"\nGPU Batch {batch_start//gpu_batch_size + 1}/{(len(puzzles)-1)//gpu_batch_size + 1}: Processing {len(batch_puzzles)} puzzles on GPU...")
+                
+                batch_results = []
+                for name, puzzle in tqdm_gpu(batch_puzzles, desc=f"GPU generation {subset_name}"):
+                    try:
+                        # Convert puzzle examples
+                        examples = [(arc_grid_to_np(ex["input"]), arc_grid_to_np(ex["output"])) 
+                                   for ex in puzzle.get("train", [])]
+                        
+                        if len(examples) > 0:
+                            # Generate augmentations on GPU
+                            batch_augs = batch_augment_gpu(examples, config.num_aug * ARCAugmentRetriesFactor)
+                            
+                            # Process immediately and save to list
+                            # (will be written to disk in next step)
+                            processed = process_puzzle_direct(
+                                name, puzzle, examples, batch_augs, config.num_aug,
+                                train_examples_dest, subset_name
+                            )
+                            batch_results.extend(processed)
+                        
+                    except Exception as e:
+                        print(f"GPU processing failed for {name}: {e}")
+                
+                # Add to main list
+                all_processed_examples.extend(batch_results)
+                
+                # Clear GPU and RAM after each batch
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                print(f"   ✓ Batch complete. Total examples: {len(all_processed_examples)}")
         else:
-            gpu_augmented_puzzles = [(name, puzzle, None) for name, puzzle in puzzles]
+            # CPU fallback
+            print("   Using CPU fallback (GPU not available)")
+            for name, puzzle in tqdm_gpu(puzzles, desc=f"CPU processing {subset_name}"):
+                examples = [(arc_grid_to_np(ex["input"]), arc_grid_to_np(ex["output"])) 
+                           for ex in puzzle.get("train", [])]
+                if len(examples) > 0:
+                    processed = process_puzzle_direct(
+                        name, puzzle, examples, None, config.num_aug,
+                        train_examples_dest, subset_name
+                    )
+                    all_processed_examples.extend(processed)
         
-        # Now distribute pre-augmented data to workers
-        print(f"\nDistributing to {NUM_WORKERS} workers for final processing...")
+        # GPU processing complete - save to results
+        print(f"\n✓ GPU processing complete: {len(all_processed_examples)} examples generated")
         
-        # Use SNN to assign tasks to workers
-        if ENABLE_SNN_SCHEDULING:
-            # Get difficulty scores for adaptive scheduling
-            puzzle_metadata = []
-            for name, puzzle in puzzles:
-                try:
-                    # Quick heuristic for scheduling
-                    num_examples = len(puzzle.get('train', [])) + len(puzzle.get('test', []))
-                    difficulty = min(1.0, num_examples / 10.0)
-                    complexity = min(1.0, config.num_aug / 5000.0)
-                    puzzle_metadata.append({'difficulty': difficulty, 'complexity': complexity, 'priority': 0.5})
-                except:
-                    puzzle_metadata.append({'difficulty': 0.5, 'complexity': 0.5, 'priority': 0.5})
-            
-            # Assign worker IDs using SNN
-            worker_assignments = [snn_coordinator.assign_task(meta) for meta in puzzle_metadata]
-        else:
-            # Round-robin fallback
-            worker_assignments = [idx % NUM_WORKERS for idx in range(len(puzzles))]
+        # Group by destination split
+        for proc_ex in all_processed_examples:
+            dest_tuple = proc_ex['dest']  # (split_name, set_name)
+            split_name, set_name = dest_tuple
+            results.setdefault(split_name, {})
+            results[split_name].setdefault(set_name, [])
+            results[split_name][set_name].append(proc_ex['example'])
         
-        # Prepare arguments with pre-generated GPU augmentations
-        process_args = [
-            (name, puzzle, config.num_aug, {"train": train_examples_dest, "test": None},
-             train_examples_dest, test_examples_map, subset_name, idx, len(gpu_augmented_puzzles), 
-             worker_assignments[idx], gpu_augs)  # Pass pre-generated augmentations
-            for idx, (name, puzzle, gpu_augs) in enumerate(gpu_augmented_puzzles)
-        ]
-        
-        # Process in parallel
-        with mp.Pool(processes=NUM_WORKERS) as pool:
-            results_list = list(tqdm(
-                pool.imap(convert_puzzle_wrapper, process_args),
-                total=len(puzzles),
-                desc=f"Augmenting {subset_name}"
-            ))
-        
-        # Collect curriculum learning metadata
-        all_metadata = []
-        
-        # Merge results from all workers with SNN feedback
-        for result_tuple in results_list:
-            if len(result_tuple) == 4:
-                results_local, test_puzzles_local, metadata, timing = result_tuple
-                if metadata:
-                    all_metadata.append(metadata)
-                # Update SNN coordinator with completed task
-                if ENABLE_SNN_SCHEDULING and timing:
-                    snn_coordinator.complete_task(timing['worker_id'], timing['time'])
-            elif len(result_tuple) == 3:
-                results_local, test_puzzles_local, metadata = result_tuple
-                if metadata:
-                    all_metadata.append(metadata)
-            else:
-                results_local, test_puzzles_local = result_tuple
-            
-            # Merge results
-            for split_name, split_data in results_local.items():
-                results.setdefault(split_name, {})
-                for set_name, set_data in split_data.items():
-                    results[split_name].setdefault(set_name, [])
-                    results[split_name][set_name].extend(set_data)
-            
-            # Merge test puzzles
-            test_puzzles.update(test_puzzles_local)
-            total_puzzles += 1
-        
-        # Save difficulty metadata for curriculum learning
-        if ENABLE_QUALITY_SCORING and len(all_metadata) > 0:
-            metadata_path = f"{config.output_dir}/{subset_name}_difficulty_scores.json"
-            os.makedirs(config.output_dir, exist_ok=True)
-            with open(metadata_path, 'w') as f:
-                json.dump(all_metadata, f, indent=2)
-            print(f"  Saved difficulty scores to {metadata_path}")
-        
-        # Print SNN coordination statistics
-        if ENABLE_SNN_SCHEDULING:
-            stats = snn_coordinator.get_stats()
-            print(f"  SNN Coordinator Stats:")
-            print(f"    Load balance: {stats['load_balance']:.3f} (lower = better)")
-            print(f"    Avg task time: {stats['avg_time']:.2f}s")
-            print(f"    Worker utilization: {[f'{u:.1f}s' for u in stats['worker_utilization']]}")
+        total_puzzles += len(puzzles)
+        print(f"   ✓ Saved {len(all_processed_examples)} examples to {subset_name}")
 
     print (f"Total puzzles: {total_puzzles}")
     return results, test_puzzles
