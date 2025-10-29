@@ -170,6 +170,86 @@ def tokenize_and_chunk(text: str, tokenizer, max_seq_len: int, stride: int):
     return sequences
 
 
+def create_code_dataset_batched(config: TextDatasetConfig, dataset, tokenizer, vocab_size: int, pad_token_id: int, eos_token_id: int):
+    """
+    Process code samples in batches to avoid memory exhaustion.
+    Uses iterative processing instead of loading all text at once.
+    """
+    os.makedirs(config.output_dir, exist_ok=True)
+    
+    # Process in smaller batches for code (files are larger)
+    batch_size = 1000  # Process 1000 files at a time
+    max_train_files = 50000
+    max_test_files = 5000
+    
+    for split_name, max_files in [("train", max_train_files), ("test", max_test_files)]:
+        print(f"\nTokenizing {split_name} set (batched processing)...")
+        os.makedirs(os.path.join(config.output_dir, split_name), exist_ok=True)
+        
+        all_inputs = []
+        all_labels = []
+        
+        file_count = 0
+        batch_texts = []
+        
+        # Determine offset based on split
+        start_idx = 0 if split_name == "train" else max_train_files
+        end_idx = max_train_files if split_name == "train" else max_train_files + max_test_files
+        
+        # Process files in batches
+        for idx, sample in enumerate(tqdm(dataset, desc=f"Processing {split_name}")):
+            # Skip until we reach the split range
+            if idx < start_idx:
+                continue
+            if idx >= end_idx:
+                break
+            
+            batch_texts.append(sample['content'])
+            file_count += 1
+            
+            # Process batch when full
+            if len(batch_texts) >= batch_size or file_count >= (end_idx - start_idx):
+                # Join texts
+                batch_text = "\n\n".join(batch_texts)
+                
+                # Tokenize batch
+                tokens = tokenizer.encode(batch_text)
+                
+                # Create sequences
+                for i in range(0, len(tokens) - config.max_seq_len + 1, config.stride):
+                    chunk = tokens[i:i + config.max_seq_len]
+                    if len(chunk) == config.max_seq_len:
+                        all_inputs.append(chunk[:-1])  # input
+                        all_labels.append(chunk[1:])   # shifted labels
+                
+                # Clear batch
+                batch_texts = []
+                
+                if file_count % 5000 == 0:
+                    print(f"  Processed {file_count} files, {len(all_inputs)} sequences so far")
+        
+        print(f"Created {len(all_inputs)} {split_name} sequences")
+        
+        # Save sequences
+        metadata = {
+            "vocab_size": vocab_size,
+            "seq_len": config.max_seq_len - 1,
+            "pad_token_id": pad_token_id,
+            "eos_token_id": eos_token_id,
+            "type": "code"
+        }
+        
+        save_data = {
+            "inputs": np.array(all_inputs, dtype=np.int32),
+            "labels": np.array(all_labels, dtype=np.int32),
+            "metadata": metadata
+        }
+        
+        output_path = os.path.join(config.output_dir, split_name, "data.npz")
+        np.savez_compressed(output_path, **save_data)
+        print(f"Saved {split_name} data to {output_path}")
+
+
 def create_tinystories_dataset_batched(config: TextDatasetConfig, dataset, tokenizer, vocab_size: int, pad_token_id: int, eos_token_id: int):
     """
     Process TinyStories in batches to avoid memory exhaustion.
