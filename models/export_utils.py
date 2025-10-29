@@ -323,11 +323,17 @@ def benchmark_inference(model: nn.Module, input_shape: Tuple[int, ...],
     model = model.to(device)
     model.eval()
     
-    # Warmup
-    dummy_input = torch.randn(*input_shape, device=device)
+    # Warmup - create proper batch input
+    batch_size, seq_len = input_shape
+    dummy_input = torch.randint(0, 50257, (batch_size, seq_len), device=device)  # Token IDs
+    dummy_batch = {
+        'input': dummy_input,
+        'puzzle_identifiers': torch.zeros(batch_size, dtype=torch.long, device=device)
+    }
+    
     with torch.no_grad():
         for _ in range(10):
-            _ = model(dummy_input)
+            _ = model(**dummy_batch)
     
     # Benchmark
     if device == 'cuda':
@@ -336,7 +342,7 @@ def benchmark_inference(model: nn.Module, input_shape: Tuple[int, ...],
     start_time = time.perf_counter()
     with torch.no_grad():
         for _ in range(num_iterations):
-            _ = model(dummy_input)
+            _ = model(**dummy_batch)
     
     if device == 'cuda':
         torch.cuda.synchronize()
