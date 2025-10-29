@@ -26,3 +26,5 @@ torchvision
 flash-attn
 datasets
 scikit-learn 
+hashlib
+json

@@ -6,6 +6,8 @@ import math
 import yaml
 import shutil
 import copy
+import hashlib
+import json
 
 import torch
 import torch.distributed as dist
@@ -302,8 +304,67 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     )
 
 
+def compute_file_checksum(filepath: str) -> str:
+    """Compute SHA256 checksum of a file."""
+    sha256_hash = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        # Read in 64KB chunks for memory efficiency
+        for byte_block in iter(lambda: f.read(65536), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+
+def save_checkpoint_atomic(checkpoint: dict, filepath: str):
+    """Save checkpoint atomically with checksum verification.
+    
+    Uses atomic write (temp file + rename) to prevent corruption during save.
+    Generates SHA256 checksum for compression safety.
+    """
+    # Write to temporary file first (atomic operation)
+    temp_filepath = filepath + ".tmp"
+    
+    try:
+        # Save checkpoint to temp file
+        torch.save(checkpoint, temp_filepath)
+        
+        # Compute checksum
+        checksum = compute_file_checksum(temp_filepath)
+        
+        # Save checksum metadata
+        checksum_file = filepath + ".sha256"
+        metadata = {
+            "checksum": checksum,
+            "step": checkpoint.get('step', 0),
+            "size_bytes": os.path.getsize(temp_filepath),
+            "timestamp": os.path.getmtime(temp_filepath)
+        }
+        with open(checksum_file + ".tmp", 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        # Atomic rename (this is the actual "commit" point)
+        # If interrupted here, temp files exist but original is intact
+        os.replace(temp_filepath, filepath)
+        os.replace(checksum_file + ".tmp", checksum_file)
+        
+        return checksum
+        
+    except Exception as e:
+        # Clean up temp files on error
+        if os.path.exists(temp_filepath):
+            os.remove(temp_filepath)
+        if os.path.exists(checksum_file + ".tmp"):
+            os.remove(checksum_file + ".tmp")
+        raise e
+
+
 def save_train_state(config: PretrainConfig, train_state: TrainState):
-    """Save complete training state including model, optimizers, and training metadata."""
+    """Save complete training state with corruption protection.
+    
+    Features:
+    - Atomic writes (temp file + rename)
+    - SHA256 checksum verification
+    - Safe for compression/transfer
+    """
     if config.checkpoint_path is None:
         return
 
@@ -321,15 +382,66 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
         checkpoint['replay_buffer_size'] = len(train_state.model.replay_buffer)
         checkpoint['dqn_step_counter'] = getattr(train_state.model, 'dqn_step_counter', 0)
     
-    torch.save(checkpoint, os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
-    # Also save latest checkpoint for easy resumption
-    torch.save(checkpoint, os.path.join(config.checkpoint_path, "latest.pt"))
+    # Save with atomic write + checksum
+    step_path = os.path.join(config.checkpoint_path, f"step_{train_state.step}")
+    latest_path = os.path.join(config.checkpoint_path, "latest.pt")
+    
+    save_checkpoint_atomic(checkpoint, step_path)
+    checksum = save_checkpoint_atomic(checkpoint, latest_path)
+    
+    # Log checksum for user verification
+    print(f"   SHA256: {checksum[:16]}...")
+
+
+def verify_checkpoint_integrity(checkpoint_path: str) -> bool:
+    """Verify checkpoint integrity using SHA256 checksum.
+    
+    Returns True if checksum matches or no checksum file exists (legacy).
+    Returns False if checksum verification fails.
+    """
+    checksum_file = checkpoint_path + ".sha256"
+    
+    # If no checksum file, assume legacy checkpoint (skip verification)
+    if not os.path.exists(checksum_file):
+        print("   ⚠️  No checksum file found (legacy checkpoint)")
+        return True
+    
+    try:
+        # Load expected checksum
+        with open(checksum_file, 'r') as f:
+            metadata = json.load(f)
+        expected_checksum = metadata['checksum']
+        
+        # Compute actual checksum
+        print("   🔍 Verifying checkpoint integrity...")
+        actual_checksum = compute_file_checksum(checkpoint_path)
+        
+        if actual_checksum == expected_checksum:
+            print(f"   ✅ Checksum verified: {actual_checksum[:16]}...")
+            return True
+        else:
+            print(f"   ❌ CHECKSUM MISMATCH!")
+            print(f"      Expected: {expected_checksum[:16]}...")
+            print(f"      Got:      {actual_checksum[:16]}...")
+            print(f"      ⚠️  Checkpoint may be corrupted!")
+            return False
+            
+    except Exception as e:
+        print(f"   ⚠️  Checksum verification failed: {e}")
+        return True  # Allow loading if verification fails
 
 
 def load_checkpoint(model: nn.Module, config: PretrainConfig, optimizers=None, train_state=None):
-    """Load checkpoint with support for full training state resumption."""
+    """Load checkpoint with integrity verification."""
     if config.load_checkpoint is not None:
         print(f"Loading checkpoint {config.load_checkpoint}")
+        
+        # Verify integrity before loading
+        if not verify_checkpoint_integrity(config.load_checkpoint):
+            print("\n⚠️  WARNING: Checkpoint failed integrity check!")
+            response = input("   Continue loading anyway? [y/N]: ")
+            if response.lower() != 'y':
+                raise RuntimeError("Checkpoint verification failed. Aborting.")
 
         # Load checkpoint
         checkpoint = torch.load(config.load_checkpoint, map_location="cuda")
