@@ -221,7 +221,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # Support separate input/output vocabularies (for vision classification)
         # input_vocab_size: patch tokens (e.g., 2048 for VQ-VAE)
         # output_vocab_size: classes (e.g., 10 for CIFAR-10)
-        input_vocab_size = getattr(self.config, 'input_vocab_size', self.config.vocab_size)
+        # For text: input_vocab_size is None, so default to vocab_size
+        input_vocab_size = self.config.input_vocab_size if self.config.input_vocab_size is not None else self.config.vocab_size
         output_vocab_size = self.config.vocab_size  # Always use vocab_size for output
         
         # Vision: CNN tokenizer or embedding table
