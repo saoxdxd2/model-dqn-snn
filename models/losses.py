@@ -61,10 +61,18 @@ class ACTLossHead(nn.Module):
                 rank=0,  # Will be set properly in distributed training
                 world_size=1,
                 compress=True,
+                prioritized=getattr(config, 'enable_prioritized_replay', False),
+                alpha=getattr(config, 'per_alpha', 0.6),
+                beta=getattr(config, 'per_beta', 0.4),
             )
             self.reward_stats = RunningStats()
             self.dqn_step_counter = 0
-            self.dqn_loss_weight = 0.1  # Conservative start
+            # Adaptive DQN loss weight: curriculum learning schedule
+            # Start low (0.01) when predictions are random, increase to 0.5 as model improves
+            self.dqn_loss_weight_min = 0.01
+            self.dqn_loss_weight_max = 0.5
+            self.dqn_loss_weight = self.dqn_loss_weight_min
+            self.running_accuracy = 0.0  # Track accuracy for weight adaptation
             
             # Intrinsic motivation for improved exploration
             self.intrinsic_reward = IntrinsicRewardModule(
@@ -93,10 +101,11 @@ class ACTLossHead(nn.Module):
         new_carry, outputs = self.model(**model_kwargs)
         labels = new_carry.current_data["labels"]
         
-        # Handle deep supervision outputs
-        if isinstance(outputs, dict) and 'intermediate' in outputs:
-            logits = outputs['final']
-            intermediate_logits = outputs['intermediate']
+        # Handle deep supervision and MTP outputs
+        if isinstance(outputs, dict) and ('intermediate' in outputs or 'mtp_logits' in outputs):
+            logits = outputs.get('final', outputs.get('logits', outputs))
+            intermediate_logits = outputs.get('intermediate')
+            mtp_logits = outputs.get('mtp_logits')  # Multi-token prediction outputs
             # Preserve critical keys: q_halt_logits, q_continue_logits, z_H
             q_halt_logits = outputs.get('q_halt_logits')
             q_continue_logits = outputs.get('q_continue_logits')
@@ -112,6 +121,7 @@ class ACTLossHead(nn.Module):
         else:
             logits = outputs if not isinstance(outputs, dict) else outputs.get('logits', outputs)
             intermediate_logits = None
+            mtp_logits = None
             # Replace outputs with proper structure if needed
             if not isinstance(outputs, dict) or 'logits' not in outputs:
                 outputs = {'logits': logits}
@@ -164,6 +174,21 @@ class ACTLossHead(nn.Module):
             total_supervision_loss = sum(deep_supervision_losses) / len(deep_supervision_losses)
             lm_loss = (lm_loss + total_supervision_loss) / 2.0  # Balance final and intermediate
             metrics["deep_supervision_loss"] = total_supervision_loss.detach()
+        
+        # Multi-Token Prediction loss (DeepSeek-V3: +10-15% data efficiency)
+        mtp_loss = 0
+        if mtp_logits is not None and self.training:
+            mtp_losses = []
+            for depth, depth_logits in enumerate(mtp_logits):
+                # Target is shifted labels (predict future tokens)
+                depth_targets = torch.cat([labels[:, depth+1:], torch.full((labels.size(0), depth+1), IGNORE_LABEL_ID, dtype=labels.dtype, device=labels.device)], dim=1)
+                depth_loss = (self.loss_fn(depth_logits, depth_targets, ignore_index=IGNORE_LABEL_ID, valid_mask=(depth_targets != IGNORE_LABEL_ID)) / loss_divisor).sum()
+                mtp_losses.append(depth_loss)
+            
+            # Average across depths (as per DeepSeek paper)
+            mtp_loss = sum(mtp_losses) / len(mtp_losses)
+            metrics["mtp_loss"] = mtp_loss.detach()
+            metrics["mtp_num_depths"] = len(mtp_logits)
         
         q_halt_loss = F.binary_cross_entropy_with_logits(outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum")
         
@@ -255,35 +280,58 @@ class ACTLossHead(nn.Module):
             
             # Compute epsilon for current step
             from models.dqn_utils import compute_epsilon
+            config = self.model.config
             current_epsilon = compute_epsilon(
-                new_carry.training_step,
-                self.model.config.dqn_epsilon_start,
-                self.model.config.dqn_epsilon_end,
-                self.model.config.dqn_epsilon_decay_steps
+                self.dqn_step_counter,
+                epsilon_start=config.dqn_epsilon_start,
+                epsilon_end=config.dqn_epsilon_end,
+                epsilon_decay_steps=config.dqn_epsilon_decay_steps
             )
             
-            # Train DQN if buffer is ready
-            if len(self.replay_buffer) >= self.model.config.dqn_buffer_min_size:
-                dqn_loss = self._compute_dqn_loss()
-                metrics["dqn_loss"] = dqn_loss.detach()
-                metrics["dqn_buffer_size"] = len(self.replay_buffer)
+            # DQN Loss (if buffer has enough samples)
+            if len(self.replay_buffer) >= config.dqn_buffer_min_size:
+                device = outputs['logits'].device if 'logits' in outputs else 'cuda'
+                batch = self.replay_buffer.sample(config.dqn_batch_size, device=device)
                 
-                # Update target network (soft update every step)
-                soft_update_target_network(
-                    self.model.inner.q_head.parameters(),
-                    self.model.inner.q_head_target.parameters(),
-                    tau=self.model.config.dqn_target_tau
-                )
-            
-            # Update carry with new tracking values (training_step incremented in TRM forward)
-            # CRITICAL: This modifies new_carry in-place, ensuring prev_accuracy propagates correctly
-            if new_carry.prev_accuracy is not None:
-                new_carry.prev_accuracy[:] = curr_accuracy  # In-place update to ensure propagation
-            else:
-                # Initialize if not already present
-                new_carry = new_carry._replace(prev_accuracy=curr_accuracy) if hasattr(new_carry, '_replace') else new_carry
+                with torch.no_grad():
+                    # Target Q-values
+                    target_q_values = self.model.inner.q_head(batch['next_state'])
+                    target_q_max = target_q_values.max(dim=1)[0]
+                    
+                    # Bellman target
+                    targets = batch['reward'] + config.dqn_gamma * target_q_max * (~batch['done'])
+                
+                # Current Q-values
+                current_q_values = self.model.inner.q_head(batch['state'])
+                current_q = current_q_values.gather(1, batch['action'].unsqueeze(1)).squeeze(1)
+                
+                # TD error (for prioritized replay)
+                td_errors = current_q - targets
+                
+                # Importance sampling weighted loss (for prioritized replay)
+                weights = batch.get('weights', torch.ones_like(td_errors))
+                dqn_loss = (weights * td_errors.pow(2)).mean()
+                
+                # Update priorities in replay buffer
+                if hasattr(self.replay_buffer, 'update_priorities'):
+                    self.replay_buffer.update_priorities(batch['indices'], td_errors)
+                
+                metrics["dqn_loss"] = dqn_loss.detach()
+                metrics["dqn_q_mean"] = current_q.mean().detach()
+                metrics["dqn_target_mean"] = targets.mean().detach()
+                metrics["dqn_td_error_mean"] = td_errors.abs().mean().detach()
             
             self.dqn_step_counter += 1
+            
+            # Adaptive DQN loss weight: curriculum learning
+            # Update running accuracy (exponential moving average)
+            current_batch_accuracy = curr_accuracy.mean().item()
+            self.running_accuracy = 0.99 * self.running_accuracy + 0.01 * current_batch_accuracy
+            
+            # Increase DQN weight as model improves (sigmoid schedule)
+            # At 0% acc → weight = 0.01, at 50% acc → weight = 0.5
+            accuracy_ratio = min(self.running_accuracy / 0.5, 1.0)  # Normalize to [0, 1]
+            self.dqn_loss_weight = self.dqn_loss_weight_min + (self.dqn_loss_weight_max - self.dqn_loss_weight_min) * accuracy_ratio
             
             # Additional DQN metrics
             metrics["dqn_reward_mean"] = rewards.mean().detach()
@@ -292,13 +340,23 @@ class ACTLossHead(nn.Module):
             metrics["dqn_reward_intrinsic"] = intrinsic_bonus.mean().detach()
             metrics["dqn_epsilon"] = current_epsilon
             metrics["dqn_accuracy_improvement"] = accuracy_improvement.mean().detach()
+            metrics["dqn_loss_weight_adaptive"] = self.dqn_loss_weight
+            metrics["dqn_running_accuracy"] = self.running_accuracy
             
             # Memory bank metrics (if enabled)
             if self.model.config.enable_memory and self.model.inner.memory is not None:
                 memory_stats = self.model.inner.memory.get_memory_stats()
                 metrics["memory_utilization"] = memory_stats['utilization']
                 metrics["memory_active_slots"] = memory_stats['active_slots']
+                metrics["memory_total_accesses"] = memory_stats['total_accesses']
                 metrics["memory_bonus_mean"] = memory_bonus.mean().detach()
+                
+                # L1 Cache statistics (valuable for inference optimization)
+                cache_stats = self.model.inner.memory.get_cache_stats()
+                metrics["memory_cache_hit_rate"] = cache_stats['hit_rate']
+                metrics["memory_cache_entries"] = cache_stats['cache_entries']
+                metrics["memory_cache_hits"] = cache_stats['cache_hits']
+                metrics["memory_cache_misses"] = cache_stats['cache_misses']
         
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
@@ -307,6 +365,12 @@ class ACTLossHead(nn.Module):
         total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + entropy_bonus
         if self.enable_dqn and isinstance(dqn_loss, torch.Tensor):
             total_loss = total_loss + self.dqn_loss_weight * dqn_loss
+        
+        # Add MTP loss with configurable weight (lambda parameter)
+        if isinstance(mtp_loss, torch.Tensor) and mtp_loss != 0:
+            mtp_weight = getattr(self.model.config, 'mtp_loss_weight', 0.5)
+            total_loss = total_loss + mtp_weight * mtp_loss
+            metrics["mtp_loss_weighted"] = (mtp_weight * mtp_loss).detach()
 
         return new_carry, total_loss, metrics, detached_outputs, new_carry.halted.all()
     

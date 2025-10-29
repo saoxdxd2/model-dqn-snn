@@ -18,6 +18,7 @@ class DQNReplayBuffer:
     - CPU storage, GPU sampling
     - Circular buffer with fixed capacity
     - Support for distributed training (local buffers per rank)
+    - Prioritized experience replay (optional, for better learning)
     """
     
     def __init__(
@@ -27,6 +28,9 @@ class DQNReplayBuffer:
         world_size: int = 1,
         compress: bool = True,
         storage_dtype: torch.dtype = torch.bfloat16,
+        prioritized: bool = False,
+        alpha: float = 0.6,  # Priority exponent
+        beta: float = 0.4,   # Importance sampling exponent
     ):
         """
         Initialize replay buffer.
@@ -44,6 +48,12 @@ class DQNReplayBuffer:
         self.compress = compress
         self.storage_dtype = storage_dtype
         
+        # Prioritized replay
+        self.prioritized = prioritized
+        self.alpha = alpha  # Priority exponent (0=uniform, 1=full prioritization)
+        self.beta = beta    # Importance sampling correction (annealed to 1.0)
+        self.beta_increment = 0.001  # Anneal beta over time
+        
         # Pre-allocated storage on CPU (eliminates memory fragmentation)
         self.states = None           # Will be [capacity, hidden_size]
         self.actions = np.zeros(capacity, dtype=np.int8)  # 0=continue, 1=halt
@@ -51,6 +61,11 @@ class DQNReplayBuffer:
         self.next_states = None      # Will be [capacity, hidden_size]
         self.dones = np.zeros(capacity, dtype=bool)
         self.steps = np.zeros(capacity, dtype=np.int32)
+        
+        # Priority tree for efficient sampling (if prioritized)
+        if self.prioritized:
+            self.priorities = np.ones(capacity, dtype=np.float32)
+            self.max_priority = 1.0
         
         self.position = 0
         self.size = 0
@@ -108,26 +123,47 @@ class DQNReplayBuffer:
         self.dones[idx] = done_val
         self.steps[idx] = step_val
         
+        # Set priority for new transition (max priority for new experiences)
+        if self.prioritized:
+            self.priorities[idx] = self.max_priority
+        
         # Update counters
         self.size = min(self.size + 1, self.capacity)
         self.position += 1
     
     def sample(self, batch_size: int, device: str = 'cuda') -> Dict[str, Tensor]:
         """
-        Sample random batch from buffer.
+        Sample batch from buffer (uniform or prioritized).
         
         Args:
             batch_size: Number of transitions to sample
             device: Device to move samples to
         
         Returns:
-            Dictionary with keys: state, action, reward, next_state, done, step
+            Dictionary with keys: state, action, reward, next_state, done, step, indices, weights
         """
         if self.size == 0:
             raise ValueError("Cannot sample from empty buffer")
         
-        # Random indices
-        indices = np.random.choice(self.size, size=min(batch_size, self.size), replace=False)
+        batch_size = min(batch_size, self.size)
+        
+        if self.prioritized:
+            # Prioritized sampling
+            priorities = self.priorities[:self.size] ** self.alpha
+            probabilities = priorities / priorities.sum()
+            
+            indices = np.random.choice(self.size, size=batch_size, replace=False, p=probabilities)
+            
+            # Importance sampling weights (for bias correction)
+            # Anneal beta from initial value to 1.0
+            self.beta = min(1.0, self.beta + self.beta_increment)
+            weights = (self.size * probabilities[indices]) ** (-self.beta)
+            weights /= weights.max()  # Normalize for stability
+            weights = torch.from_numpy(weights).to(device=device, dtype=torch.float32)
+        else:
+            # Uniform sampling
+            indices = np.random.choice(self.size, size=batch_size, replace=False)
+            weights = torch.ones(batch_size, device=device, dtype=torch.float32)
         
         # Gather samples (vectorized operations on pre-allocated arrays)
         batch = {
@@ -137,6 +173,8 @@ class DQNReplayBuffer:
             'next_state': self.next_states[indices].to(device=device, dtype=torch.float32),
             'done': torch.from_numpy(self.dones[indices]).to(device=device, dtype=torch.bool),
             'step': torch.from_numpy(self.steps[indices]).to(device=device, dtype=torch.int32),
+            'indices': indices,  # For priority updates
+            'weights': weights,  # Importance sampling weights
         }
         
         return batch
@@ -144,6 +182,23 @@ class DQNReplayBuffer:
     def __len__(self) -> int:
         """Return current buffer size."""
         return self.size
+    
+    def update_priorities(self, indices: np.ndarray, td_errors: Tensor):
+        """Update priorities for sampled transitions based on TD-errors.
+        
+        Args:
+            indices: Indices of transitions to update
+            td_errors: TD-errors for priority calculation (higher error = higher priority)
+        """
+        if not self.prioritized:
+            return
+        
+        # Convert TD-errors to priorities (add small epsilon for stability)
+        priorities = np.abs(td_errors.detach().cpu().numpy()) + 1e-6
+        
+        # Update priorities
+        self.priorities[indices] = priorities
+        self.max_priority = max(self.max_priority, priorities.max())
     
     def clear(self):
         """Clear all stored transitions."""
@@ -155,6 +210,11 @@ class DQNReplayBuffer:
         self.rewards.fill(0.0)
         self.dones.fill(False)
         self.steps.fill(0)
+        
+        if self.prioritized:
+            self.priorities.fill(1.0)
+            self.max_priority = 1.0
+        
         self.position = 0
         self.size = 0
     

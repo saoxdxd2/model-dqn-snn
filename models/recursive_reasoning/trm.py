@@ -5,6 +5,8 @@ import torch
 import copy
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
+from functools import partial
 from pydantic import BaseModel
 import random
 from models.common import trunc_normal_init_
@@ -13,6 +15,29 @@ from models.sparse_embedding import CastedSparseEmbedding
 from models.dqn_utils import compute_epsilon, select_action_epsilon_greedy
 from models.q_heads import create_q_head
 from models.memory_bank import AssociativeMemoryBank
+
+# Selective checkpointing policy: save matmuls, recompute cheap ops
+try:
+    from torch.utils.checkpoint import CheckpointPolicy, create_selective_checkpoint_contexts
+    
+    def selective_checkpoint_policy(ctx, op, *args, **kwargs):
+        """Save compute-intensive ops (matmuls, attention), recompute cheap ops (pointwise)."""
+        compute_intensive_ops = [
+            torch.ops.aten.mm,
+            torch.ops.aten.bmm,
+            torch.ops.aten.addmm,
+            torch.ops.aten._scaled_dot_product_flash_attention,
+            torch.ops.aten._scaled_dot_product_efficient_attention,
+        ]
+        if op in compute_intensive_ops:
+            return CheckpointPolicy.MUST_SAVE
+        else:
+            return CheckpointPolicy.PREFER_RECOMPUTE
+    
+    SELECTIVE_CHECKPOINT_AVAILABLE = True
+except ImportError:
+    SELECTIVE_CHECKPOINT_AVAILABLE = False
+    selective_checkpoint_policy = None
 
 IGNORE_LABEL_ID = -100
 
@@ -109,6 +134,18 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     memory_dropout: float = 0.1
     memory_reward_bonus: float = 0.5
     memory_reward_threshold: float = 0.05  # Match YAML default
+    
+    # Multi-Token Prediction (DeepSeek-V3 inspired)
+    enable_mtp: bool = False  # Enable multi-token prediction for better data efficiency
+    mtp_num_depths: int = 3  # Number of future tokens to predict (D in paper)
+    mtp_loss_weight: float = 0.5  # Lambda: weight for MTP loss vs main loss
+    mtp_share_embeddings: bool = True  # Share embedding across depths (parameter savings)
+    mtp_share_output_head: bool = True  # Share output head across depths
+    
+    # CPU Optimization Flags
+    cpu_optimized: bool = False  # Enable CPU-friendly optimizations
+    use_gelu: bool = True  # GELU (GPU) vs ReLU (CPU faster)
+    ffn_expansion_ratio: float = 4.0  # 4.0 for GPU, 2.0 for CPU
 
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
@@ -217,11 +254,49 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 num_heads=self.config.memory_num_heads,
                 dropout=self.config.memory_dropout
             )
+        
+        # Multi-Token Prediction (optional, DeepSeek-V3 inspired)
+        self.mtp_modules = None
+        if self.config.enable_mtp:
+            # Create lightweight MTP modules that reuse embeddings/output head
+            self.mtp_modules = nn.ModuleList([
+                self._create_mtp_module() for _ in range(self.config.mtp_num_depths)
+            ])
 
         # Initial states
         self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
         self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
 
+    def _create_mtp_module(self):
+        """Create single MTP module that shares weights with main model."""
+        class MTPDepthModule(nn.Module):
+            def __init__(self, config, embedding, output_head):
+                super().__init__()
+                self.embedding = embedding  # Shared
+                self.output_head = output_head  # Shared
+                # Projection: [h_prev; token_emb] -> h_combined
+                self.projection = nn.Linear(config.hidden_size * 2, config.hidden_size)
+                # Lightweight transformer (1 layer)
+                self.transformer = TinyRecursiveReasoningModel_ACTV1Block(config)
+            
+            def forward(self, h_prev, next_token_ids, **seq_info):
+                # Embed next tokens
+                token_emb = self.embedding(next_token_ids.to(torch.int32))
+                # Combine with previous state
+                combined = torch.cat([h_prev, token_emb], dim=-1)
+                h_combined = self.projection(combined)
+                # Transform
+                h_current = self.transformer(h_combined, **seq_info)
+                # Predict
+                logits = self.output_head(h_current)
+                return h_current, logits
+        
+        return MTPDepthModule(
+            self.config,
+            self.embed_tokens,
+            self.lm_head
+        )
+    
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # Token embedding
         embedding = self.embed_tokens(input.to(torch.int32))
@@ -272,49 +347,72 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         intermediate_outputs = [] if enable_deep_supervision else None
         supervision_interval = max(1, self.config.H_cycles // supervision_steps) if enable_deep_supervision else self.config.H_cycles
         
-        # Process H-cycles (with selective gradient computation)
+        # Process H-cycles with gradient checkpointing for memory efficiency
         for h_step in range(self.config.H_cycles):
             # Determine if this step should have gradients
             is_supervision_step = enable_deep_supervision and (h_step % supervision_interval == 0 or h_step == self.config.H_cycles - 1)
             is_final_step = (h_step == self.config.H_cycles - 1)
             
-            # Context manager for gradient control
-            context = torch.enable_grad() if (is_supervision_step or is_final_step) else torch.no_grad()
-            
-            with context:
-                # Dynamic memory query at each H-cycle
-                memory_content = None
-                if self.memory is not None:
+            # Dynamic memory query at each H-cycle
+            memory_content = None
+            if self.memory is not None:
+                with torch.no_grad():  # Memory read is always no_grad for stability
                     memory_content = self.memory.read(z_H[:, 0])  # [batch, hidden_size]
                     memory_content = memory_content.unsqueeze(1)  # [batch, 1, hidden_size]
-                
-                # L-cycles with memory-enhanced input
-                for _L_step in range(self.config.L_cycles):
-                    h_input = z_H + input_embeddings
-                    if memory_content is not None:
-                        h_input = h_input + memory_content
-                    z_L = self.L_level(z_L, h_input, **seq_info)
-                z_H = self.L_level(z_H, z_L, **seq_info)
-                
-                # Collect intermediate output for supervision
-                if is_supervision_step and intermediate_outputs is not None:
-                    intermediate_output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-                    intermediate_outputs.append(intermediate_output)
-                
-                # Detach for next iteration (unless final or supervision step)
-                if not is_final_step:
-                    z_H = z_H.detach()
-                    z_L = z_L.detach()
+            
+            # L-cycles with memory-enhanced input
+            for _L_step in range(self.config.L_cycles):
+                h_input = z_H + input_embeddings
+                if memory_content is not None:
+                    h_input = h_input + memory_content
+                z_L = self.L_level(z_L, h_input, **seq_info)
+            z_H = self.L_level(z_H, z_L, **seq_info)
+            
+            # Collect intermediate output for supervision (keep in graph)
+            if is_supervision_step and intermediate_outputs is not None:
+                intermediate_output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
+                intermediate_outputs.append(intermediate_output)
+            
+            # Detach for next iteration ONLY if not supervision step
+            # This ensures gradients flow through all supervision checkpoints
+            if not is_final_step and not is_supervision_step:
+                z_H = z_H.detach()
+                z_L = z_L.detach()
 
         # Final outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
         
-        # Store intermediate outputs in extra field
-        if intermediate_outputs:
-            # Return intermediate outputs for deep supervision loss
-            output = {'final': output, 'intermediate': intermediate_outputs}
+        # Multi-Token Prediction (if enabled)
+        mtp_logits = None
+        if self.mtp_modules is not None and self.training:
+            seq_info_mtp = dict(cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None)
+            mtp_logits = []
+            h_prev = z_H[:, self.puzzle_emb_len:]  # Remove puzzle embeddings
+            
+            for depth, mtp_module in enumerate(self.mtp_modules):
+                # Get next token IDs (shifted by depth+1)
+                if depth + 1 < batch["inputs"].size(1):
+                    next_tokens = batch["inputs"][:, depth+1:]
+                    # Pad to match sequence length
+                    if next_tokens.size(1) < batch["inputs"].size(1):
+                        next_tokens = F.pad(next_tokens, (0, batch["inputs"].size(1) - next_tokens.size(1)))
+                else:
+                    next_tokens = torch.zeros_like(batch["inputs"])
+                
+                h_current, logits = mtp_module(h_prev, next_tokens, **seq_info_mtp)
+                mtp_logits.append(logits)
+                h_prev = h_current
+        
+        # Store intermediate outputs and MTP in dict
+        if intermediate_outputs or mtp_logits:
+            output_dict = {'final': output if not isinstance(output, dict) else output}
+            if intermediate_outputs:
+                output_dict['intermediate'] = intermediate_outputs
+            if mtp_logits:
+                output_dict['mtp_logits'] = mtp_logits
+            output = output_dict
         
         return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
 
@@ -391,14 +489,17 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             
             # Detect puzzle boundary changes (new puzzle started)
             puzzle_changed = torch.zeros_like(halted)
+            new_puzzle_ids = carry.puzzle_ids  # Default to current
+            
             if carry.puzzle_ids is not None and 'puzzle_identifiers' in new_current_data:
                 current_puzzle_ids = new_current_data['puzzle_identifiers'].view(-1)
                 puzzle_changed = (carry.puzzle_ids != current_puzzle_ids) & (carry.puzzle_ids != 0)
-                # Update tracked puzzle IDs
+                # CRITICAL: Update tracked puzzle IDs BEFORE reset to ensure proper state tracking
                 new_puzzle_ids = torch.where(carry.halted, current_puzzle_ids, carry.puzzle_ids)
             
             # Reset RNN Q-head state for puzzle boundaries (CRITICAL FIX)
             # This prevents state contamination when a new puzzle starts
+            # Must happen AFTER puzzle_ids are updated but BEFORE using the Q-head
             if hasattr(self.inner.q_head, 'reset_hidden') and puzzle_changed.any():
                 batch_size = batch["inputs"].shape[0]
                 self.inner.q_head.reset_hidden(batch_size, mask=puzzle_changed)

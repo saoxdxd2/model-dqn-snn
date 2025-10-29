@@ -279,20 +279,55 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
 
 
 def save_train_state(config: PretrainConfig, train_state: TrainState):
-    # FIXME: Only saved model.
+    """Save complete training state including model, optimizers, and training metadata."""
     if config.checkpoint_path is None:
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
-    torch.save(train_state.model.state_dict(), os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
+    
+    checkpoint = {
+        'step': train_state.step,
+        'model_state_dict': train_state.model.state_dict(),
+        'optimizer_states': [opt.state_dict() for opt in train_state.optimizers],
+        'carry': train_state.carry,  # Save RNN/memory states
+    }
+    
+    # Save DQN-specific state if enabled
+    if hasattr(train_state.model, 'replay_buffer'):
+        checkpoint['replay_buffer_size'] = len(train_state.model.replay_buffer)
+        checkpoint['dqn_step_counter'] = getattr(train_state.model, 'dqn_step_counter', 0)
+    
+    torch.save(checkpoint, os.path.join(config.checkpoint_path, f"step_{train_state.step}"))
+    # Also save latest checkpoint for easy resumption
+    torch.save(checkpoint, os.path.join(config.checkpoint_path, "latest.pt"))
 
 
-def load_checkpoint(model: nn.Module, config: PretrainConfig):
+def load_checkpoint(model: nn.Module, config: PretrainConfig, optimizers=None, train_state=None):
+    """Load checkpoint with support for full training state resumption."""
     if config.load_checkpoint is not None:
         print(f"Loading checkpoint {config.load_checkpoint}")
 
-        # Load state dict
-        state_dict = torch.load(config.load_checkpoint, map_location="cuda")
+        # Load checkpoint
+        checkpoint = torch.load(config.load_checkpoint, map_location="cuda")
+        
+        # Handle both old format (dict with state_dict) and new format (dict with model_state_dict)
+        if 'model_state_dict' in checkpoint:
+            # New format with full training state
+            state_dict = checkpoint['model_state_dict']
+            
+            # Load optimizer states if provided
+            if optimizers is not None and 'optimizer_states' in checkpoint:
+                print(f"Restoring optimizer states from checkpoint")
+                for opt, opt_state in zip(optimizers, checkpoint['optimizer_states']):
+                    opt.load_state_dict(opt_state)
+            
+            # Restore training step
+            if train_state is not None and 'step' in checkpoint:
+                train_state.step = checkpoint['step']
+                print(f"Resuming from step {train_state.step}")
+        else:
+            # Old format: checkpoint is the state_dict directly
+            state_dict = checkpoint
 
         # Resize and reset puzzle emb if needed
         puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
