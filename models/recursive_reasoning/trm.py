@@ -13,7 +13,6 @@ from models.common import trunc_normal_init_
 from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 from models.common import *
-from models.base_types import *
 from models.dqn_utils import compute_epsilon, select_action_epsilon_greedy
 from models.q_heads import create_q_head
 from models.memory_bank import AssociativeMemoryBank
