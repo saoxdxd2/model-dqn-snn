@@ -21,6 +21,46 @@ from pathlib import Path
 import argparse
 
 
+# Communication Training Roadmap (optimized for chat quality)
+COMMUNICATION_ROADMAP = [
+    {
+        "phase": 1,
+        "name": "Foundation (Language Structure)",
+        "dataset": "text",
+        "epochs": 5000,
+        "time_hours": 9,
+        "goal": "Learn formal English, grammar, vocabulary",
+        "continue_from": None
+    },
+    {
+        "phase": 2,
+        "name": "Fluency (Conversational Flow)",
+        "dataset": "text-tiny",
+        "epochs": 2000,
+        "time_hours": 12,
+        "goal": "Simple, fluent generation (children's stories)",
+        "continue_from": "text"
+    },
+    {
+        "phase": 3,
+        "name": "Instruction Following (Q&A)",
+        "dataset": "alpaca",
+        "epochs": 1000,
+        "time_hours": 6,
+        "goal": "Learn instruction→response patterns",
+        "continue_from": "text-tiny"
+    },
+    {
+        "phase": 4,
+        "name": "Conversational Polish",
+        "dataset": "sharegpt",
+        "epochs": 500,
+        "time_hours": 8,
+        "goal": "Multi-turn dialogue",
+        "continue_from": "alpaca"
+    }
+]
+
 MODELS = {
     "text": {
         "name": "Text Generation (Language Model)",
@@ -88,8 +128,94 @@ MODELS = {
             "seed": 42
         },
         "description": "Train on CIFAR-10 with patch tokenization (like BPE for images) + DQN"
+    },
+    "alpaca": {
+        "name": "Instruction Following (Alpaca)",
+        "config": "cfg_text",
+        "dataset_builder": "dataset/build_text_dataset.py",
+        "dataset_args": {
+            "input_file": "alpaca",
+            "output_dir": "data/text-alpaca",
+            "tokenizer_name": "gpt2",
+            "max_seq_len": 512,
+            "stride": 256
+        },
+        "description": "Train on Alpaca instruction-response pairs"
+    },
+    "sharegpt": {
+        "name": "Conversational (ShareGPT)",
+        "config": "cfg_text",
+        "dataset_builder": "dataset/build_text_dataset.py",
+        "dataset_args": {
+            "input_file": "sharegpt",
+            "output_dir": "data/text-sharegpt",
+            "tokenizer_name": "gpt2",
+            "max_seq_len": 512,
+            "stride": 256
+        },
+        "description": "Train on ShareGPT multi-turn dialogues"
     }
 }
+
+
+def detect_checkpoints():
+    """Detect all available checkpoints in checkpoints/ directory."""
+    checkpoint_dir = Path("checkpoints")
+    if not checkpoint_dir.exists():
+        return []
+    
+    checkpoints = []
+    for subdir in checkpoint_dir.iterdir():
+        if subdir.is_dir():
+            latest_pt = subdir / "latest.pt"
+            if latest_pt.exists():
+                checkpoints.append({
+                    "name": subdir.name,
+                    "path": str(latest_pt),
+                    "dir": str(subdir)
+                })
+    return checkpoints
+
+
+def recommend_next_phase(completed_datasets):
+    """Recommend next training phase based on roadmap."""
+    for phase in COMMUNICATION_ROADMAP:
+        dataset = phase["dataset"]
+        # Check if this phase's prerequisite is completed
+        prereq = phase["continue_from"]
+        
+        # Phase 1 has no prereq
+        if prereq is None:
+            if dataset not in completed_datasets:
+                return phase
+        # Check if prereq is done but this phase isn't
+        elif prereq in completed_datasets and dataset not in completed_datasets:
+            return phase
+    
+    return None  # All phases completed!
+
+
+def print_roadmap():
+    """Print the communication training roadmap."""
+    print("\n" + "="*70)
+    print("  🗺️  COMMUNICATION TRAINING ROADMAP")
+    print("="*70)
+    print("\nOptimal path for chat model (total ~35 hours):\n")
+    
+    total_hours = 0
+    for phase in COMMUNICATION_ROADMAP:
+        print(f"Phase {phase['phase']}: {phase['name']}")
+        print(f"  Dataset: {phase['dataset']}")
+        print(f"  Epochs: {phase['epochs']}")
+        print(f"  Time: ~{phase['time_hours']} hours")
+        print(f"  Goal: {phase['goal']}")
+        if phase['continue_from']:
+            print(f"  Continue from: Phase {phase['phase']-1} ({phase['continue_from']})")
+        print()
+        total_hours += phase['time_hours']
+    
+    print(f"Total training time: ~{total_hours} hours")
+    print("="*70 + "\n")
 
 
 def print_banner():
@@ -101,9 +227,127 @@ def print_banner():
     print()
 
 
+def select_continual_learning_mode():
+    """Interactive continual learning: select checkpoint and next dataset."""
+    
+    # Detect checkpoints
+    checkpoints = detect_checkpoints()
+    if not checkpoints:
+        print("\n❌ No checkpoints found in checkpoints/ directory.")
+        print("   Train a base model first (e.g., Phase 1: WikiText-2)\n")
+        return None, None, None
+    
+    print("\n" + "="*70)
+    print("  🔄 CONTINUAL LEARNING MODE")
+    print("="*70)
+    print("\nAvailable checkpoints:\n")
+    
+    for idx, ckpt in enumerate(checkpoints, 1):
+        print(f"  [{idx}] {ckpt['name']}")
+        print(f"      Path: {ckpt['path']}")
+        print()
+    
+    # Select checkpoint
+    while True:
+        try:
+            choice = input(f"Select checkpoint to continue from [1-{len(checkpoints)}]: ")
+            choice_idx = int(choice) - 1
+            if 0 <= choice_idx < len(checkpoints):
+                selected_ckpt = checkpoints[choice_idx]
+                break
+            else:
+                print(f"Invalid choice. Enter 1-{len(checkpoints)}")
+        except (ValueError, KeyboardInterrupt):
+            print("\nExiting...")
+            sys.exit(0)
+    
+    print(f"\n✅ Selected: {selected_ckpt['name']}")
+    
+    # Extract completed datasets from checkpoint names
+    completed_datasets = []
+    for ckpt in checkpoints:
+        name = ckpt['name'].lower()
+        for dataset_key in MODELS.keys():
+            if dataset_key in name:
+                completed_datasets.append(dataset_key)
+    
+    # Recommend next phase
+    next_phase = recommend_next_phase(completed_datasets)
+    
+    if next_phase:
+        print("\n" + "="*70)
+        print("  💡 RECOMMENDED NEXT PHASE")
+        print("="*70)
+        print(f"\nPhase {next_phase['phase']}: {next_phase['name']}")
+        print(f"  Dataset: {next_phase['dataset']}")
+        print(f"  Epochs: {next_phase['epochs']}")
+        print(f"  Time: ~{next_phase['time_hours']} hours")
+        print(f"  Goal: {next_phase['goal']}")
+        print("\n" + "="*70)
+        
+        use_recommended = input("\nUse recommended phase? [Y/n]: ").strip().lower()
+        if use_recommended in ['', 'y', 'yes']:
+            return selected_ckpt['path'], next_phase['dataset'], next_phase['epochs']
+    
+    # Manual dataset selection
+    print("\nAvailable datasets:\n")
+    dataset_keys = list(MODELS.keys())
+    for idx, key in enumerate(dataset_keys, 1):
+        info = MODELS[key]
+        print(f"  [{idx}] {key} - {info['name']}")
+    
+    while True:
+        try:
+            choice = input(f"\nSelect dataset [1-{len(dataset_keys)}]: ")
+            choice_idx = int(choice) - 1
+            if 0 <= choice_idx < len(dataset_keys):
+                selected_dataset = dataset_keys[choice_idx]
+                break
+            else:
+                print(f"Invalid choice. Enter 1-{len(dataset_keys)}")
+        except (ValueError, KeyboardInterrupt):
+            print("\nExiting...")
+            sys.exit(0)
+    
+    # Get epochs
+    while True:
+        try:
+            epochs = int(input("Enter number of epochs [default: 2000]: ") or "2000")
+            break
+        except ValueError:
+            print("Please enter a valid number")
+    
+    return selected_ckpt['path'], selected_dataset, epochs
+
+
 def select_model_interactive():
     """Interactive model selection."""
-    print("Available Models:\n")
+    
+    # Check if we should show continual learning option
+    checkpoints = detect_checkpoints()
+    
+    print("Training Modes:\n")
+    print("  [1] Fresh Training (Start new model)")
+    if checkpoints:
+        print("  [2] Continual Learning (Continue from checkpoint)")
+    print("  [3] View Communication Roadmap")
+    print()
+    
+    mode_choice = input(f"Select mode [1-{3 if checkpoints else 1}]: ").strip()
+    
+    if mode_choice == "2" and checkpoints:
+        ckpt_path, dataset, epochs = select_continual_learning_mode()
+        if ckpt_path:
+            return {"mode": "continual", "checkpoint": ckpt_path, "dataset": dataset, "epochs": epochs}
+        else:
+            sys.exit(0)
+    elif mode_choice == "3":
+        print_roadmap()
+        input("Press Enter to continue...")
+        return select_model_interactive()  # Recurse
+    
+    # Fresh training mode
+    print("\nAvailable Models:\n")
     for idx, (key, info) in enumerate(MODELS.items(), 1):
         print(f"  [{idx}] {info['name']}")
         print(f"      {info['description']}")
@@ -115,7 +359,7 @@ def select_model_interactive():
             choice_idx = int(choice) - 1
             if 0 <= choice_idx < len(MODELS):
                 selected_key = list(MODELS.keys())[choice_idx]
-                return selected_key
+                return {"mode": "fresh", "dataset": selected_key}
             else:
                 print(f"Invalid choice. Enter 1-{len(MODELS)}")
         except (ValueError, KeyboardInterrupt):
@@ -175,7 +419,7 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False):
         return False
 
 
-def train_model(model_config: dict, extra_args: list):
+def train_model(model_config: dict, extra_args: list, checkpoint_path: str = None, epochs_override: int = None):
     """Start training with specified config."""
     config_name = model_config['config']
     data_path = model_config['dataset_args']['output_dir']
@@ -184,6 +428,10 @@ def train_model(model_config: dict, extra_args: list):
     print("-" * 70)
     print(f"Config: {config_name}")
     print(f"Data: {data_path}")
+    if checkpoint_path:
+        print(f"Continue from: {checkpoint_path}")
+    if epochs_override:
+        print(f"Epochs: {epochs_override}")
     print("-" * 70)
     print()
     
@@ -192,7 +440,15 @@ def train_model(model_config: dict, extra_args: list):
         "python", "pretrain.py",
         f"--config-name={config_name}",
         f"data_paths=[{data_path}]"  # Override data path
-    ] + extra_args
+    ]
+    
+    # Add continual learning parameters
+    if checkpoint_path:
+        cmd.append(f"load_checkpoint={checkpoint_path}")
+    if epochs_override:
+        cmd.append(f"epochs={epochs_override}")
+    
+    cmd += extra_args
     
     print(f"Command: {' '.join(cmd)}\n")
     
@@ -247,13 +503,33 @@ Auto-Resume:
     print_banner()
     
     # Model selection
-    if args.model:
-        model_key = args.model
-        print(f"Selected model: {MODELS[model_key]['name']}\n")
-    else:
-        model_key = select_model_interactive()
+    checkpoint_path = None
+    epochs_override = None
     
-    model_config = MODELS[model_key]
+    if args.model:
+        selected_model = args.model
+        selection = {"mode": "fresh", "dataset": selected_model}
+    else:
+        selection = select_model_interactive()
+    
+    # Handle continual learning mode
+    if isinstance(selection, dict) and selection["mode"] == "continual":
+        checkpoint_path = selection["checkpoint"]
+        selected_model = selection["dataset"]
+        epochs_override = selection["epochs"]
+        print(f"\n🔄 Continual Learning Mode")
+        print(f"   Checkpoint: {checkpoint_path}")
+        print(f"   Dataset: {selected_model}")
+        print(f"   Epochs: {epochs_override}\n")
+    else:
+        selected_model = selection["dataset"]
+    
+    if selected_model not in MODELS:
+        print(f"❌ Unknown model: {selected_model}")
+        print(f"Available models: {', '.join(MODELS.keys())}")
+        sys.exit(1)
+    
+    model_config = MODELS[selected_model]
     
     # Dataset preparation (auto-skips if exists unless --rebuild-dataset)
     success = download_and_build_dataset(model_config, force_rebuild=args.rebuild_dataset)
@@ -265,8 +541,8 @@ Auto-Resume:
         print("\n✅ Dataset preparation complete. Exiting (--dataset-only).")
         sys.exit(0)
     
-    # Training
-    train_model(model_config, unknown_args)
+    # Start training
+    train_model(model_config, unknown_args, checkpoint_path=checkpoint_path, epochs_override=epochs_override)
     
     print("\n" + "=" * 70)
     print("  ✅ Training completed!")

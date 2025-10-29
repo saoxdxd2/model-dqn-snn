@@ -1,6 +1,7 @@
 from typing import Optional, Any, Sequence, List
 from dataclasses import dataclass
 import os
+import sys
 import math
 import yaml
 import shutil
@@ -749,53 +750,84 @@ def launch(hydra_config: DictConfig):
         print(f"  📍 Step: {train_state.step}/{train_state.total_steps}")
         print(f"{'='*70}\n")
     
-    for _iter_id in range(start_iter, total_iters):
-        print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
+    # Graceful shutdown handler
+    try:
+        for _iter_id in range(start_iter, total_iters):
+            print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
 
-        ############ Train Iter
+            ############ Train Iter
+            if RANK == 0:
+                print("TRAIN")
+            train_state.model.train()
+            for set_name, batch, global_batch_size in train_loader:
+                metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, gradient_monitor=gradient_monitor)
+
+                if RANK == 0 and metrics is not None:
+                    wandb.log(metrics, step=train_state.step)
+                    progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
+                if config.ema:
+                    ema_helper.update(train_state.model)
+
+            if _iter_id >= config.min_eval_interval:
+                ############ Evaluation
+                if RANK == 0:
+                    print("EVALUATE")
+                if config.ema:
+                    print("SWITCH TO EMA")
+                    train_state_eval = copy.deepcopy(train_state)
+                    train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
+                else:
+                    train_state_eval = train_state
+                train_state_eval.model.eval()
+                metrics = evaluate(config, 
+                    train_state_eval, 
+                    eval_loader, 
+                    eval_metadata, 
+                    evaluators,
+                    rank=RANK, 
+                    world_size=WORLD_SIZE,
+                    cpu_group=CPU_PROCESS_GROUP)
+
+                if RANK == 0 and metrics is not None:
+                    wandb.log(metrics, step=train_state.step)
+                    
+                ############ Checkpointing
+                if RANK == 0:
+                    print("SAVE CHECKPOINT")
+                if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
+                    save_train_state(config, train_state_eval)
+
+                if config.ema:
+                    del train_state_eval
+    
+    except KeyboardInterrupt:
         if RANK == 0:
-            print("TRAIN")
-        train_state.model.train()
-        for set_name, batch, global_batch_size in train_loader:
-            metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, gradient_monitor=gradient_monitor)
-
-            if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
-                progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
-            if config.ema:
-                ema_helper.update(train_state.model)
-
-        if _iter_id >= config.min_eval_interval:
-            ############ Evaluation
-            if RANK == 0:
-                print("EVALUATE")
-            if config.ema:
-                print("SWITCH TO EMA")
-                train_state_eval = copy.deepcopy(train_state)
-                train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
-            else:
-                train_state_eval = train_state
-            train_state_eval.model.eval()
-            metrics = evaluate(config, 
-                train_state_eval, 
-                eval_loader, 
-                eval_metadata, 
-                evaluators,
-                rank=RANK, 
-                world_size=WORLD_SIZE,
-                cpu_group=CPU_PROCESS_GROUP)
-
-            if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
-                
-            ############ Checkpointing
-            if RANK == 0:
-                print("SAVE CHECKPOINT")
-            if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
-                save_train_state(config, train_state_eval)
-
-            if config.ema:
-                del train_state_eval
+            print("\n" + "="*70)
+            print("  ⚠️  CTRL+C DETECTED - Saving checkpoint before exit...")
+            print("="*70)
+            
+            # Save current training state
+            try:
+                save_train_state(config, train_state)
+                print("\n✅ Checkpoint saved successfully!")
+                print(f"   Step: {train_state.step}")
+                print(f"   Saved to: {config.checkpoint_path}/latest.pt")
+                print("\n💡 You can resume training with the same command.")
+            except Exception as e:
+                print(f"\n❌ Error saving checkpoint: {e}")
+                print("   Training state may be lost!")
+            
+            print("\n" + "="*70)
+            print("  👋 Training interrupted by user")
+            print("="*70 + "\n")
+        
+        # Clean up
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        if RANK == 0:
+            wandb.finish()
+        
+        sys.exit(0)
 
     # finalize
     if dist.is_initialized():
