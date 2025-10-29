@@ -91,8 +91,9 @@ class AssociativeMemoryBank(nn.Module):
         
         # Update usage statistics (LRU tracking)
         with torch.no_grad():
-            # Average attention weights across batch and heads
-            avg_attn = attn_weights.mean(0)  # [capacity]
+            # Average attention weights across batch and sequence dimensions
+            # attn_weights shape: [batch, tgt_len=1, src_len=capacity]
+            avg_attn = attn_weights.mean(dim=(0, 1))  # [capacity]
             self.usage_count += avg_attn
             
             # Cache hot patterns (eval mode only)

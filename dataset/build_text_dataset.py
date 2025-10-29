@@ -74,15 +74,68 @@ def download_code_python():
     """Download The Stack Python code dataset (deduplicated)."""
     try:
         from datasets import load_dataset
+        from huggingface_hub import HfFolder, login
+        import os
+        
         print("Downloading The Stack Python (this may take a while...)")
-        # Use streaming to avoid downloading entire dataset
-        dataset = load_dataset(
-            "bigcode/the-stack-dedup",
-            data_dir="data/python",
-            split="train",
-            streaming=True
-        )
-        return dataset
+        
+        # Check if already authenticated
+        token = HfFolder.get_token()
+        
+        # Try loading dataset first
+        try:
+            dataset = load_dataset(
+                "bigcode/the-stack-dedup",
+                data_dir="data/python",
+                split="train",
+                streaming=True
+            )
+            return dataset
+        except Exception as auth_error:
+            if "gated dataset" in str(auth_error).lower() or "authenticated" in str(auth_error).lower():
+                # Gated dataset - need authentication
+                print("\n" + "="*70)
+                print("  🔒 The Stack is a GATED dataset - Authentication Required")
+                print("="*70)
+                print("\nTo access this dataset, you need:")
+                print("  1. A HuggingFace account (free)")
+                print("  2. Request access to The Stack dataset")
+                print("  3. Your HuggingFace API token\n")
+                
+                print("📝 Steps:")
+                print("  1. Create account: https://huggingface.co/join")
+                print("  2. Request access: https://huggingface.co/datasets/bigcode/the-stack-dedup")
+                print("  3. Get your token: https://huggingface.co/settings/tokens\n")
+                
+                # Prompt for token
+                token_input = input("Enter your HuggingFace token (or press Enter to skip): ").strip()
+                
+                if token_input:
+                    try:
+                        # Login with token
+                        login(token=token_input, add_to_git_credential=True)
+                        print("✅ Authentication successful!\n")
+                        
+                        # Retry loading
+                        print("Retrying download...")
+                        dataset = load_dataset(
+                            "bigcode/the-stack-dedup",
+                            data_dir="data/python",
+                            split="train",
+                            streaming=True
+                        )
+                        return dataset
+                    except Exception as login_error:
+                        print(f"❌ Authentication failed: {login_error}")
+                        print("\nTip: Make sure you've requested access to the dataset first!")
+                        return None
+                else:
+                    print("\n⚠️  Skipping code dataset. Try another model instead.")
+                    return None
+            else:
+                # Different error
+                raise auth_error
+                
     except ImportError:
         print("❌ datasets library not found. Install with: pip install datasets")
         return None
