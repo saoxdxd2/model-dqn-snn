@@ -151,6 +151,9 @@ class BinaryLinear(nn.Module):
         if training is None:
             training = self.training
         
+        # Cast to float32 for BNN computation (weights are float32)
+        x = x.float()
+        
         if training:
             # Straight-through estimator (STE) for gradient flow
             weight_binary = self.binarize_weights()
@@ -325,15 +328,25 @@ def benchmark_inference(model: nn.Module, input_shape: Tuple[int, ...],
     
     # Warmup - create proper batch input
     batch_size, seq_len = input_shape
-    dummy_input = torch.randint(0, 50257, (batch_size, seq_len), device=device)  # Token IDs
+    # Use model's actual seq_len if available (avoid mismatch)
+    if hasattr(model, 'config') and hasattr(model.config, 'seq_len'):
+        seq_len = model.config.seq_len
+    dummy_inputs = torch.randint(0, 50257, (batch_size, seq_len), device=device)  # Token IDs
     dummy_batch = {
-        'input': dummy_input,
+        'inputs': dummy_inputs,
+        'labels': dummy_inputs,
         'puzzle_identifiers': torch.zeros(batch_size, dtype=torch.long, device=device)
     }
     
+    # Create initial carry
+    carry = model.initial_carry(dummy_batch)
+    
     with torch.no_grad():
         for _ in range(10):
-            _ = model(**dummy_batch)
+            carry, _ = model(carry, dummy_batch)
+    
+    # Reset carry for benchmark
+    carry = model.initial_carry(dummy_batch)
     
     # Benchmark
     if device == 'cuda':
@@ -342,7 +355,7 @@ def benchmark_inference(model: nn.Module, input_shape: Tuple[int, ...],
     start_time = time.perf_counter()
     with torch.no_grad():
         for _ in range(num_iterations):
-            _ = model(**dummy_batch)
+            carry, _ = model(carry, dummy_batch)
     
     if device == 'cuda':
         torch.cuda.synchronize()

@@ -366,16 +366,24 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # Scale
         return self.embed_scale * embedding
 
-    def empty_carry(self, batch_size: int):
+    def empty_carry(self, batch_size: int, seq_len: int = None):
+        # Use provided seq_len or fall back to config
+        if seq_len is None:
+            seq_len = self.config.seq_len
         return TinyRecursiveReasoningModel_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H=torch.empty(batch_size, seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L=torch.empty(batch_size, seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry):
+        # Expand init states to match carry sequence length
+        batch_size, seq_len, hidden_size = carry.z_H.shape
+        H_init_expanded = self.H_init.view(1, 1, -1).expand(batch_size, seq_len, hidden_size)
+        L_init_expanded = self.L_init.view(1, 1, -1).expand(batch_size, seq_len, hidden_size)
+        
         return TinyRecursiveReasoningModel_ACTV1InnerCarry(
-            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
-            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
+            z_H=torch.where(reset_flag.view(-1, 1, 1), H_init_expanded, carry.z_H),
+            z_L=torch.where(reset_flag.view(-1, 1, 1), L_init_expanded, carry.z_L),
         )
 
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], 
@@ -478,10 +486,11 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
+        seq_len = batch["inputs"].shape[1]  # Get actual sequence length from input
         device = batch["inputs"].device
 
         return TinyRecursiveReasoningModel_ACTV1Carry(
-            inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
+            inner_carry=self.inner.empty_carry(batch_size, seq_len=seq_len),  # Use dynamic seq_len
             
             steps=torch.zeros((batch_size, ), dtype=torch.int32, device=device),
             halted=torch.ones((batch_size, ), dtype=torch.bool, device=device),  # Default to halted

@@ -91,8 +91,12 @@ def export_cpu_optimized(
     print(f"  Throughput: {throughput_tps:.1f} tokens/sec")
     print(f"  Target met: {'✅' if throughput_tps >= 10 else '❌'} (≥10 t/s)")
     
-    # Save optimized model
-    torch.save(optimized_model.state_dict(), output_path)
+    # Save optimized model with config
+    checkpoint = {
+        'model_state_dict': optimized_model.state_dict(),
+        'config': loader.config  # Include config for loading
+    }
+    torch.save(checkpoint, output_path)
     print(f"\nSaved to: {output_path}")
     
     # Save deployment info

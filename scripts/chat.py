@@ -78,8 +78,14 @@ class ChatSession:
         # Tokenize
         input_ids = self.tokenizer.encode(prompt, add_special_tokens=True)
         
-        # Truncate if too long
-        if len(input_ids) > self.max_seq_len:
+        # Pad to max_seq_len to avoid dimension mismatches during generation
+        # (model's hidden states are sized to sequence length)
+        if len(input_ids) < self.max_seq_len:
+            # Pad with pad_token_id at the beginning
+            padding_length = self.max_seq_len - len(input_ids)
+            input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
+        elif len(input_ids) > self.max_seq_len:
+            # Truncate if too long
             input_ids = input_ids[-self.max_seq_len:]
         
         # Convert to tensor
@@ -104,8 +110,19 @@ class ChatSession:
                 # Forward pass
                 carry, outputs = self.model(carry, batch)
                 
-                # Get logits for last token
-                logits = outputs['logits'][0, -1, :]  # [vocab_size]
+                # Handle dict or tensor outputs
+                if isinstance(outputs, dict):
+                    # Deep supervision or multi-output mode
+                    if 'final' in outputs:
+                        logits = outputs['final'][0, -1, :]  # [vocab_size]
+                    elif 'logits' in outputs:
+                        logits = outputs['logits'][0, -1, :]
+                    else:
+                        # Fallback: use first value
+                        logits = list(outputs.values())[0][0, -1, :]
+                else:
+                    # Direct tensor output
+                    logits = outputs[0, -1, :]  # [vocab_size]
                 
                 # Temperature sampling
                 if self.temperature > 0:
@@ -117,8 +134,15 @@ class ChatSession:
                 
                 generated_ids.append(next_token)
                 
+                # Debug first few tokens
+                if verbose and step < 5:
+                    token_text = self.tokenizer.decode([next_token])
+                    print(f"[Step {step}: token={next_token}, text='{token_text}']")
+                
                 # Check for EOS token
                 if next_token == self.tokenizer.eos_token_id:
+                    if verbose:
+                        print(f"[Hit EOS at step {step}]")
                     break
                 
                 # Update batch for next iteration
@@ -130,6 +154,10 @@ class ChatSession:
                     batch['inputs'] = batch['inputs'][:, -self.max_seq_len:]
                 
                 batch['labels'] = torch.full_like(batch['inputs'], -100)
+                
+                # CRITICAL: Reinitialize carry when sequence length changes
+                # The carry contains tensors sized for the sequence length
+                carry = self.model.initial_carry(batch)
         
         # Decode generated tokens
         generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -289,7 +317,7 @@ class OllamaStyleChat:
                 print("Assistant: ", end='', flush=True)
                 
                 try:
-                    response = self.session.generate_response(user_input, verbose=False)
+                    response = self.session.generate_response(user_input, verbose=True)
                     print(response)
                     
                     # Add to history
@@ -297,7 +325,10 @@ class OllamaStyleChat:
                     self.session.add_message('assistant', response)
                     
                 except Exception as e:
+                    import traceback
                     print(f"\n❌ Error generating response: {e}")
+                    print("\nFull traceback:")
+                    traceback.print_exc()
                 
                 print()  # Empty line for readability
         
@@ -328,7 +359,7 @@ Examples:
         """
     )
     
-    parser.add_argument('--model', type=str, required=True,
+    parser.add_argument('--model', '--checkpoint', type=str, required=True, dest='model',
                        help='Path to model checkpoint (.pt file)')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'],
                        help='Device to run on (default: cpu)')
