@@ -115,12 +115,17 @@ def compute_heuristic_difficulty(input_grid: np.ndarray, output_grid: np.ndarray
     
     # Pattern complexity (edge density)
     def edge_density(grid):
+        # Handle edge cases: grids too small or would cause division by zero
+        denominator = grid.size - grid.shape[0] - grid.shape[1] + 1
+        if denominator <= 0 or grid.shape[0] <= 1 or grid.shape[1] <= 1:
+            return 0.0  # No meaningful edge density for tiny grids
+        
         edges = 0
         for i in range(grid.shape[0] - 1):
             for j in range(grid.shape[1] - 1):
                 if grid[i, j] != grid[i+1, j] or grid[i, j] != grid[i, j+1]:
                     edges += 1
-        return edges / (grid.size - grid.shape[0] - grid.shape[1] + 1)
+        return edges / denominator
     
     scores['pattern_complexity'] = (edge_density(input_grid) + edge_density(output_grid)) / 2
     
