@@ -1,0 +1,44 @@
+# Image Understanding Training Config
+# TRM + ViT for image classification/understanding
+
+defaults:
+  - arch: trm_vision
+  - _self_
+
+hydra:
+  output_subdir: null
+
+# Data path
+data_paths: ['data/vision-cifar10']
+data_paths_test: []
+
+evaluators: []
+
+# Training hyperparams (optimized for vision)
+global_batch_size: 64
+epochs: 200
+eval_interval: 10
+checkpoint_every_eval: True
+
+# Learning rates (ViT-style)
+lr: 1e-3  # Higher for vision
+lr_min_ratio: 0.01
+lr_warmup_steps: 2000
+
+# Optimizer
+beta1: 0.9
+beta2: 0.999  # Adam-style for vision
+weight_decay: 0.05  # Moderate regularization
+
+# No puzzle embeddings
+puzzle_emb_lr: 0.0
+puzzle_emb_weight_decay: 0.0
+
+seed: 42
+min_eval_interval: 0
+
+checkpoint_path: "checkpoints/vision-trm-20m"
+
+ema: True  # Important for vision
+ema_rate: 0.999
+freeze_weights: False

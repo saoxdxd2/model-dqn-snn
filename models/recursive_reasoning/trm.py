@@ -98,6 +98,9 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     no_ACT_continue: bool =  True # No continue ACT loss, only use the sigmoid of the halt which makes much more sense
     use_learned_halting_eval: bool = True  # Enable learned halting during evaluation
     
+    # Text generation mode
+    causal: bool = False  # Enable causal attention for autoregressive text generation
+    
     # DQN Enhancement Parameters
     enable_dqn: bool = False  # Enable DQN-based halting
     dqn_buffer_capacity: int = 20000
@@ -165,7 +168,7 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
                 head_dim=config.hidden_size // config.num_heads,
                 num_heads=config.num_heads,
                 num_key_value_heads=config.num_heads,
-                causal=False
+                causal=config.causal  # Use config setting for causal/non-causal
             )
         self.mlp = SwiGLU(
             hidden_size=config.hidden_size,

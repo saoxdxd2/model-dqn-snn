@@ -138,6 +138,15 @@ class ACTLossHead(nn.Module):
             is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
             seq_is_correct = is_correct.sum(-1) == loss_counts
             
+            # For text generation: also compute confidence-based halt target
+            # This allows halting based on model confidence, not just correctness
+            probs = torch.softmax(outputs["logits"], dim=-1)
+            max_probs = probs.max(dim=-1).values  # [batch, seq]
+            # Average confidence across sequence (only on valid tokens)
+            avg_confidence = torch.where(mask, max_probs, 0.0).sum(-1) / loss_counts.clamp_min(1)
+            # High confidence → should halt (model is certain)
+            confidence_halt_target = avg_confidence > 0.8
+            
             # Deep supervision: compute correctness for intermediate outputs
             if intermediate_logits is not None:
                 intermediate_correct = []
