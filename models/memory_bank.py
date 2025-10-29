@@ -122,7 +122,9 @@ class AssociativeMemoryBank(nn.Module):
         
         # Apply gating (learn when memory is useful)
         if use_gating:
-            gate_value = self.gate(query)  # [batch, 1]
+            # Cast to float32 for gate (Linear layers use float32)
+            gate_value = self.gate(query.float())  # [batch, 1]
+            gate_value = gate_value.to(original_dtype)
             memory_output = gate_value * memory_output
         
         return memory_output

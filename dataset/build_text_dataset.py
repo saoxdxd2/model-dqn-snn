@@ -310,19 +310,10 @@ def create_text_dataset(config: TextDatasetConfig):
         dataset = download_code_python()
         if dataset is None:
             raise RuntimeError("Failed to download The Stack Python")
-        print("Collecting code samples (this may take a few minutes)...")
-        # Use streaming dataset - take first 50k samples for train, next 5k for test
-        code_samples = []
-        for i, sample in enumerate(dataset):
-            if i >= 55000:
-                break
-            code_samples.append(sample['content'])
-            if (i + 1) % 5000 == 0:
-                print(f"  Collected {i + 1} samples...")
-        
-        train_text = "\n\n".join(code_samples[:50000])
-        test_text = "\n\n".join(code_samples[50000:55000])
-        print(f"Using 50k train files, 5k test files")
+        print("Processing code samples with batched tokenization (memory-efficient)...")
+        # Use batched processing to avoid memory exhaustion
+        create_code_dataset_batched(config, dataset, tokenizer, vocab_size, pad_token_id, eos_token_id)
+        return
     else:
         print(f"Loading text from: {config.input_file}")
         if not os.path.exists(config.input_file):
