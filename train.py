@@ -247,6 +247,39 @@ def detect_checkpoints():
     return checkpoints
 
 
+def dataset_to_model_key(dataset_path: str) -> str:
+    """Map dataset path back to MODELS dictionary key.
+    
+    Examples:
+        data/text-wikitext2 -> text
+        data/text-tinystories -> text-tiny
+        data/arc-aug-1000 -> arc
+    """
+    dataset_name = dataset_path.split('/')[-1] if '/' in dataset_path else dataset_path
+    
+    # Direct mapping
+    if 'wikitext' in dataset_name:
+        return 'text'
+    elif 'tinystories' in dataset_name:
+        return 'text-tiny'
+    elif 'arc' in dataset_name:
+        return 'arc'
+    elif 'code' in dataset_name or 'python' in dataset_name:
+        return 'code'
+    elif 'cifar' in dataset_name or 'vision' in dataset_name:
+        return 'vision'
+    elif 'alpaca' in dataset_name:
+        return 'alpaca'
+    elif 'sharegpt' in dataset_name:
+        return 'sharegpt'
+    else:
+        # Fallback: return first matching key
+        for key in MODELS.keys():
+            if key in dataset_name:
+                return key
+        return 'text'  # Default fallback
+
+
 def recommend_next_phase(completed_datasets):
     """Recommend next training phase based on roadmap."""
     for phase in COMMUNICATION_ROADMAP:
@@ -383,7 +416,9 @@ def select_continual_learning_mode():
         if choice == "1":
             # Continue current phase
             remaining_epochs = selected_status.get('config_epochs', 0)
-            return selected_ckpt['path'], selected_status.get('dataset', 'text').split('/')[-1], remaining_epochs
+            dataset_path = selected_status.get('dataset', 'data/text-wikitext2')
+            model_key = dataset_to_model_key(dataset_path)
+            return selected_ckpt['path'], model_key, remaining_epochs
         elif choice == "2":
             print("\n⚠️  Proceeding to next phase with incomplete base...")
         else:
@@ -585,13 +620,11 @@ def train_model(model_config: dict, extra_args: list, checkpoint_path: str = Non
     
     try:
         # Run training (will stream output)
+        # KeyboardInterrupt will propagate to pretrain.py for graceful shutdown
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:
         print(f"\n❌ Training failed: {e}")
         sys.exit(1)
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Training interrupted by user")
-        sys.exit(0)
 
 
 def main():
