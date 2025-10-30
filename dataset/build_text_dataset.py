@@ -428,17 +428,18 @@ def create_text_dataset(config: TextDatasetConfig):
         labels = []
         puzzle_identifiers = []  # All 0 for text (no puzzle-specific embeddings)
         puzzle_indices = [0]  # Each sequence is a "puzzle"
-        group_indices = [0]  # All sequences in one group
+        group_indices = []  # Each sequence is its own group
         
-        for seq in sequences:
+        for i, seq in enumerate(sequences):
             # Input: tokens 0 to n-1
-            # Label: tokens 1 to n (next token prediction)
             inputs.append(seq[:-1])
+            # Label: tokens 1 to n (next token prediction)
             labels.append(seq[1:])
             puzzle_identifiers.append(0)  # No puzzle-specific embedding for text
             puzzle_indices.append(len(inputs))
+            group_indices.append(i)  # Group i contains sequence i
         
-        group_indices.append(len(sequences))
+        group_indices.append(len(sequences))  # Final boundary
         
         # Save as numpy arrays
         results = {
@@ -460,8 +461,8 @@ def create_text_dataset(config: TextDatasetConfig):
             ignore_label_id=-100,  # Standard for language modeling
             blank_identifier_id=0,
             num_puzzle_identifiers=1,  # No puzzle embeddings for text
-            total_groups=1,
-            mean_puzzle_examples=float(len(sequences)),  # All sequences in one group
+            total_groups=len(sequences),  # Each sequence is a group
+            mean_puzzle_examples=1.0,  # 1 sequence per group
             total_puzzles=len(sequences),
             sets=["all"]
         )
