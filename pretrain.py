@@ -217,9 +217,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model)  # type: ignore
 
-        # Load checkpoint
-        if rank == 0:
-            load_checkpoint(model, config)
+        # Checkpoint will be loaded after train_state creation to restore step
 
         # Broadcast parameters from rank 0
         if world_size > 1:
@@ -931,6 +929,16 @@ def launch(hydra_config: DictConfig):
 
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
+    
+    # Load checkpoint AFTER train_state creation to restore step/epoch
+    if config.load_checkpoint is not None and RANK == 0:
+        load_checkpoint(train_state.model, config, optimizers=train_state.optimizers, train_state=train_state)
+        
+        # Broadcast parameters from rank 0 after loading
+        if WORLD_SIZE > 1:
+            with torch.no_grad():
+                for param in list(train_state.model.parameters()) + list(train_state.model.buffers()):
+                    dist.broadcast(param, src=0)
 
     # Progress bar and logger
     progress_bar = None
