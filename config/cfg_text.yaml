@@ -39,6 +39,6 @@ min_eval_interval: 0
 
 checkpoint_path: "checkpoints/text-trm-10m"
 
-ema: False
-ema_rate: 0.999
+ema: True  # Exponential Moving Average for stability
+ema_rate: 0.9995  # Slightly higher for text (smoother averaging)
 freeze_weights: False
