@@ -206,20 +206,8 @@ class PuzzleDataset(IterableDataset):
             # Randomly shuffle groups
             rng = np.random.Generator(np.random.Philox(seed=self.config.seed + self._iters))
 
-            # Debug: check group structure
-            num_groups = dataset["group_indices"].size - 1
-            print(f"\n[DEBUG _iter_train] Dataset '{set_name}':")
-            print(f"  Total examples: {len(dataset['inputs'])}")
-            print(f"  Num groups: {num_groups}")
-            print(f"  Epochs per iter: {self.config.epochs_per_iter}")
-            print(f"  Batch size: {self.config.global_batch_size}")
-            
-            group_order = np.concatenate([rng.permutation(num_groups) for _i in range(self.config.epochs_per_iter)])
-            print(f"  Group order length: {group_order.size}")
-            print(f"  Group order: {group_order[:10]}...") if group_order.size > 0 else print(f"  Group order: EMPTY!")
-            
+            group_order = np.concatenate([rng.permutation(dataset["group_indices"].size - 1) for _i in range(self.config.epochs_per_iter)])
             start_index = 0
-            batches_yielded = 0
             
             while start_index < group_order.size:
                 start_index, batch_indices, batch_puzzle_indices = _sample_batch(
@@ -236,7 +224,6 @@ class PuzzleDataset(IterableDataset):
 
                 # Drop last batch
                 if global_effective_batch_size < self.config.global_batch_size:
-                    print(f"  [DEBUG] Dropping incomplete batch: {global_effective_batch_size} < {self.config.global_batch_size}")
                     break
 
                 batch_indices        = batch_indices       [self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
@@ -246,29 +233,16 @@ class PuzzleDataset(IterableDataset):
                     "labels": dataset["labels"][batch_indices],
                     "puzzle_identifiers": dataset["puzzle_identifiers"][batch_puzzle_indices]
                 })
-                
-                batches_yielded += 1
+
                 yield set_name, batch, global_effective_batch_size
-            
-            print(f"  [DEBUG] Total batches yielded: {batches_yielded}")
                 
     def __iter__(self):
-        # For IterableDataset, PyTorch does NOT auto-split - we must do it manually
         worker_info = get_worker_info()
+        assert worker_info is None or worker_info.num_workers == 1, "Multithreaded data loading is not currently supported."
         
         self._lazy_load_dataset()
         
-        # Split dataset across workers by dividing the index range
-        if worker_info is not None:
-            # Multi-worker: each worker gets a subset of indices
-            worker_id = worker_info.id
-            num_workers = worker_info.num_workers
-            
-            # Temporarily override batch sampling to this worker's subset
-            # This is cleaner than filtering batches after creation
-            # Store original for restoration
-            pass  # Dataset iteration handles this internally
-        
+        # Iterate using specified mode
         if self.config.test_set_mode:
             yield from self._iter_test()
         else:

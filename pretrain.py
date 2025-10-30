@@ -173,8 +173,10 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     dataloader = DataLoader(
         dataset,
         batch_size=None,
-        num_workers=0,  # Single-threaded for IterableDataset (multi-worker needs manual splitting)
-        pin_memory=True
+        num_workers=1,
+        prefetch_factor=8,
+        pin_memory=True,
+        persistent_workers=True
     )
     return dataloader, dataset.metadata
 
@@ -215,7 +217,9 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model)  # type: ignore
 
-        # Checkpoint will be loaded after train_state creation to restore step
+        # Load checkpoint
+        if rank == 0:
+            load_checkpoint(model, config)
 
         # Broadcast parameters from rank 0
         if world_size > 1:
@@ -407,7 +411,7 @@ def save_checkpoint_atomic(checkpoint: dict, filepath: str):
         raise e
 
 
-def save_train_state(config: PretrainConfig, train_state: TrainState, train_metadata: PuzzleDatasetMetadata = None):
+def save_train_state(config: PretrainConfig, train_state: TrainState):
     """Save complete training state with corruption protection.
     
     Features:
@@ -423,20 +427,8 @@ def save_train_state(config: PretrainConfig, train_state: TrainState, train_meta
     # Update last checkpoint step
     train_state.last_checkpoint_step = train_state.step
     
-    # Calculate current epoch from step (if metadata available)
-    current_epoch = 0
-    if train_metadata is not None:
-        steps_per_iter = train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size
-        train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
-        current_iter = int(train_state.step / steps_per_iter) if steps_per_iter > 0 else 0
-        current_epoch = current_iter * train_epochs_per_iter
-    else:
-        # Fallback: estimate from step ratio
-        current_epoch = int((train_state.step / train_state.total_steps) * config.epochs) if train_state.total_steps > 0 else 0
-    
     checkpoint = {
         'step': train_state.step,
-        'current_epoch': current_epoch,  # NEW: Track exact epoch
         'model_state_dict': train_state.model.state_dict(),
         'optimizer_states': [opt.state_dict() for opt in train_state.optimizers],
         'carry': train_state.carry,  # Save RNN/memory states
@@ -523,8 +515,6 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig, optimizers=None, t
         # Show checkpoint info (for cross-dataset loading)
         if 'dataset' in checkpoint:
             print(f"   Source dataset: {checkpoint['dataset']}")
-        if 'current_epoch' in checkpoint:
-            print(f"   Saved at epoch: {checkpoint['current_epoch']:,}/{checkpoint.get('config_epochs', 0):,}")
         if 'step' in checkpoint:
             print(f"   Checkpoint step: {checkpoint.get('step', 0):,}")
         
@@ -547,10 +537,10 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig, optimizers=None, t
             # Old format: checkpoint is the state_dict directly
             state_dict = checkpoint
 
-        # Resize and reset puzzle emb if needed (only for models with puzzle embeddings)
+        # Resize and reset puzzle emb if needed
         puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
-        if hasattr(model.model, 'puzzle_emb') and puzzle_emb_name in state_dict:
-            expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
+        expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
+        if puzzle_emb_name in state_dict:
             puzzle_emb = state_dict[puzzle_emb_name]
             if puzzle_emb.shape != expected_shape:
                 print(f"Resetting puzzle embedding as shape is different. Found {puzzle_emb.shape}, Expected {expected_shape}")
@@ -927,16 +917,6 @@ def launch(hydra_config: DictConfig):
 
     # Train state
     train_state = init_train_state(config, train_metadata, rank=RANK, world_size=WORLD_SIZE)
-    
-    # Load checkpoint AFTER train_state creation to restore step/epoch
-    if config.load_checkpoint is not None and RANK == 0:
-        load_checkpoint(train_state.model, config, optimizers=train_state.optimizers, train_state=train_state)
-        
-        # Broadcast parameters from rank 0 after loading
-        if WORLD_SIZE > 1:
-            with torch.no_grad():
-                for param in list(train_state.model.parameters()) + list(train_state.model.buffers()):
-                    dist.broadcast(param, src=0)
 
     # Progress bar and logger
     progress_bar = None
@@ -979,7 +959,7 @@ def launch(hydra_config: DictConfig):
                     print("  💾 GRACEFUL SHUTDOWN IN PROGRESS")
                     print("="*70)
                     print(f"\n  Saving checkpoint at step {train_state.step}...")
-                    save_train_state(config, train_state, train_metadata)
+                    save_train_state(config, train_state)
                     print("\n✅ Training stopped successfully!")
                     print(f"   Final step: {train_state.step}/{train_state.total_steps}")
                     print(f"   Progress: {(train_state.step/train_state.total_steps)*100:.1f}%")
@@ -999,13 +979,7 @@ def launch(hydra_config: DictConfig):
             if RANK == 0:
                 print("TRAIN")
             train_state.model.train()
-            
-            # Debug: track batches processed
-            batches_processed = 0
-            step_before_train = train_state.step
-            
             for set_name, batch, global_batch_size in train_loader:
-                batches_processed += 1
                 metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, gradient_monitor=gradient_monitor)
 
                 if RANK == 0 and metrics is not None:
@@ -1013,12 +987,6 @@ def launch(hydra_config: DictConfig):
                     progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
                 if config.ema:
                     ema_helper.update(train_state.model)
-            
-            # Debug: show training progress
-            if RANK == 0:
-                step_after_train = train_state.step
-                print(f"   Processed {batches_processed} training batches")
-                print(f"   Steps: {step_before_train} → {step_after_train} (+{step_after_train - step_before_train})")
 
             if _iter_id >= config.min_eval_interval:
                 ############ Evaluation
@@ -1047,7 +1015,7 @@ def launch(hydra_config: DictConfig):
                 if RANK == 0:
                     print("SAVE CHECKPOINT")
                 if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
-                    save_train_state(config, train_state_eval, train_metadata)
+                    save_train_state(config, train_state_eval)
 
                 if config.ema:
                     del train_state_eval
