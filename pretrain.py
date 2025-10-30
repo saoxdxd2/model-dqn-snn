@@ -551,10 +551,10 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig, optimizers=None, t
             # Old format: checkpoint is the state_dict directly
             state_dict = checkpoint
 
-        # Resize and reset puzzle emb if needed
+        # Resize and reset puzzle emb if needed (only for models with puzzle embeddings)
         puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
-        expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
-        if puzzle_emb_name in state_dict:
+        if hasattr(model.model, 'puzzle_emb') and puzzle_emb_name in state_dict:
+            expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
             puzzle_emb = state_dict[puzzle_emb_name]
             if puzzle_emb.shape != expected_shape:
                 print(f"Resetting puzzle embedding as shape is different. Found {puzzle_emb.shape}, Expected {expected_shape}")
