@@ -45,6 +45,7 @@ from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 from utils.gradient_monitor import GradientFlowMonitor
+from utils.batch_scaler import PostCompilationBatchScaler
 
 
 class LossConfig(pydantic.BaseModel):
@@ -942,6 +943,7 @@ def launch(hydra_config: DictConfig):
     progress_bar = None
     ema_helper = None
     gradient_monitor = None
+    batch_scaler = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
@@ -951,6 +953,14 @@ def launch(hydra_config: DictConfig):
         # Initialize gradient flow monitor
         gradient_monitor = GradientFlowMonitor(train_state.model, track_every_n_steps=100)
         print('Initialized gradient flow monitor (tracking every 100 steps)')
+        
+        # Initialize post-compilation batch scaler
+        batch_scaler = PostCompilationBatchScaler(
+            initial_batch_size=config.global_batch_size,
+            target_batch_size=160,  # Target after compilation
+            stabilization_steps=20
+        )
+        print(f'Initialized batch scaler: {config.global_batch_size} → 160 after compilation')
         
     if config.ema:
         print('Setup EMA')
@@ -1019,6 +1029,13 @@ def launch(hydra_config: DictConfig):
                 step_after_train = train_state.step
                 print(f"   Processed {batches_processed} training batches")
                 print(f"   Steps: {step_before_train} → {step_after_train} (+{step_after_train - step_before_train})")
+                
+                # Check if we should scale batch size post-compilation
+                if batch_scaler:
+                    new_batch_size = batch_scaler.check_and_scale(step_after_train)
+                    if new_batch_size != config.global_batch_size:
+                        config.global_batch_size = new_batch_size
+                        print(f"   ✅ Batch size updated to {new_batch_size} (takes effect next epoch)")
 
             if _iter_id >= config.min_eval_interval:
                 ############ Evaluation
