@@ -461,7 +461,7 @@ def create_text_dataset(config: TextDatasetConfig):
             blank_identifier_id=0,
             num_puzzle_identifiers=1,  # No puzzle embeddings for text
             total_groups=1,
-            mean_puzzle_examples=1.0,
+            mean_puzzle_examples=float(len(sequences)),  # All sequences in one group
             total_puzzles=len(sequences),
             sets=["all"]
         )
