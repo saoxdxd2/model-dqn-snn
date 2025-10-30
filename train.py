@@ -183,11 +183,24 @@ def check_phase_completion(checkpoint_path: str) -> dict:
             'config_epochs': config_epochs,
             'dataset': dataset,
             'progress_pct': progress,
-            'is_complete': is_complete
+            'is_complete': is_complete,
+            'corrupted': False
         }
     except Exception as e:
-        print(f"   ⚠️  Could not read checkpoint metadata: {e}")
-        return {'is_complete': False, 'progress_pct': 0}
+        error_msg = str(e)
+        is_corrupted = 'PytorchStreamReader' in error_msg or 'zip archive' in error_msg
+        
+        if is_corrupted:
+            print(f"   ❌ CORRUPTED CHECKPOINT: {e}")
+        else:
+            print(f"   ⚠️  Could not read checkpoint metadata: {e}")
+        
+        return {
+            'is_complete': False, 
+            'progress_pct': 0,
+            'corrupted': is_corrupted,
+            'error': error_msg
+        }
 
 
 def detect_checkpoints():
@@ -280,18 +293,26 @@ def select_continual_learning_mode():
     
     for idx, ckpt in enumerate(checkpoints, 1):
         status = ckpt['status']
-        completion_icon = "✅" if status.get('is_complete') else "⚠️"
-        progress = status.get('progress_pct', 0)
         
-        print(f"  [{idx}] {ckpt['name']} {completion_icon}")
-        print(f"      Path: {ckpt['path']}")
-        print(f"      Progress: {progress:.1f}% ({status.get('current_step', 0):,}/{status.get('target_steps', 0):,} steps)")
-        
-        if status.get('is_complete'):
-            print(f"      Status: ✅ COMPLETE - Ready for next phase")
+        # Check if corrupted
+        if status.get('corrupted'):
+            print(f"  [{idx}] {ckpt['name']} ❌ CORRUPTED")
+            print(f"      Path: {ckpt['path']}")
+            print(f"      Status: ❌ Cannot load - checkpoint is corrupted")
+            print(f"      ⚠️  Delete this checkpoint or re-download from Colab")
         else:
-            remaining = status.get('target_steps', 0) - status.get('current_step', 0)
-            print(f"      Status: ⚠️  INCOMPLETE - {remaining:,} steps remaining")
+            completion_icon = "✅" if status.get('is_complete') else "⚠️"
+            progress = status.get('progress_pct', 0)
+            
+            print(f"  [{idx}] {ckpt['name']} {completion_icon}")
+            print(f"      Path: {ckpt['path']}")
+            print(f"      Progress: {progress:.1f}% ({status.get('current_step', 0):,}/{status.get('target_steps', 0):,} steps)")
+            
+            if status.get('is_complete'):
+                print(f"      Status: ✅ COMPLETE - Ready for next phase")
+            else:
+                remaining = status.get('target_steps', 0) - status.get('current_step', 0)
+                print(f"      Status: ⚠️  INCOMPLETE - {remaining:,} steps remaining")
         print()
     
     # Select checkpoint
@@ -301,6 +322,17 @@ def select_continual_learning_mode():
             choice_idx = int(choice) - 1
             if 0 <= choice_idx < len(checkpoints):
                 selected_ckpt = checkpoints[choice_idx]
+                
+                # Block corrupted checkpoints
+                if selected_ckpt['status'].get('corrupted'):
+                    print("\n❌ Cannot use corrupted checkpoint!")
+                    print("\nTo fix:")
+                    print("  1. Delete the corrupted checkpoint:")
+                    print(f"     rm -rf {selected_ckpt['dir']}")
+                    print("  2. Re-download from Colab (use tar.gz, NOT zip!)")
+                    print("  3. Or start fresh training\n")
+                    continue
+                
                 break
             else:
                 print(f"Invalid choice. Enter 1-{len(checkpoints)}")
@@ -520,9 +552,9 @@ def train_model(model_config: dict, extra_args: list, checkpoint_path: str = Non
         f"data_paths=[{data_path}]"  # Override data path
     ]
     
-    # Add continual learning parameters
+    # Add continual learning parameters (use + prefix for Hydra)
     if checkpoint_path:
-        cmd.append(f"load_checkpoint={checkpoint_path}")
+        cmd.append(f"+load_checkpoint={checkpoint_path}")
     if epochs_override:
         cmd.append(f"epochs={epochs_override}")
     
