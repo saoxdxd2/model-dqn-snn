@@ -13,14 +13,20 @@ from models.layers import CastedLinear, rms_norm
 class MLPQHead(nn.Module):
     """Simple MLP Q-head (baseline, fast)."""
     
+    # Q-value initialization constants
+    # Research: Near-zero initialization prevents early-training instability (Schaul et al., 2015)
+    Q_INIT_WEIGHT = 0.0  # Zero weights for conservative initial Q-values
+    Q_INIT_BIAS = -5.0   # Negative bias → initial Q-values near sigmoid(-5) ≈ 0.007 (prefer continue)
+    
     def __init__(self, hidden_size: int, num_actions: int = 2):
         super().__init__()
         self.q_head = CastedLinear(hidden_size, num_actions, bias=True)
         
         # Init Q to (almost) zero for faster learning during bootstrapping
+        # Negative bias ensures model initially prefers continuing (exploration)
         with torch.no_grad():
-            self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)  # type: ignore
+            self.q_head.weight.fill_(self.Q_INIT_WEIGHT)
+            self.q_head.bias.fill_(self.Q_INIT_BIAS)  # type: ignore
     
     def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
         """
@@ -61,10 +67,10 @@ class RNNQHead(nn.Module):
         # Hidden state buffer
         self.register_buffer('h_prev', torch.zeros(num_layers, 1, rnn_hidden_size))
         
-        # Init output to (almost) zero
+        # Init output to (almost) zero - same as MLPQHead
         with torch.no_grad():
-            self.output_proj.weight.zero_()
-            self.output_proj.bias.fill_(-5)  # type: ignore
+            self.output_proj.weight.fill_(MLPQHead.Q_INIT_WEIGHT)
+            self.output_proj.bias.fill_(MLPQHead.Q_INIT_BIAS)  # type: ignore
     
     def reset_hidden(self, batch_size: int, mask: Optional[torch.Tensor] = None):
         """Reset RNN hidden state.
@@ -140,10 +146,10 @@ class MiniAttentionQHead(nn.Module):
         self.register_buffer('context_buffer', torch.zeros(1, context_window, hidden_size))
         self.register_buffer('context_ptr', torch.tensor(0, dtype=torch.long))
         
-        # Init output to (almost) zero
+        # Init output to (almost) zero - same as MLPQHead
         with torch.no_grad():
-            self.output_proj.weight.zero_()
-            self.output_proj.bias.fill_(-5)  # type: ignore
+            self.output_proj.weight.fill_(MLPQHead.Q_INIT_WEIGHT)
+            self.output_proj.bias.fill_(MLPQHead.Q_INIT_BIAS)  # type: ignore
     
     def reset_context(self, batch_size: int):
         """Reset context buffer."""

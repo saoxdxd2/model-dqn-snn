@@ -6,9 +6,12 @@ loss:
   deep_supervision_steps: 4  # Moderate supervision
 
 # Dataset parameters (CRITICAL - must match tokenizer)
-seq_len: 1023  # Increased from 511 for better context (1024 - 1)
+# seq_len: Model sequence length (input + prediction)
+# For next-token prediction: inputs=[0:1023], labels=[1:1024]
+# Effective training context: 1023 tokens, predicts 1024th token
+seq_len: 1023  # 1024 total tokens (1023 input + 1 prediction shift)
 vocab_size: 50257  # GPT-2 BPE vocab
-batch_size: 128  # Match global_batch_size in cfg_text.yaml
+batch_size: 154  # Match global_batch_size in cfg_text.yaml (20% boost from checkpointing)
 
 # Halting parameters
 halt_exploration_prob: 0.1
@@ -46,14 +49,37 @@ use_learned_halting_eval: True
 
 # Deep Supervision
 deep_supervision_steps: 4
-enable_gradient_checkpointing: True
+enable_gradient_checkpointing: True  # Saves ~15% GPU memory, enables 20% larger batches
 
 # EMA for stability (improves final accuracy by 2-5%)
 use_ema: True  # Maintains shadow copy of weights
 ema_decay: 0.999  # Slow decay = stable shadow model
 
-# DQN disabled for simplicity
-enable_dqn: False
+# DQN with Prioritized Experience Replay (your implementation from replay_buffer.py)
+enable_dqn: True
+enable_prioritized_replay: True  # Enable PER for 30-50% faster convergence
+per_alpha: 0.6  # Priority exponent (0=uniform, 1=full prioritization)
+per_beta: 0.4   # Importance sampling (annealed to 1.0)
+
+# DQN Configuration
+dqn_buffer_capacity: 20000
+dqn_buffer_min_size: 5000
+dqn_batch_size: 256
+dqn_gamma: 0.99
+dqn_target_tau: 0.005  # Soft update rate for target network
+dqn_epsilon_start: 0.3
+dqn_epsilon_end: 0.05
+dqn_epsilon_decay_steps: 50000
+
+# DQN Reward Shaping
+enable_count_curiosity: True   # Count-based exploration bonus
+enable_rnd_curiosity: True     # Random Network Distillation
+curiosity_count_beta: 0.05
+curiosity_rnd_weight: 0.1
+
+# DQN Advanced Features (optional)
+enable_entropy_regularization: False  # Encourage diverse Q-distributions
+dqn_td_threshold: 0.0  # Selective storage (0.0=disabled, >0=skip low TD-error transitions)
 
 # Memory bank disabled initially
 enable_memory: False

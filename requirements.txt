@@ -25,5 +25,8 @@ torchaudio
 torchvision
 flash-attn
 datasets
-scikit-learn 
-
+scikit-learn
+optuna
+stable-baselines3
+onnx 
+onnxruntime-gpu
