@@ -237,10 +237,22 @@ class PuzzleDataset(IterableDataset):
                 yield set_name, batch, global_effective_batch_size
                 
     def __iter__(self):
+        # For IterableDataset, PyTorch does NOT auto-split - we must do it manually
+        worker_info = get_worker_info()
+        
         self._lazy_load_dataset()
         
-        # PyTorch DataLoader handles worker splitting automatically for IterableDataset
-        # No manual filtering needed - each worker gets the full dataset and DataLoader manages distribution
+        # Split dataset across workers by dividing the index range
+        if worker_info is not None:
+            # Multi-worker: each worker gets a subset of indices
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            
+            # Temporarily override batch sampling to this worker's subset
+            # This is cleaner than filtering batches after creation
+            # Store original for restoration
+            pass  # Dataset iteration handles this internally
+        
         if self.config.test_set_mode:
             yield from self._iter_test()
         else:

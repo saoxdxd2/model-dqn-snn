@@ -173,10 +173,8 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     dataloader = DataLoader(
         dataset,
         batch_size=None,
-        num_workers=2,  # 2 workers + prefetch keeps GPU fed without overhead
-        prefetch_factor=4,
-        pin_memory=True,
-        persistent_workers=True
+        num_workers=0,  # Single-threaded for IterableDataset (multi-worker needs manual splitting)
+        pin_memory=True
     )
     return dataloader, dataset.metadata
 
