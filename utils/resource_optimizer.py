@@ -14,12 +14,12 @@ class DynamicResourceOptimizer:
     
     def __init__(
         self,
-        initial_batch_size: int = 128,
-        min_batch_size: int = 32,
-        max_batch_size: int = 512,
-        target_gpu_utilization: float = 0.85,  # Use 85% of GPU memory
+        initial_batch_size: int = 32,
+        min_batch_size: int = 16,
+        max_batch_size: int = 1024,
+        target_gpu_utilization: float = 0.95,  # Target 95% GPU utilization
         initial_num_workers: int = 0,
-        check_interval: int = 10  # Check every N steps
+        check_interval: int = 5  # Check every 5 steps for faster adaptation
     ):
         self.batch_size = initial_batch_size
         self.min_batch_size = min_batch_size
@@ -74,29 +74,53 @@ class DynamicResourceOptimizer:
         current_utilization = used_mem / total_mem
         self.gpu_memory_history.append(current_utilization)
         
-        # Only adjust if we have stable training (no recent OOMs)
-        if self.stable_steps < 20:
+        # After torch.compile (step 10+), scale aggressively to target
+        warmup_complete = self.stable_steps >= 10
+        
+        if not warmup_complete:
             self.stable_steps += 1
+            # Conservative during warmup (torch.compile phase)
+            if current_utilization < 0.5 and self.stable_steps >= 5:
+                # Very low usage - safe to increase modestly
+                new_batch_size = min(int(self.batch_size * 1.5), self.max_batch_size)
+                if new_batch_size != self.batch_size:
+                    print(f"\n📈 Warmup increase: {self.batch_size} → {new_batch_size}")
+                    print(f"   GPU: {used_mem:.1f}GB / {total_mem:.1f}GB ({current_utilization*100:.1f}%)")
+                    self.batch_size = new_batch_size
+                    self.last_adjustment_step = current_step
             return self.batch_size
         
-        # Scale batch size based on memory headroom
-        if current_utilization < self.target_gpu_utilization - 0.1:
-            # We have room - increase batch size
-            new_batch_size = min(int(self.batch_size * 1.25), self.max_batch_size)
+        # Post-warmup: Maintain 95% target (only scale if significantly off)
+        tolerance = 0.03  # ±3% tolerance
+        
+        # Only scale up if significantly underutilized (for non-optimized configs)
+        if current_utilization < 0.7:
+            # Very low usage - likely unoptimized config, scale up
+            if current_utilization < 0.5:
+                scale = 1.5  # Lots of room - big jump
+            else:
+                scale = 1.3  # Moderate room
+            
+            new_batch_size = min(int(self.batch_size * scale), self.max_batch_size)
             if new_batch_size != self.batch_size:
-                print(f"\n📈 Increasing batch size: {self.batch_size} → {new_batch_size}")
-                print(f"   GPU memory: {used_mem:.1f}GB / {total_mem:.1f}GB ({current_utilization*100:.1f}%)")
+                print(f"\n📈 Scaling up: {self.batch_size} → {new_batch_size}")
+                print(f"   GPU: {used_mem:.1f}GB / {total_mem:.1f}GB ({current_utilization*100:.1f}%)")
                 self.batch_size = new_batch_size
                 self.last_adjustment_step = current_step
-                
-        elif current_utilization > self.target_gpu_utilization + 0.05:
-            # Too close to limit - reduce batch size
-            new_batch_size = max(int(self.batch_size * 0.8), self.min_batch_size)
+        
+        # Always scale down if over target (safety)
+        elif current_utilization > self.target_gpu_utilization + tolerance:
+            # Over target - reduce to stay safe
+            new_batch_size = max(int(self.batch_size * 0.9), self.min_batch_size)
             if new_batch_size != self.batch_size:
-                print(f"\n📉 Reducing batch size: {self.batch_size} → {new_batch_size}")
-                print(f"   GPU memory: {used_mem:.1f}GB / {total_mem:.1f}GB ({current_utilization*100:.1f}%)")
+                print(f"\n📉 Scaling down: {self.batch_size} → {new_batch_size}")
+                print(f"   GPU: {used_mem:.1f}GB / {total_mem:.1f}GB ({current_utilization*100:.1f}%)")
                 self.batch_size = new_batch_size
                 self.last_adjustment_step = current_step
+        else:
+            # Within tolerance - perfect!
+            if current_step % 50 == 0:
+                print(f"\n✅ Optimal batch size: {self.batch_size} (GPU: {current_utilization*100:.1f}%)")
         
         return self.batch_size
     

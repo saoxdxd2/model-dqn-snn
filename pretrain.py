@@ -957,10 +957,10 @@ def launch(hydra_config: DictConfig):
         # Initialize dynamic resource optimizer
         resource_optimizer = DynamicResourceOptimizer(
             initial_batch_size=config.global_batch_size,
-            min_batch_size=32,
-            max_batch_size=512,
-            target_gpu_utilization=0.85,
-            check_interval=10
+            min_batch_size=16,
+            max_batch_size=1024,
+            target_gpu_utilization=0.95,  # Target 95% for maximum efficiency
+            check_interval=5  # Check every 5 steps
         )
         resource_optimizer.print_status()
         
@@ -1033,12 +1033,12 @@ def launch(hydra_config: DictConfig):
                 print(f"   Steps: {step_before_train} → {step_after_train} (+{step_after_train - step_before_train})")
                 
                 # Dynamic resource optimization
-                if resource_optimizer and step_after_train % 10 == 0:
+                if resource_optimizer and step_after_train % 5 == 0:
                     # Check if we should adjust batch size
                     suggested_batch = resource_optimizer.suggest_batch_size(step_after_train)
                     if suggested_batch != config.global_batch_size:
                         config.global_batch_size = suggested_batch
-                        # Note: batch size change takes effect next iteration
+                        # Batch size change takes effect next epoch
 
             if _iter_id >= config.min_eval_interval:
                 ############ Evaluation

@@ -15,7 +15,7 @@ data_paths_test: []
 evaluators: []  # Can add perplexity evaluator later
 
 # Hyperparams - Training (optimized for 15GB T4 GPU)
-global_batch_size: 128  # Balanced for 15GB GPU (256 causes OOM during compilation)
+global_batch_size: 241  # Pre-calculated optimal: 95% GPU @ T4 (resource manager adjusts if needed)
 epochs: 5000  # Extended for better convergence on small dataset
 eval_interval: 5  # Save every 5 epochs (~366 steps)
 checkpoint_every_eval: True
