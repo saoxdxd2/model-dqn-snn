@@ -323,6 +323,41 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     )
 
 
+def get_checkpoint_name(dataset_path: str) -> str:
+    """Get checkpoint filename from dataset path.
+    
+    Examples:
+        data/text-wikitext2 -> text.pt
+        data/arc-aug-1000 -> arc.pt
+        data/text-tinystories -> text-tiny.pt
+    """
+    # Extract dataset name from path
+    dataset_name = os.path.basename(dataset_path)
+    
+    # Map common patterns to simple names
+    if 'text-wikitext' in dataset_name:
+        return 'text.pt'
+    elif 'text-tinystories' in dataset_name or 'tinystories' in dataset_name:
+        return 'text-tiny.pt'
+    elif 'arc' in dataset_name:
+        return 'arc.pt'
+    elif 'code' in dataset_name:
+        return 'code.pt'
+    elif 'vision' in dataset_name or 'cifar' in dataset_name or 'image' in dataset_name:
+        return 'vision.pt'
+    elif 'alpaca' in dataset_name:
+        return 'alpaca.pt'
+    elif 'sharegpt' in dataset_name:
+        return 'sharegpt.pt'
+    elif 'sudoku' in dataset_name:
+        return 'sudoku.pt'
+    elif 'maze' in dataset_name:
+        return 'maze.pt'
+    else:
+        # Fallback: use sanitized dataset name
+        return f"{dataset_name.replace('/', '_').replace('-', '_')}.pt"
+
+
 def compute_file_checksum(filepath: str) -> str:
     """Compute SHA256 checksum of a file."""
     sha256_hash = hashlib.sha256()
@@ -409,14 +444,15 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
         checkpoint['replay_buffer_size'] = len(train_state.model.replay_buffer)
         checkpoint['dqn_step_counter'] = getattr(train_state.model, 'dqn_step_counter', 0)
     
-    # Save with atomic write + checksum
-    step_path = os.path.join(config.checkpoint_path, f"step_{train_state.step}")
-    latest_path = os.path.join(config.checkpoint_path, "latest.pt")
+    # Get dataset-specific checkpoint name (e.g., text.pt, arc.pt, vision.pt)
+    checkpoint_name = get_checkpoint_name(config.data_paths[0] if config.data_paths else 'model')
+    checkpoint_file = os.path.join(config.checkpoint_path, checkpoint_name)
     
-    save_checkpoint_atomic(checkpoint, step_path)
-    checksum = save_checkpoint_atomic(checkpoint, latest_path)
+    # Save single checkpoint file with atomic write + checksum
+    checksum = save_checkpoint_atomic(checkpoint, checkpoint_file)
     
-    # Log checksum for user verification
+    # Log save info
+    print(f"   💾 Saved: {checkpoint_name}")
     print(f"   SHA256: {checksum[:16]}...")
 
 
@@ -459,7 +495,10 @@ def verify_checkpoint_integrity(checkpoint_path: str) -> bool:
 
 
 def load_checkpoint(model: nn.Module, config: PretrainConfig, optimizers=None, train_state=None):
-    """Load checkpoint with integrity verification."""
+    """Load checkpoint with integrity verification.
+    
+    Supports cross-dataset loading (e.g., load text.pt into vision training).
+    """
     if config.load_checkpoint is not None:
         print(f"Loading checkpoint {config.load_checkpoint}")
         
@@ -472,6 +511,12 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig, optimizers=None, t
 
         # Load checkpoint
         checkpoint = torch.load(config.load_checkpoint, map_location="cuda")
+        
+        # Show checkpoint info (for cross-dataset loading)
+        if 'dataset' in checkpoint:
+            print(f"   Source dataset: {checkpoint['dataset']}")
+        if 'step' in checkpoint:
+            print(f"   Checkpoint step: {checkpoint.get('step', 0):,}")
         
         # Handle both old format (dict with state_dict) and new format (dict with model_state_dict)
         if 'model_state_dict' in checkpoint:
@@ -832,14 +877,21 @@ def launch(hydra_config: DictConfig):
 
     # Auto-resume: Check if checkpoint exists and auto-load if not specified
     if config.load_checkpoint is None and config.checkpoint_path is not None:
-        latest_checkpoint = os.path.join(config.checkpoint_path, "latest.pt")
-        if os.path.exists(latest_checkpoint):
+        # Look for dataset-specific checkpoint (e.g., text.pt, arc.pt)
+        checkpoint_name = get_checkpoint_name(config.data_paths[0] if config.data_paths else 'model')
+        checkpoint_file = os.path.join(config.checkpoint_path, checkpoint_name)
+        
+        # Fallback to latest.pt for backward compatibility
+        if not os.path.exists(checkpoint_file):
+            checkpoint_file = os.path.join(config.checkpoint_path, "latest.pt")
+        
+        if os.path.exists(checkpoint_file):
             if RANK == 0:
                 print(f"\n{'='*70}")
                 print(f"  🔄 AUTO-RESUME: Found existing checkpoint")
-                print(f"  📁 Loading from: {latest_checkpoint}")
+                print(f"  📁 Loading from: {checkpoint_file}")
                 print(f"{'='*70}\n")
-            config.load_checkpoint = latest_checkpoint
+            config.load_checkpoint = checkpoint_file
     
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
@@ -985,8 +1037,9 @@ def launch(hydra_config: DictConfig):
             print(f"   Lost progress: {lost_steps:,} steps")
             print(f"   Saved progress: {progress_pct:.1f}% of total training")
             
-            if config.checkpoint_path:
-                print(f"\n💾 Last checkpoint saved at: {config.checkpoint_path}/latest.pt")
+            if config.checkpoint_path and config.data_paths:
+                checkpoint_name = get_checkpoint_name(config.data_paths[0])
+                print(f"\n💾 Last checkpoint: {config.checkpoint_path}/{checkpoint_name}")
             
             print("\n💡 Resume training with the same command to continue from last checkpoint.")
             print("\n" + "="*70)

@@ -204,7 +204,10 @@ def check_phase_completion(checkpoint_path: str) -> dict:
 
 
 def detect_checkpoints():
-    """Detect all available checkpoints in checkpoints/ directory."""
+    """Detect all available checkpoints in checkpoints/ directory.
+    
+    Looks for dataset-specific .pt files (text.pt, arc.pt, etc) or legacy latest.pt.
+    """
     checkpoint_dir = Path("checkpoints")
     if not checkpoint_dir.exists():
         return []
@@ -212,14 +215,32 @@ def detect_checkpoints():
     checkpoints = []
     for subdir in checkpoint_dir.iterdir():
         if subdir.is_dir():
-            latest_pt = subdir / "latest.pt"
-            if latest_pt.exists():
+            # Look for any .pt files in the directory
+            pt_files = list(subdir.glob("*.pt"))
+            
+            if pt_files:
+                # Prefer dataset-specific names over latest.pt
+                checkpoint_file = None
+                for pt_file in pt_files:
+                    if pt_file.name != "latest.pt":
+                        checkpoint_file = pt_file
+                        break
+                
+                # Fallback to latest.pt if no dataset-specific file found
+                if checkpoint_file is None:
+                    checkpoint_file = subdir / "latest.pt"
+                    if not checkpoint_file.exists():
+                        continue
+                
                 # Check completion status
-                status = check_phase_completion(str(latest_pt))
+                status = check_phase_completion(str(checkpoint_file))
+                
+                # Extract dataset name from checkpoint filename
+                dataset_name = checkpoint_file.stem  # e.g., "text" from "text.pt"
                 
                 checkpoints.append({
-                    "name": subdir.name,
-                    "path": str(latest_pt),
+                    "name": f"{subdir.name} ({dataset_name})",
+                    "path": str(checkpoint_file),
                     "dir": str(subdir),
                     "status": status
                 })
