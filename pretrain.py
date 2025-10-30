@@ -114,6 +114,7 @@ class TrainState:
 
     step: int
     total_steps: int
+    last_checkpoint_step: int = 0  # Track last saved checkpoint
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
@@ -387,6 +388,9 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
         return
 
     os.makedirs(config.checkpoint_path, exist_ok=True)
+    
+    # Update last checkpoint step
+    train_state.last_checkpoint_step = train_state.step
     
     checkpoint = {
         'step': train_state.step,
@@ -967,22 +971,26 @@ def launch(hydra_config: DictConfig):
     except KeyboardInterrupt:
         if RANK == 0:
             print("\n" + "="*70)
-            print("  ⚠️  CTRL+C DETECTED - Saving checkpoint before exit...")
+            print("  🛑 TRAINING INTERRUPTED (Ctrl+C)")
             print("="*70)
             
-            # Save current training state
-            try:
-                save_train_state(config, train_state)
-                print("\n✅ Checkpoint saved successfully!")
-                print(f"   Step: {train_state.step}")
-                print(f"   Saved to: {config.checkpoint_path}/latest.pt")
-                print("\n💡 You can resume training with the same command.")
-            except Exception as e:
-                print(f"\n❌ Error saving checkpoint: {e}")
-                print("   Training state may be lost!")
+            # Calculate lost progress
+            lost_steps = train_state.step - train_state.last_checkpoint_step
+            progress_pct = (train_state.last_checkpoint_step / train_state.total_steps) * 100 if train_state.total_steps > 0 else 0
             
+            print("\n⚠️  NOT saving current state (may be unsafe during training)")
+            print("\n📍 Checkpoint Status:")
+            print(f"   Last safe checkpoint: Step {train_state.last_checkpoint_step:,}")
+            print(f"   Current training step: Step {train_state.step:,}")
+            print(f"   Lost progress: {lost_steps:,} steps")
+            print(f"   Saved progress: {progress_pct:.1f}% of total training")
+            
+            if config.checkpoint_path:
+                print(f"\n💾 Last checkpoint saved at: {config.checkpoint_path}/latest.pt")
+            
+            print("\n💡 Resume training with the same command to continue from last checkpoint.")
             print("\n" + "="*70)
-            print("  👋 Training interrupted by user")
+            print("  👋 Training stopped by user")
             print("="*70 + "\n")
         
         # Clean up
