@@ -35,7 +35,7 @@ num_puzzle_identifiers: 1  # Just blank ID
 pos_encodings: rope
 rope_theta: 10000  # Standard RoPE base
 rms_norm_eps: 1e-6  # LayerNorm epsilon
-forward_dtype: bfloat16
+forward_dtype: float16
 causal: True  # CRITICAL: Enable causal attention for autoregressive generation
 
 # Optimizations

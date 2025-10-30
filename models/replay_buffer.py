@@ -27,7 +27,7 @@ class DQNReplayBuffer:
         rank: int = 0,
         world_size: int = 1,
         compress: bool = True,
-        storage_dtype: torch.dtype = torch.bfloat16,
+        storage_dtype: torch.dtype = torch.float16,
         prioritized: bool = False,
         alpha: float = 0.6,  # Priority exponent
         beta: float = 0.4,   # Importance sampling exponent
