@@ -8,6 +8,7 @@ import shutil
 import copy
 import hashlib
 import json
+import signal
 
 import torch
 import torch.distributed as dist
@@ -21,6 +22,23 @@ import hydra
 import pydantic
 from omegaconf import DictConfig
 from adam_atan2_pytorch import AdamAtan2
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+def shutdown_signal_handler(sig, frame):
+    """Handle Ctrl+C (SIGINT) gracefully.
+    
+    Sets a flag instead of immediately exiting to allow safe checkpoint saving.
+    This prevents model corruption during backpropagation.
+    """
+    global shutdown_requested
+    shutdown_requested = True
+    print("\n" + "="*70)
+    print("  🛑 SHUTDOWN REQUESTED (Ctrl+C detected)")
+    print("  ⏳ Will save checkpoint at next safe point...")
+    print("  ⚠️  Press Ctrl+C again to force quit (may lose progress!)")
+    print("="*70 + "\n")
 
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
 from utils.functions import load_model_class, get_model_source_path
@@ -800,6 +818,14 @@ def launch(hydra_config: DictConfig):
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
 
+    # Register signal handler for graceful shutdown (only on rank 0 to avoid duplicate messages)
+    if RANK == 0:
+        signal.signal(signal.SIGINT, shutdown_signal_handler)
+        print("\n" + "="*70)
+        print("  📌 Graceful shutdown enabled")
+        print("  💡 Press Ctrl+C to stop training and save checkpoint")
+        print("="*70 + "\n")
+
     # Auto-resume: Check if checkpoint exists and auto-load if not specified
     if config.load_checkpoint is None and config.checkpoint_path is not None:
         latest_checkpoint = os.path.join(config.checkpoint_path, "latest.pt")
@@ -870,6 +896,27 @@ def launch(hydra_config: DictConfig):
     # Graceful shutdown handler
     try:
         for _iter_id in range(start_iter, total_iters):
+            # Check for shutdown request at start of each iteration
+            if shutdown_requested:
+                if RANK == 0:
+                    print("\n" + "="*70)
+                    print("  💾 GRACEFUL SHUTDOWN IN PROGRESS")
+                    print("="*70)
+                    print(f"\n  Saving checkpoint at step {train_state.step}...")
+                    save_train_state(config, train_state)
+                    print("\n✅ Training stopped successfully!")
+                    print(f"   Final step: {train_state.step}/{train_state.total_steps}")
+                    print(f"   Progress: {(train_state.step/train_state.total_steps)*100:.1f}%")
+                    print(f"   Checkpoint saved to: {config.checkpoint_path}")
+                    print("\n💡 Resume training with the same command.\n")
+                
+                # Clean exit
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+                if RANK == 0:
+                    wandb.finish()
+                return  # Exit gracefully
+            
             print (f"[Rank {RANK}, World Size {WORLD_SIZE}]: Epoch {_iter_id * train_epochs_per_iter}")
 
             ############ Train Iter
