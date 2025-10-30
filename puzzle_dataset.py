@@ -237,12 +237,10 @@ class PuzzleDataset(IterableDataset):
                 yield set_name, batch, global_effective_batch_size
                 
     def __iter__(self):
-        worker_info = get_worker_info()
-        assert worker_info is None or worker_info.num_workers == 1, "Multithreaded data loading is not currently supported."
-        
         self._lazy_load_dataset()
         
-        # Iterate using specified mode
+        # PyTorch DataLoader handles worker splitting automatically for IterableDataset
+        # No manual filtering needed - each worker gets the full dataset and DataLoader manages distribution
         if self.config.test_set_mode:
             yield from self._iter_test()
         else:

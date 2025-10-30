@@ -173,8 +173,8 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     dataloader = DataLoader(
         dataset,
         batch_size=None,
-        num_workers=1,
-        prefetch_factor=8,
+        num_workers=2,  # 2 workers + prefetch keeps GPU fed without overhead
+        prefetch_factor=4,
         pin_memory=True,
         persistent_workers=True
     )
@@ -1001,7 +1001,13 @@ def launch(hydra_config: DictConfig):
             if RANK == 0:
                 print("TRAIN")
             train_state.model.train()
+            
+            # Debug: track batches processed
+            batches_processed = 0
+            step_before_train = train_state.step
+            
             for set_name, batch, global_batch_size in train_loader:
+                batches_processed += 1
                 metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, gradient_monitor=gradient_monitor)
 
                 if RANK == 0 and metrics is not None:
@@ -1009,6 +1015,12 @@ def launch(hydra_config: DictConfig):
                     progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
                 if config.ema:
                     ema_helper.update(train_state.model)
+            
+            # Debug: show training progress
+            if RANK == 0:
+                step_after_train = train_state.step
+                print(f"   Processed {batches_processed} training batches")
+                print(f"   Steps: {step_before_train} → {step_after_train} (+{step_after_train - step_before_train})")
 
             if _iter_id >= config.min_eval_interval:
                 ############ Evaluation
