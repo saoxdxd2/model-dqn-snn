@@ -20,14 +20,6 @@ except ImportError:
 
 from common import PuzzleDatasetMetadata
 
-# Dataset processing constants
-CODE_BATCH_SIZE = 1000  # Process 1000 code files at a time (memory-efficient)
-CODE_MAX_TRAIN_FILES = 50000  # Limit training set size for manageable training time
-CODE_MAX_TEST_FILES = 5000   # Limit test set for faster evaluation
-
-STORY_BATCH_SIZE = 4000  # Process 4000 stories at once (optimized for 12GB RAM)
-STORY_MAX_TRAIN = 100000  # 100k stories for good language coverage
-STORY_MAX_VAL = 10000     # 10k validation stories
 
 cli = ArgParser()
 
@@ -186,9 +178,9 @@ def create_code_dataset_batched(config: TextDatasetConfig, dataset, tokenizer, v
     os.makedirs(config.output_dir, exist_ok=True)
     
     # Process in smaller batches for code (files are larger)
-    batch_size = CODE_BATCH_SIZE
-    max_train_files = CODE_MAX_TRAIN_FILES
-    max_test_files = CODE_MAX_TEST_FILES
+    batch_size = 1000  # Process 1000 files at a time
+    max_train_files = 50000
+    max_test_files = 5000
     
     for split_name, max_files in [("train", max_train_files), ("test", max_test_files)]:
         print(f"\nTokenizing {split_name} set (batched processing)...")
@@ -267,9 +259,9 @@ def create_tinystories_dataset_batched(config: TextDatasetConfig, dataset, token
     
     # Process in batches to avoid memory issues
     # Optimized for Colab (12GB RAM): 4000 stories = ~8GB peak usage
-    batch_size = STORY_BATCH_SIZE
-    max_train_stories = STORY_MAX_TRAIN
-    max_val_stories = STORY_MAX_VAL
+    batch_size = 4000  # Process 4000 stories at a time
+    max_train_stories = 100000
+    max_val_stories = 10000
     
     for split_name, split_data, max_stories in [
         ("train", dataset['train'], max_train_stories),
@@ -390,8 +382,10 @@ def create_text_dataset(config: TextDatasetConfig):
         if dataset is None:
             raise RuntimeError("Failed to download TinyStories")
         # TinyStories: Use batched processing to avoid memory exhaustion
+        print("Using 100k train stories, 10k validation stories")
         create_tinystories_dataset_batched(config, dataset, tokenizer, vocab_size, pad_token_id, eos_token_id)
         return
+        print(f"Using 100k train stories, 10k validation stories")
     elif config.input_file == "code-python":
         dataset = download_code_python()
         if dataset is None:

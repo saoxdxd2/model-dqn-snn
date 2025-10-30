@@ -403,9 +403,6 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         supervision_interval = max(1, self.config.H_cycles // supervision_steps) if enable_deep_supervision else self.config.H_cycles
         
         # Process H-cycles with gradient checkpointing for memory efficiency
-        # Checkpointing saves ~15% GPU memory by recomputing activations during backward pass
-        use_checkpointing = self.training and getattr(self.config, 'enable_gradient_checkpointing', True)
-        
         for h_step in range(self.config.H_cycles):
             # Determine if this step should have gradients
             is_supervision_step = enable_deep_supervision and (h_step % supervision_interval == 0 or h_step == self.config.H_cycles - 1)
@@ -418,45 +415,13 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                     memory_content = self.memory.read(z_H[:, 0])  # [batch, hidden_size]
                     memory_content = memory_content.unsqueeze(1)  # [batch, 1, hidden_size]
             
-            # L-cycles with memory-enhanced input (checkpointed for memory efficiency)
-            if use_checkpointing and SELECTIVE_CHECKPOINT_AVAILABLE:
-                # Selective checkpointing: saves matmuls, recomputes cheap ops
-                def l_cycle_forward(z_L_in, z_H_in):
-                    z_L_out = z_L_in
-                    for _L_step in range(self.config.L_cycles):
-                        h_input = z_H_in + input_embeddings
-                        if memory_content is not None:
-                            h_input = h_input + memory_content
-                        z_L_out = self.L_level(z_L_out, h_input, **seq_info)
-                    z_H_out = self.L_level(z_H_in, z_L_out, **seq_info)
-                    return z_L_out, z_H_out
-                
-                z_L, z_H = checkpoint(
-                    l_cycle_forward, z_L, z_H,
-                    use_reentrant=False,
-                    context_fn=partial(create_selective_checkpoint_contexts, selective_checkpoint_policy)
-                )
-            elif use_checkpointing:
-                # Standard checkpointing (no selective policy)
-                def l_cycle_forward(z_L_in, z_H_in):
-                    z_L_out = z_L_in
-                    for _L_step in range(self.config.L_cycles):
-                        h_input = z_H_in + input_embeddings
-                        if memory_content is not None:
-                            h_input = h_input + memory_content
-                        z_L_out = self.L_level(z_L_out, h_input, **seq_info)
-                    z_H_out = self.L_level(z_H_in, z_L_out, **seq_info)
-                    return z_L_out, z_H_out
-                
-                z_L, z_H = checkpoint(l_cycle_forward, z_L, z_H, use_reentrant=False)
-            else:
-                # No checkpointing (evaluation or disabled)
-                for _L_step in range(self.config.L_cycles):
-                    h_input = z_H + input_embeddings
-                    if memory_content is not None:
-                        h_input = h_input + memory_content
-                    z_L = self.L_level(z_L, h_input, **seq_info)
-                z_H = self.L_level(z_H, z_L, **seq_info)
+            # L-cycles with memory-enhanced input
+            for _L_step in range(self.config.L_cycles):
+                h_input = z_H + input_embeddings
+                if memory_content is not None:
+                    h_input = h_input + memory_content
+                z_L = self.L_level(z_L, h_input, **seq_info)
+            z_H = self.L_level(z_H, z_L, **seq_info)
             
             # Collect intermediate output for supervision (keep in graph)
             if is_supervision_step and intermediate_outputs is not None:

@@ -8,14 +8,11 @@ import shutil
 import copy
 import hashlib
 import json
-import signal
-import atexit
 
 import torch
 import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
 
 import tqdm
 import wandb
@@ -89,10 +86,6 @@ class PretrainConfig(pydantic.BaseModel):
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
-    
-    # Automatic Mixed Precision (AMP)
-    use_amp: bool = False  # Enable for 2-3× speedup on T4/A100
-    amp_dtype: str = "float16"  # "float16" for T4, "bfloat16" for A100+
 
 @dataclass
 class TrainState:
@@ -515,7 +508,7 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 
     return evaluators
 
-def train_batch(config: PretrainConfig, train_state: TrainState, batch: dict, global_batch_size: int, rank: int, world_size: int, gradient_monitor=None, scaler=None):
+def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int, gradient_monitor=None):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
         return
@@ -528,19 +521,10 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: dict, gl
         with torch.device("cuda"):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
-    # Determine AMP dtype
-    amp_dtype = torch.float16 if config.amp_dtype == "float16" else torch.bfloat16
-    
-    # Forward with Automatic Mixed Precision
-    with autocast(dtype=amp_dtype, enabled=config.use_amp):
-        train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
-        scaled_loss = (1 / global_batch_size) * loss
-    
-    # Backward with loss scaling (if AMP enabled)
-    if config.use_amp and scaler is not None:
-        scaler.scale(scaled_loss).backward()
-    else:
-        scaled_loss.backward()
+    # Forward
+    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+
+    ((1 / global_batch_size) * loss).backward()
 
     # Allreduce
     if world_size > 1:
@@ -553,28 +537,19 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: dict, gl
     if gradient_monitor is not None and rank == 0:
         grad_stats = gradient_monitor.update()
     
-    # Gradient clipping (unscale first if using AMP)
-    if config.use_amp and scaler is not None:
-        scaler.unscale_(train_state.optimizers[0])  # Unscale for clipping
+    # Gradient clipping for stability
     grad_norm = torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), max_norm=1.0)
             
-    # Apply optimizer with AMP scaling
+    # Apply optimizer
     lr_this_step = None    
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
 
         for param_group in optim.param_groups:
             param_group['lr'] = lr_this_step
-        
-        if config.use_amp and scaler is not None:
-            scaler.step(optim)
-        else:
-            optim.step()
+            
+        optim.step()
         optim.zero_grad()
-    
-    # Update scaler
-    if config.use_amp and scaler is not None:
-        scaler.update()
 
     # Reduce metrics
     if len(metrics):
@@ -825,117 +800,6 @@ def launch(hydra_config: DictConfig):
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
 
-    # ========== OPTUNA HYPERPARAMETER OPTIMIZATION (BEFORE TRAINING) ==========
-    if RANK == 0 and getattr(config, 'enable_optuna_sweep', False):
-        print("\n" + "="*70)
-        print("  🔬 OPTUNA HYPERPARAMETER OPTIMIZATION ENABLED")
-        print("="*70)
-        print(f"  Trials: {getattr(config, 'optuna_n_trials', 20)}")
-        print(f"  Timeout: {getattr(config, 'optuna_timeout', 14400)}s ({getattr(config, 'optuna_timeout', 14400)/3600:.1f}h)")
-        print(f"  Study: {getattr(config, 'optuna_study_name', 'trm-text-optimization')}")
-        print("  Will optimize: lr, batch_size, H_cycles, L_cycles, hidden_size,")
-        print("                 num_heads, expansion, weight_decay, halt_params, DQN")
-        print("="*70 + "\n")
-        
-        try:
-            import optuna
-            from optuna.samplers import TPESampler
-            from optuna.pruners import MedianPruner
-            import sys
-            from pathlib import Path
-            
-            # Import objective function from optuna_sweep.py
-            sys.path.insert(0, str(Path(__file__).parent / "scripts"))
-            from optuna_sweep import objective
-            
-            # Create study
-            study = optuna.create_study(
-                study_name=getattr(config, 'optuna_study_name', 'trm-text-optimization'),
-                storage='sqlite:///optuna_study.db',
-                load_if_exists=True,
-                direction='minimize',
-                sampler=TPESampler(seed=config.seed),
-                pruner=MedianPruner(n_startup_trials=3, n_warmup_steps=5, interval_steps=3)
-            )
-            
-            # Run optimization
-            print("Starting Optuna optimization...\n")
-            study.optimize(
-                objective,
-                n_trials=getattr(config, 'optuna_n_trials', 20),
-                timeout=getattr(config, 'optuna_timeout', 14400),
-                show_progress_bar=True
-            )
-            
-            # Print results
-            print("\n" + "="*70)
-            print("  ✅ OPTUNA OPTIMIZATION COMPLETE!")
-            print("="*70)
-            print(f"  Best trial: #{study.best_trial.number}")
-            print(f"  Best val loss: {study.best_value:.4f}")
-            print("\n  📊 Best hyperparameters:")
-            for key, value in study.best_params.items():
-                print(f"    {key}: {value}")
-            print("="*70 + "\n")
-            
-            # Save best config directly to original files
-            import yaml
-            arch_config_path = Path(__file__).parent / "config" / "arch" / "trm_text.yaml"
-            training_config_path = Path(__file__).parent / "config" / "cfg_text.yaml"
-            
-            # Update architecture config
-            with open(arch_config_path, 'r') as f:
-                arch_config = yaml.safe_load(f)
-            
-            # Update with best params
-            for key, value in study.best_params.items():
-                if key in ['H_cycles', 'L_cycles', 'hidden_size', 'num_heads', 'expansion',
-                          'halt_exploration_prob', 'halt_max_steps', 'dqn_epsilon_start',
-                          'dqn_gamma', 'dqn_buffer_capacity']:
-                    arch_config[key] = value
-            
-            with open(arch_config_path, 'w') as f:
-                yaml.dump(arch_config, f)
-            
-            print(f"💾 Best architecture saved to: {arch_config_path}")
-            
-            # Update training config
-            with open(training_config_path, 'r') as f:
-                training_config = yaml.safe_load(f)
-            
-            training_config['lr'] = study.best_params['lr']
-            training_config['global_batch_size'] = study.best_params['batch_size']
-            training_config['weight_decay'] = study.best_params['weight_decay']
-            training_config['enable_optuna_sweep'] = False  # Disable for next run
-            
-            with open(training_config_path, 'w') as f:
-                yaml.dump(training_config, f)
-            
-            print(f"💾 Training config saved to: {training_config_path}")
-            
-            print("\n" + "="*70)
-            print("  🚀 NOW STARTING MAIN TRAINING WITH OPTIMIZED CONFIG")
-            print("  💡 Next run will automatically use optimized parameters")
-            print("="*70 + "\n")
-            
-            # Reload config with optimized values
-            with open(training_config_path, 'r') as f:
-                optimized_config_dict = yaml.safe_load(f)
-            
-            # Update current config
-            config = PretrainConfig(**optimized_config_dict)
-            
-        except ImportError as e:
-            print(f"\n⚠️  Optuna not installed or import failed: {e}")
-            print("   Install with: pip install optuna")
-            print("   Continuing with original config...\n")
-        except Exception as e:
-            print(f"\n⚠️  Optuna optimization failed: {e}")
-            print("   Continuing with original config...\n")
-            import traceback
-            traceback.print_exc()
-    # ========== END OPTUNA INTEGRATION ==========
-
     # Auto-resume: Check if checkpoint exists and auto-load if not specified
     if config.load_checkpoint is None and config.checkpoint_path is not None:
         latest_checkpoint = os.path.join(config.checkpoint_path, "latest.pt")
@@ -959,24 +823,14 @@ def launch(hydra_config: DictConfig):
     train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
     try:
         eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
-    except FileNotFoundError as e:
-        if RANK == 0:
-            print(f"No eval data found: {e}")
-        eval_loader = eval_metadata = None
-    except Exception as e:
-        if RANK == 0:
-            print(f"Warning: Failed to load eval data: {e}")
+    except:
+        print("NO EVAL DATA FOUND")
         eval_loader = eval_metadata = None
 
     try:
         evaluators = create_evaluators(config, eval_metadata)
-    except (ImportError, AttributeError) as e:
-        if RANK == 0:
-            print(f"No evaluator found: {e}")
-        evaluators = []
-    except Exception as e:
-        if RANK == 0:
-            print(f"Warning: Failed to initialize evaluators: {e}")
+    except:
+        print("No evaluator found")
         evaluators = []
 
     # Train state
@@ -986,46 +840,6 @@ def launch(hydra_config: DictConfig):
     progress_bar = None
     ema_helper = None
     gradient_monitor = None
-    
-    # Signal handlers for Colab force-stop (! button) and SIGTERM
-    # This ensures checkpoints are saved even when stopped forcefully
-    shutdown_in_progress = [False]  # Use list for mutability in nested function
-    
-    def emergency_checkpoint_saver(signum, frame):
-        """Save checkpoint on SIGTERM/SIGINT (Colab force-stop)."""
-        if shutdown_in_progress[0]:
-            return  # Already handling shutdown
-        shutdown_in_progress[0] = True
-        
-        if RANK == 0:
-            print("\n" + "="*70)
-            print("  🛑 FORCE STOP DETECTED - Emergency checkpoint save...")
-            print(f"  Signal: {signum} (SIGTERM={signal.SIGTERM}, SIGINT={signal.SIGINT})")
-            print("="*70)
-            
-            try:
-                save_train_state(config, train_state)
-                print("\n✅ Emergency checkpoint saved successfully!")
-                print(f"   Step: {train_state.step}")
-                print(f"   Location: {config.checkpoint_path}/latest.pt")
-            except Exception as e:
-                print(f"\n❌ Emergency save failed: {e}")
-            
-            print("\n" + "="*70)
-            print("  Training terminated by force stop")
-            print("="*70 + "\n")
-        
-        # Clean up
-        if dist.is_initialized():
-            dist.destroy_process_group()
-        if RANK == 0:
-            wandb.finish()
-        sys.exit(0)
-    
-    # Register signal handlers (Colab sends SIGTERM when using stop button)
-    signal.signal(signal.SIGTERM, emergency_checkpoint_saver)
-    signal.signal(signal.SIGINT, emergency_checkpoint_saver)
-    
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
@@ -1040,13 +854,6 @@ def launch(hydra_config: DictConfig):
         print('Setup EMA')
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.model)
-    
-    # Initialize GradScaler for Automatic Mixed Precision
-    scaler = None
-    if config.use_amp:
-        scaler = GradScaler()
-        if RANK == 0:
-            print(f'✨ AMP enabled: {config.amp_dtype} (2-3× faster on T4 GPU)')
 
     # Training Loop
     # Calculate starting iteration from restored step (for auto-resume)
@@ -1070,7 +877,7 @@ def launch(hydra_config: DictConfig):
                 print("TRAIN")
             train_state.model.train()
             for set_name, batch, global_batch_size in train_loader:
-                metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, gradient_monitor=gradient_monitor, scaler=scaler)
+                metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, gradient_monitor=gradient_monitor)
 
                 if RANK == 0 and metrics is not None:
                     wandb.log(metrics, step=train_state.step)

@@ -15,8 +15,7 @@ data_paths_test: []
 evaluators: []  # Can add perplexity evaluator later
 
 # Hyperparams - Training (optimized for 15GB T4 GPU)
-# With gradient checkpointing: +15% memory → +20% batch size possible
-global_batch_size: 154  # Increased from 128 (20% boost from checkpointing)
+global_batch_size: 128  # Increased from 32 to utilize GPU memory
 epochs: 5000  # Extended for better convergence on small dataset
 eval_interval: 5  # Save every 5 epochs (~366 steps)
 checkpoint_every_eval: True
@@ -43,13 +42,3 @@ checkpoint_path: "checkpoints/text-trm-10m"
 ema: True  # Exponential Moving Average for stability
 ema_rate: 0.9995  # Slightly higher for text (smoother averaging)
 freeze_weights: False
-
-# Automatic Mixed Precision (T4 GPU optimization)
-use_amp: True  # 2-3× faster training on T4 Tensor Cores
-amp_dtype: "float16"  # float16 for T4, bfloat16 for A100+
-
-# Optuna Hyperparameter Optimization (runs BEFORE main training)
-enable_optuna_sweep: False  # Set True to run hyperparameter search first
-optuna_n_trials: 20  # Number of trials to run (20 trials ≈ 3-4 hours)
-optuna_timeout: 14400  # Timeout in seconds (14400 = 4 hours)
-optuna_study_name: "trm-text-optimization"
