@@ -7,7 +7,21 @@ import torch.nn.functional as F
 # Flash Attention 3 with automatic fallback
 try:
     from flash_attn import flash_attn_func
-    FLASH_ATTN_AVAILABLE = True
+    
+    # Check if GPU supports FlashAttention (requires Ampere or newer: SM 8.0+)
+    if torch.cuda.is_available():
+        compute_capability = torch.cuda.get_device_capability()
+        # Ampere = SM 8.0, Ada/Hopper = SM 8.9/9.0
+        supports_flash_attn = compute_capability[0] >= 8
+    else:
+        supports_flash_attn = False
+    
+    FLASH_ATTN_AVAILABLE = supports_flash_attn
+    
+    if not supports_flash_attn:
+        print(f"⚠️  FlashAttention disabled: GPU compute capability {compute_capability} < 8.0 (requires Ampere or newer)")
+        print("   Using PyTorch SDPA fallback instead.")
+        from torch.nn.functional import scaled_dot_product_attention
 except ImportError:
     FLASH_ATTN_AVAILABLE = False
     from torch.nn.functional import scaled_dot_product_attention
