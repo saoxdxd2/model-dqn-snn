@@ -45,6 +45,7 @@ from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 from utils.gradient_monitor import GradientFlowMonitor
+from utils.resource_optimizer import DynamicResourceOptimizer
 
 
 class LossConfig(pydantic.BaseModel):
@@ -942,6 +943,7 @@ def launch(hydra_config: DictConfig):
     progress_bar = None
     ema_helper = None
     gradient_monitor = None
+    resource_optimizer = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
@@ -951,6 +953,16 @@ def launch(hydra_config: DictConfig):
         # Initialize gradient flow monitor
         gradient_monitor = GradientFlowMonitor(train_state.model, track_every_n_steps=100)
         print('Initialized gradient flow monitor (tracking every 100 steps)')
+        
+        # Initialize dynamic resource optimizer
+        resource_optimizer = DynamicResourceOptimizer(
+            initial_batch_size=config.global_batch_size,
+            min_batch_size=32,
+            max_batch_size=512,
+            target_gpu_utilization=0.85,
+            check_interval=10
+        )
+        resource_optimizer.print_status()
         
     if config.ema:
         print('Setup EMA')
@@ -1019,6 +1031,14 @@ def launch(hydra_config: DictConfig):
                 step_after_train = train_state.step
                 print(f"   Processed {batches_processed} training batches")
                 print(f"   Steps: {step_before_train} → {step_after_train} (+{step_after_train - step_before_train})")
+                
+                # Dynamic resource optimization
+                if resource_optimizer and step_after_train % 10 == 0:
+                    # Check if we should adjust batch size
+                    suggested_batch = resource_optimizer.suggest_batch_size(step_after_train)
+                    if suggested_batch != config.global_batch_size:
+                        config.global_batch_size = suggested_batch
+                        # Note: batch size change takes effect next iteration
 
             if _iter_id >= config.min_eval_interval:
                 ############ Evaluation
@@ -1051,6 +1071,28 @@ def launch(hydra_config: DictConfig):
 
                 if config.ema:
                     del train_state_eval
+    
+    except torch.cuda.OutOfMemoryError as e:
+        if RANK == 0:
+            print("\n" + "="*70)
+            print("  ❌ GPU OUT OF MEMORY")
+            print("="*70)
+            
+            if resource_optimizer:
+                resource_optimizer.on_oom_error()
+                print(f"\n  Reduced batch size to: {resource_optimizer.batch_size}")
+                print("  Please restart training to continue with smaller batch.")
+            else:
+                print("\n  Try reducing batch size in config/cfg_text.yaml")
+            
+            print("\n" + "="*70)
+        
+        # Clean up
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        if RANK == 0:
+            wandb.finish()
+        raise e
     
     except KeyboardInterrupt:
         if RANK == 0:
