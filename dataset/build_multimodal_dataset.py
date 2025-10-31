@@ -10,15 +10,19 @@ Supports composite samples with:
 Ideal for reasoning tasks requiring multiple modalities.
 """
 
-from typing import List, Dict, Any, Optional, Union
+import sys
 from pathlib import Path
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from typing import List, Dict, Any, Optional, Union
 import numpy as np
 import torch
 from pydantic import BaseModel
 from argdantic import ArgParser
 
-from base_builder import BaseDatasetBuilder, DataSample, ModalityType
-from common import PuzzleDatasetMetadata
+from dataset.base_builder import BaseDatasetBuilder, DataSample, ModalityType
+from dataset.common import PuzzleDatasetMetadata
 
 try:
     from PIL import Image

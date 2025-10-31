@@ -3,13 +3,17 @@ Unified base class for all dataset builders.
 Supports multimodal data: text, images, mazes, puzzles.
 """
 
+import sys
+from pathlib import Path
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Union, Any
-from pathlib import Path
 import numpy as np
 import torch
 from pydantic import BaseModel
-from common import PuzzleDatasetMetadata
+from dataset.common import PuzzleDatasetMetadata
 
 
 class ModalityType:
