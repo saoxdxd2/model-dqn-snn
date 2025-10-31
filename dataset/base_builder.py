@@ -162,6 +162,8 @@ class BaseDatasetBuilder(ABC):
         batch_size = 8
         
         from tqdm import tqdm
+        import gc
+        
         for i in tqdm(range(0, len(texts), batch_size), desc="Encoding capsules"):
             with torch.no_grad():
                 result = self.encoder(texts[i:i+batch_size], return_children=True)
@@ -169,6 +171,15 @@ class BaseDatasetBuilder(ABC):
             for key in all_data:
                 if key in result and result[key] is not None:
                     all_data[key].append(result[key].cpu())
+            
+            # Clear intermediate results
+            del result
+            
+            # Periodic memory cleanup (every 100 batches)
+            if i % (batch_size * 100) == 0:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         # Concatenate all batches
         result = {k: torch.cat(v, dim=0) if v else torch.empty(0) for k, v in all_data.items()}
