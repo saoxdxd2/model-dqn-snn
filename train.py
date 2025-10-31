@@ -66,40 +66,37 @@ MODELS = {
     "text": {
         "name": "Text Generation (Language Model)",
         "config": "cfg_text",
-        "dataset_builder": "dataset/build_text_dataset.py",
+        "dataset_builder": "dataset/build_multimodal_dataset.py",
+        "dataset_command": "build_text",
         "dataset_args": {
             "input_file": "wikitext2",
             "output_dir": "datasets/wikitext2",
-            "semantic_mode": True,
-            "semantic_hidden_size": 768,
             "num_concepts": 2048,
-            "semantic_target_tokens": 12,
-            "encoder_model": "openai/clip-vit-large-patch14"
+            "target_capsules": 12
         },
-        "description": "Train on WikiText-2 with HESC (Hierarchical Expandable Semantic Capsules)"
+        "description": "Train on WikiText-2 with HESC capsules + concept vocabulary"
     },
     "text-tiny": {
         "name": "Text Generation (TinyStories - Small)",
         "config": "cfg_text",
-        "dataset_builder": "dataset/build_text_dataset.py",
+        "dataset_builder": "dataset/build_multimodal_dataset.py",
+        "dataset_command": "build_text",
         "dataset_args": {
             "input_file": "tinystories",
             "output_dir": "datasets/tinystories",
-            "semantic_mode": True,
-            "semantic_hidden_size": 768,
             "num_concepts": 2048,
-            "semantic_target_tokens": 12,
-            "encoder_model": "openai/clip-vit-large-patch14"
+            "target_capsules": 12
         },
-        "description": "Train on TinyStories with HESC (smaller, faster convergence)"
+        "description": "Train on TinyStories with HESC (smaller, faster)"
     },
     "arc": {
         "name": "Visual Reasoning (ARC Puzzles)",
         "config": "cfg_pretrain",
-        "dataset_builder": "dataset/build_arc_dataset.py",
+        "dataset_builder": "dataset/build_multimodal_dataset.py",
+        "dataset_command": "build_arc",
         "dataset_args": {
             "input_file_prefix": "kaggle/combined/arc-agi",
-            "output_dir": "data/arc-aug-1000",
+            "output_dir": "data/arc-capsules",
             "subsets": ["training", "training2"],
             "test_set_name": "evaluation",
             "num_aug": 1000,
@@ -110,55 +107,70 @@ MODELS = {
     "code": {
         "name": "Code Generation (Python)",
         "config": "cfg_code",
-        "dataset_builder": "dataset/build_text_dataset.py",
+        "dataset_builder": "dataset/build_multimodal_dataset.py",
+        "dataset_command": "build_text",
         "dataset_args": {
-            "input_file": "code-python",  # Auto-downloads The Stack Python
+            "input_file": "code-python",
             "output_dir": "data/code-python",
-            "tokenizer_name": "Salesforce/codegen-350M-mono",
-            "max_seq_len": 1024,
-            "stride": 512
+            "num_concepts": 2048,
+            "target_capsules": 12
         },
-        "description": "Train on Python code from The Stack (deduplicated)"
+        "description": "Train on Python code with HESC capsules"
     },
     "vision": {
-        "name": "Image Understanding (Patch Tokens + TRM + DQN)",
+        "name": "Image Understanding (CLIP Vision)",
         "config": "cfg_vision",
-        "dataset_builder": "dataset/build_image_dataset.py",
+        "dataset_builder": "dataset/build_multimodal_dataset.py",
+        "dataset_command": "build_image",
         "dataset_args": {
             "dataset_name": "cifar10",
             "output_dir": "data/vision-cifar10",
-            "patch_size": 8,  # 8×8 patches (4×4 grid = 16 tokens)
-            "vocab_size": 2048,  # Patch vocabulary (learned codebook)
-            "image_size": 32,  # CIFAR-10 native size
-            "seed": 42
+            "image_size": 224
         },
-        "description": "Train on CIFAR-10 with patch tokenization (like BPE for images) + DQN"
+        "description": "Train on CIFAR-10 with CLIP vision encoding"
     },
     "alpaca": {
         "name": "Instruction Following (Alpaca)",
         "config": "cfg_text",
-        "dataset_builder": "dataset/build_text_dataset.py",
+        "dataset_builder": "dataset/build_multimodal_dataset.py",
+        "dataset_command": "build_text",
         "dataset_args": {
             "input_file": "alpaca",
             "output_dir": "data/text-alpaca",
-            "tokenizer_name": "gpt2",
-            "max_seq_len": 512,
-            "stride": 256
+            "num_concepts": 2048
         },
         "description": "Train on Alpaca instruction-response pairs"
     },
     "sharegpt": {
         "name": "Conversational (ShareGPT)",
         "config": "cfg_text",
-        "dataset_builder": "dataset/build_text_dataset.py",
+        "dataset_builder": "dataset/build_multimodal_dataset.py",
+        "dataset_command": "build_text",
         "dataset_args": {
             "input_file": "sharegpt",
             "output_dir": "data/text-sharegpt",
-            "tokenizer_name": "gpt2",
-            "max_seq_len": 512,
-            "stride": 256
+            "num_concepts": 2048
         },
         "description": "Train on ShareGPT multi-turn dialogues"
+    },
+    "multimodal": {
+        "name": "🌐 Unified Multimodal (ARC + Text + Vision)",
+        "config": "cfg_text",
+        "dataset_builder": "dataset/build_multimodal_dataset.py",
+        "dataset_command": "build_composite",
+        "dataset_args": {
+            "sources": [
+                "kaggle/combined/arc-agi_training.json",
+                "wikitext2",
+                "cifar10"
+            ],
+            "output_dir": "datasets/multimodal_unified",
+            "augment": True,
+            "num_concepts": 2048,
+            "target_capsules": 12,
+            "enable_quality_scoring": True
+        },
+        "description": "🔥 SINGLE model trained on all modalities - best cross-modal transfer"
     }
 }
 
@@ -564,6 +576,12 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False):
     args = model_config['dataset_args']
     
     cmd = ["python", builder_script]
+    
+    # Add subcommand if using unified builder
+    if 'dataset_command' in model_config:
+        cmd.append(model_config['dataset_command'])
+    
+    # Add arguments
     for key, value in args.items():
         flag = f"--{key.replace('_', '-')}"
         if isinstance(value, list):

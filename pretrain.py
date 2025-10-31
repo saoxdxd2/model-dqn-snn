@@ -178,105 +178,64 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
         print(f"   DQN recommended: {features['enable_dqn']}")
     
     if semantic_mode:
-        # Load precomputed HESC capsule dataset
+        # Load unified multimodal capsule dataset
         import torch
         
-        # Try new capsule format first, fallback to legacy semantic
         capsule_path = config.semantic_dataset.replace('semantic_embeddings', 'capsule_dataset') if split == 'train' else config.semantic_eval_dataset.replace('semantic_embeddings', 'capsule_dataset')
         
-        if os.path.exists(capsule_path):
-            # New HESC format
-            print(f"\n📦 Loading HESC capsules: {capsule_path}")
-            data = torch.load(capsule_path)
-            sketches = data['sketches']  # [N, k, hidden_size]
-            checksums = data.get('checksums', None)  # [N, k, checksum_dim]
-            children = data.get('children', None)  # [N, k, m, hidden_size]
-            
-            print(f"   Sketches: {sketches.shape}")
-            if children is not None:
-                print(f"   Children: {children.shape}")
-            print(f"   Compression: ~{sketches.shape[1]} capsules (expandable)")
-            
-            # Create metadata
-            # Concept vocab: num_concepts + 4 control symbols
-            num_concepts = getattr(config.arch, 'num_concepts', 2048)
-            vocab_size = num_concepts + 4  # <EXPAND>, <STOP>, <MERGE>, <PAD>
-            
-            metadata = PuzzleDatasetMetadata(
-                seq_len=sketches.shape[1],
-                vocab_size=vocab_size,
-                pad_id=0,
-                ignore_label_id=-100,
-                blank_identifier_id=0,
-                num_puzzle_identifiers=0,
-                total_groups=sketches.shape[0],
-                mean_puzzle_examples=1.0,
-                total_puzzles=sketches.shape[0],
-                sets=["all"]
+        if not os.path.exists(capsule_path):
+            raise FileNotFoundError(
+                f"Capsule dataset not found: {capsule_path}\n"
+                f"Build with: python dataset/build_multimodal_dataset.py build_text --input_file wikitext2 --output_dir {os.path.dirname(capsule_path)}"
             )
-            
-            # Dataset with all capsule components
-            from torch.utils.data import TensorDataset
-            if children is not None and checksums is not None:
-                dataset = TensorDataset(sketches, checksums, children)
-            elif checksums is not None:
-                dataset = TensorDataset(sketches, checksums)
-            else:
-                dataset = TensorDataset(sketches)
-            
-            dataloader = DataLoader(
-                dataset,
-                batch_size=config.global_batch_size // world_size,
-                shuffle=(split == 'train'),
-                num_workers=0,
-                pin_memory=True
-            )
-            
-            return dataloader, metadata
         
+        print(f"\n📦 Loading multimodal capsule dataset: {capsule_path}")
+        data = torch.load(capsule_path)
+        
+        # Extract components (unified format)
+        sketches = data['sketches']  # [N, k, hidden_size]
+        checksums = data.get('checksums', None)
+        children = data.get('children', None)
+        
+        print(f"   Samples: {sketches.shape[0]}, Capsules: {sketches.shape[1]}, Dim: {sketches.shape[2]}")
+        if children is not None:
+            print(f"   Expandable: {children.shape[2]} children per capsule")
+        
+        # Metadata with concept vocabulary
+        num_concepts = getattr(config.arch, 'num_concepts', 2048)
+        vocab_size = num_concepts + 4  # Concept vocab + control symbols
+        
+        metadata = PuzzleDatasetMetadata(
+            seq_len=sketches.shape[1],
+            vocab_size=vocab_size,
+            pad_id=0,
+            ignore_label_id=-100,
+            blank_identifier_id=0,
+            num_puzzle_identifiers=0,
+            total_groups=sketches.shape[0],
+            mean_puzzle_examples=1.0,
+            total_puzzles=sketches.shape[0],
+            sets=["all"]
+        )
+        
+        # Create dataset with available components
+        from torch.utils.data import TensorDataset
+        if children is not None and checksums is not None:
+            dataset = TensorDataset(sketches, checksums, children)
+        elif checksums is not None:
+            dataset = TensorDataset(sketches, checksums)
         else:
-            # Fallback: legacy semantic embeddings
-            semantic_path = config.semantic_dataset if split == 'train' else config.semantic_eval_dataset
-            
-            if not os.path.exists(semantic_path):
-                raise FileNotFoundError(
-                    f"Capsule dataset not found: {capsule_path}\n"
-                    f"Build it: python dataset/build_text_dataset.py --semantic_mode --input_file wikitext2 --output_dir datasets/wikitext2"
-                )
-            
-            print(f"\n📦 Loading legacy semantic embeddings: {semantic_path}")
-            data = torch.load(semantic_path)
-            embeddings = data.get('embeddings', data.get('sketches'))  # [N, k, hidden_size]
-            print(f"   Shape: {embeddings.shape}")
-            
-            # Use concept vocab even for legacy mode
-            num_concepts = getattr(config.arch, 'num_concepts', 2048)
-            vocab_size = num_concepts + 4
-            
-            metadata = PuzzleDatasetMetadata(
-                seq_len=embeddings.shape[1],
-                vocab_size=vocab_size,
-                pad_id=0,
-                ignore_label_id=-100,
-                blank_identifier_id=0,
-                num_puzzle_identifiers=0,
-                total_groups=embeddings.shape[0],
-                mean_puzzle_examples=1.0,
-                total_puzzles=embeddings.shape[0],
-                sets=["all"]
-            )
-            
-            from torch.utils.data import TensorDataset
-            dataset = TensorDataset(embeddings)
-            dataloader = DataLoader(
-                dataset,
-                batch_size=config.global_batch_size // world_size,
-                shuffle=(split == 'train'),
-                num_workers=0,
-                pin_memory=True
-            )
-            
-            return dataloader, metadata
+            dataset = TensorDataset(sketches)
+        
+        dataloader = DataLoader(
+            dataset,
+            batch_size=config.global_batch_size // world_size,
+            shuffle=(split == 'train'),
+            num_workers=0,
+            pin_memory=True
+        )
+        
+        return dataloader, metadata
     
     # Token-based mode (original logic)
     dataset_paths = config.data_paths if split == 'train' else config.data_paths_test

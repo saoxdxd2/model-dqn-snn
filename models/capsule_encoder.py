@@ -89,11 +89,13 @@ class CapsuleEncoder(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
     
-    def forward(self, texts, return_children: bool = True):
+    def forward(self, texts=None, images=None, return_children: bool = True):
         """
-        Encode texts to capsules.
+        Encode texts or images to capsules (multimodal support).
         
         Args:
+            texts: List of text strings or None
+            images: List of PIL Images/tensors or None
             texts: List of strings or pre-encoded tensor
             return_children: Whether to compute children embeddings
         
@@ -104,9 +106,17 @@ class CapsuleEncoder(nn.Module):
         
         # Handle pre-encoded tensors (precomputed mode)
         if isinstance(texts, torch.Tensor):
-            return {'sketches': texts.to(device)}
+            device = next(self.encoder.parameters()).device
         
-        # Chunk texts into coarse capsules
+        # Handle vision inputs
+        if images is not None:
+            return self._encode_images(images, return_children)
+        
+        # Text encoding path
+        if texts is None:
+            raise ValueError("Either texts or images must be provided")
+        
+        # Chunk texts into coarse semantic chunks (constituency-aware)
         all_capsule_chunks = []
         all_children_chunks = []
         capsule_counts = []
@@ -227,6 +237,68 @@ class CapsuleEncoder(nn.Module):
             result['children'] = children
         
         return result
+    
+    def _encode_images(self, images, return_children: bool):
+        """
+        Encode images to capsules using CLIP vision encoder.
+        
+        Args:
+            images: List of PIL Images or torch tensors [B, 3, H, W]
+            return_children: Whether to compute spatial children
+        
+        Returns:
+            dict with 'sketches', 'checksums', 'children'
+        """
+        device = next(self.encoder.parameters()).device
+        
+        # Preprocess images
+        if self.encoder_type == "clip":
+            # CLIP image preprocessing
+            from torchvision import transforms
+            preprocess = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
+                                   std=[0.26862954, 0.26130258, 0.27577711])
+            ])
+            
+            # Process images
+            if isinstance(images[0], torch.Tensor):
+                image_tensors = torch.stack(images).to(device)
+            else:
+                # PIL Images
+                image_tensors = torch.stack([preprocess(img) for img in images]).to(device)
+            
+            # Encode with CLIP vision encoder
+            with torch.no_grad() if not self.training else torch.enable_grad():
+                image_features = self.encoder.get_image_features(pixel_values=image_tensors)
+            
+            # image_features: [B, encoder_dim]
+            # Split into k capsules (spatial or semantic regions)
+            batch_size = image_features.shape[0]
+            sketches = image_features.unsqueeze(1).repeat(1, self.target_capsules, 1)  # [B, k, D]
+            
+            # Project to hidden size
+            sketches = self.sketch_projection(sketches)  # [B, k, hidden_size]
+            
+            # Compute checksums
+            checksums = self.checksum_head(sketches)  # [B, k, checksum_dim]
+            
+            result = {
+                'sketches': sketches,
+                'checksums': checksums
+            }
+            
+            # Children: spatial patches (if requested)
+            if return_children:
+                # Split image into spatial regions as children
+                # For now, duplicate sketches (TODO: implement spatial patching)
+                children = sketches.unsqueeze(2).repeat(1, 1, self.children_per_capsule, 1)
+                result['children'] = children  # [B, k, m, hidden_size]
+            
+            return result
+        else:
+            raise NotImplementedError(f"Image encoding not implemented for {self.encoder_type}")
     
     def _chunk_text_hierarchical(self, text: str, target_chunks: int) -> list:
         """Split text into coarse semantic chunks (constituency-aware)."""
