@@ -159,48 +159,51 @@ class BaseDatasetBuilder(ABC):
             else:
                 self.encoder = self.encoder.to('cpu')
         
-        # Unified conversion: all modalities → text representation
-        texts = [self._sample_to_text(s) for s in samples]
-        
-        # Encoding with GPU optimization
+        # Encoding with GPU optimization - process in chunks to prevent RAM leak
         batch_size = 16 if torch.cuda.is_available() else 4  # Optimal for CLIP
-        chunk_size = 500  # Concatenate every 500 samples to prevent RAM leak
+        chunk_size = 1000  # Process 1000 samples at a time
         
-        print(f"⚡ Encoding with batch_size={batch_size}")
+        print(f"⚡ Encoding {len(samples)} samples with batch_size={batch_size}")
         
         from tqdm import tqdm
         import gc
         
-        # Initialize result tensors
         result_chunks = {'sketches': [], 'checksums': [], 'children': []}
-        temp_data = {'sketches': [], 'checksums': [], 'children': []}
         
-        for i in tqdm(range(0, len(texts), batch_size), desc="Encoding capsules"):
-            with torch.no_grad():
-                batch_result = self.encoder(texts[i:i+batch_size], return_children=True)
+        # Process in chunks to avoid RAM accumulation
+        num_chunks = (len(samples) + chunk_size - 1) // chunk_size
+        for chunk_idx in range(num_chunks):
+            chunk_start = chunk_idx * chunk_size
+            chunk_end = min(chunk_start + chunk_size, len(samples))
+            chunk_samples = samples[chunk_start:chunk_end]
             
-            # Move to CPU immediately and append
-            for key in temp_data:
-                if key in batch_result and batch_result[key] is not None:
-                    temp_data[key].append(batch_result[key].cpu())
+            # Convert only this chunk to text
+            texts = [self._sample_to_text(s) for s in chunk_samples]
             
-            del batch_result
+            # Encode chunk
+            temp_data = {'sketches': [], 'checksums': [], 'children': []}
             
-            # Concatenate chunks periodically to free intermediate lists
-            if len(temp_data['sketches']) >= chunk_size // batch_size:
-                for key in temp_data:
-                    if temp_data[key]:
-                        result_chunks[key].append(torch.cat(temp_data[key], dim=0))
-                        temp_data[key] = []  # Clear temp list
+            pbar = tqdm(range(0, len(texts), batch_size), desc=f"Chunk {chunk_idx+1}/{num_chunks}", leave=True)
+            for i in pbar:
+                with torch.no_grad():
+                    batch_result = self.encoder(texts[i:i+batch_size], return_children=True)
                 
-                gc.collect()  # Force garbage collection
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        
-        # Final concatenation of remaining data
-        for key in temp_data:
-            if temp_data[key]:
-                result_chunks[key].append(torch.cat(temp_data[key], dim=0))
+                for key in temp_data:
+                    if key in batch_result and batch_result[key] is not None:
+                        temp_data[key].append(batch_result[key].cpu())
+                
+                del batch_result
+            
+            # Concatenate chunk
+            for key in temp_data:
+                if temp_data[key]:
+                    result_chunks[key].append(torch.cat(temp_data[key], dim=0))
+            
+            # Clear memory
+            del texts, chunk_samples, temp_data
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
         # Concatenate all chunks into final result
         result = {k: torch.cat(v, dim=0) if v else torch.empty(0) for k, v in result_chunks.items()}
