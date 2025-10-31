@@ -67,7 +67,7 @@ MODELS = {
         "name": "Text Generation (WikiText-2)",
         "config": "cfg_text",
         "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build_text",
+        "dataset_command": "build-text",
         "dataset_args": {
             "input_file": "wikitext2",
             "output_dir": "datasets/wikitext2",
@@ -80,7 +80,7 @@ MODELS = {
         "name": "Vision Classification (CIFAR-10)",
         "config": "cfg_vision",
         "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build_image",
+        "dataset_command": "build-image",
         "dataset_args": {
             "dataset_name": "cifar10",
             "output_dir": "data/vision-cifar10",
@@ -92,7 +92,7 @@ MODELS = {
         "name": "ARC-AGI Reasoning (Geometric Puzzles)",
         "config": "cfg_pretrain",
         "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build_arc",
+        "dataset_command": "build-arc",
         "dataset_args": {
             "input_file_prefix": "kaggle/combined/arc-agi",
             "output_dir": "data/arc-capsules",
@@ -107,7 +107,7 @@ MODELS = {
         "name": "Multimodal Unified (Text + Vision + ARC)",
         "config": "cfg_multimodal",
         "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build_composite",
+        "dataset_command": "build-composite",
         "dataset_args": {
             "sources": [
                 "kaggle/combined/arc-agi_training.json",
