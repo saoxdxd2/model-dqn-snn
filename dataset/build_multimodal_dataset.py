@@ -372,6 +372,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
 @cli.command(singleton=True)
 def build(config: MultimodalDatasetConfig):
     """Unified dataset builder - all formats, all modalities."""
+    print(f"\n🔍 DEBUG: build() received config.output_dir = '{config.output_dir}'")
     print(f"\n{'='*70}\n🌐 Building: {', '.join(config.source_paths)}\n{'='*70}")
     
     # Build pipeline
@@ -486,6 +487,8 @@ def build_composite(
     enable_quality_scoring: bool = True
 ):
     """Build composite multimodal dataset from multiple sources."""
+    print(f"\n🔍 DEBUG: build_composite received output_dir = '{output_dir}'")
+    
     config = MultimodalDatasetConfig(
         source_paths=sources,
         output_dir=output_dir,  # Pass through CLI argument
@@ -497,6 +500,8 @@ def build_composite(
         target_capsules=target_capsules,
         enable_quality_scoring=enable_quality_scoring
     )
+    
+    print(f"🔍 DEBUG: config.output_dir = '{config.output_dir}'")
     build(config)
 
 
