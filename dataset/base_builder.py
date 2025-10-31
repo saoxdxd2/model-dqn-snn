@@ -224,8 +224,11 @@ class BaseDatasetBuilder(ABC):
             sets=["all"]
         )
     
-    def save(self, data: Dict, output_dir: str):
+    def save(self, dataset: Dict, output_dir: str = None):
         """Save dataset to disk."""
+        if output_dir is None:
+            output_dir = getattr(self.config, 'output_dir', 'datasets/output')
+        
         import os
         
         os.makedirs(output_dir, exist_ok=True)
@@ -233,38 +236,36 @@ class BaseDatasetBuilder(ABC):
         # Save train (with float16 compression for memory efficiency)
         train_path = os.path.join(output_dir, 'capsule_dataset.pt')
         train_compressed = {
-            'sketches': data['train']['sketches'].half() if 'sketches' in data['train'] else data['train'].get('sketches'),
-            'checksums': data['train'].get('checksums'),  # Keep checksums in float32 for precision
+            'sketches': dataset['train']['sketches'].half() if 'sketches' in dataset['train'] else dataset['train'].get('sketches'),
+            'checksums': dataset['train'].get('checksums'),  # Keep checksums in float32 for precision
         }
-        if 'children' in data['train']:
-            train_compressed['children'] = data['train']['children'].half()  # 50% memory reduction
+        if 'children' in dataset['train']:
+            train_compressed['children'] = dataset['train']['children'].half()  # 50% memory reduction
         # Copy any other keys
-        for key in data['train']:
+        for key in dataset['train']:
             if key not in train_compressed:
-                train_compressed[key] = data['train'][key]
+                train_compressed[key] = dataset['train'][key]
         
         torch.save(train_compressed, train_path)
         print(f"✅ Saved train (float16 compressed): {train_path}")
         
-        # Save test (with float16 compression)
+        # Save test
         test_path = os.path.join(output_dir, 'capsule_dataset_test.pt')
         test_compressed = {
-            'sketches': data['test']['sketches'].half() if 'sketches' in data['test'] else data['test'].get('sketches'),
-            'checksums': data['test'].get('checksums'),
+            'sketches': dataset['test']['sketches'].half() if 'sketches' in dataset['test'] else dataset['test'].get('sketches'),
+            'checksums': dataset['test'].get('checksums'),
         }
-        if 'children' in data['test']:
-            test_compressed['children'] = data['test']['children'].half()
-        # Copy any other keys
-        for key in data['test']:
+        if 'children' in dataset['test']:
+            test_compressed['children'] = dataset['test']['children'].half()
+        for key in dataset['test']:
             if key not in test_compressed:
-                test_compressed[key] = data['test'][key]
+                test_compressed[key] = dataset['test'][key]
         
         torch.save(test_compressed, test_path)
         print(f"✅ Saved test (float16 compressed): {test_path}")
         
         # Save metadata
-        import json
         metadata_path = os.path.join(output_dir, 'dataset.json')
         with open(metadata_path, 'w') as f:
-            json.dump(data['metadata'].model_dump(), f, indent=2)
+            json.dump(dataset.get('metadata', {}).__dict__ if hasattr(dataset.get('metadata'), '__dict__') else dataset.get('metadata', {}), f, indent=2)
         print(f"✅ Saved metadata: {metadata_path}")

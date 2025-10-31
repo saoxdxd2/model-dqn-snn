@@ -9,15 +9,15 @@ hydra:
   output_subdir: null
 
 # Data paths
-data_paths: ['data/multimodal-mixed']
+data_paths: ['datasets/multimodal_unified']
 data_paths_test: []
 
 evaluators: []
 
 # HESC capsule mode (REQUIRED)
 semantic_mode: true
-semantic_dataset: "datasets/multimodal/capsule_dataset.pt"
-semantic_eval_dataset: "datasets/multimodal/capsule_dataset_test.pt"
+semantic_dataset: "datasets/multimodal_unified/capsule_dataset.pt"
+semantic_eval_dataset: "datasets/multimodal_unified/capsule_dataset_test.pt"
 
 # Training hyperparameters (optimized for 12-capsule sequences)
 global_batch_size: 768  # High batch for capsule compression
@@ -43,6 +43,10 @@ seed: 42
 min_eval_interval: 0
 
 checkpoint_path: "checkpoints/multimodal-hesc"
+
+# Project naming
+project_name: "Multimodal-HESC"
+run_name: null
 
 # EMA (stability for mixed data)
 ema: True
