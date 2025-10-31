@@ -369,7 +369,6 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         return augmented
 
 
-@cli.command(singleton=True)
 def build(config: MultimodalDatasetConfig):
     """Unified dataset builder - all formats, all modalities."""
     print(f"\n🔍 DEBUG: build() received config.output_dir = '{config.output_dir}'")
