@@ -170,7 +170,13 @@ class BaseDatasetBuilder(ABC):
                     all_data[key].append(result[key].cpu())
         
         # Concatenate all batches
-        return {k: torch.cat(v, dim=0) for k, v in all_data.items() if v}
+        result = {k: torch.cat(v, dim=0) if v else torch.empty(0) for k, v in all_data.items()}
+        
+        # Ensure at least 'sketches' key exists for compatibility
+        if 'sketches' not in result or result['sketches'].numel() == 0:
+            result['sketches'] = torch.empty(0, getattr(self.config, 'target_capsules', 12), getattr(self.config, 'hidden_size', 768))
+        
+        return result
     
     def _sample_to_text(self, sample: DataSample) -> str:
         """Convert any sample type to text representation."""

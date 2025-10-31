@@ -384,8 +384,18 @@ def build(config: MultimodalDatasetConfig):
     # Save
     builder.save(dataset, config.output_dir)
     
-    print(f"\n✅ Complete: {dataset['train']['sketches'].shape[0]} train, {dataset['test']['sketches'].shape[0]} test")
+    # Print summary
+    train_size = dataset['train'].get('sketches', torch.empty(0)).shape[0] if 'sketches' in dataset['train'] else len(dataset['train']) if isinstance(dataset['train'], list) else 0
+    test_size = dataset['test'].get('sketches', torch.empty(0)).shape[0] if 'sketches' in dataset['test'] else len(dataset['test']) if isinstance(dataset['test'], list) else 0
+    
+    print(f"\n✅ Complete: {train_size} train, {test_size} test samples")
     print(f"   Output: {config.output_dir}")
+    
+    if train_size == 0:
+        print(f"\n⚠️  WARNING: No samples were loaded from sources:")
+        for src in config.source_paths:
+            print(f"   - {src}")
+        print(f"   Please check that the data files exist and are accessible.")
 
 def _post_process(config: MultimodalDatasetConfig, dataset: Dict):
     """Unified post-processing: concept tables, quality scoring."""
