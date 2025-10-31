@@ -152,14 +152,23 @@ class BaseDatasetBuilder(ABC):
                 capsule_grid_shape=getattr(self.config, 'capsule_grid_shape', (3, 4))
             )
             self.encoder.eval()
-            self.encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
+            
+            if torch.cuda.is_available():
+                self.encoder = self.encoder.to('cuda')
+                # Enable mixed precision for 2x speedup
+                self.encoder = self.encoder.half()  # FP16 inference
+                print("🚀 GPU optimizations enabled: FP16 mixed precision")
+            else:
+                self.encoder = self.encoder.to('cpu')
         
         # Unified conversion: all modalities → text representation
         texts = [self._sample_to_text(s) for s in samples]
         
-        # Encoding with incremental concatenation to prevent RAM accumulation
-        batch_size = 4  # Reduced from 8 to lower memory usage
+        # Encoding with GPU optimization (6x speedup target)
+        batch_size = 32 if torch.cuda.is_available() else 4  # 8x larger for GPU
         chunk_size = 500  # Concatenate every 500 samples to prevent RAM leak
+        
+        print(f"⚡ Encoding with batch_size={batch_size} (GPU optimized)")
         
         from tqdm import tqdm
         import gc
@@ -169,13 +178,15 @@ class BaseDatasetBuilder(ABC):
         temp_data = {'sketches': [], 'checksums': [], 'children': []}
         
         for i in tqdm(range(0, len(texts), batch_size), desc="Encoding capsules"):
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 batch_result = self.encoder(texts[i:i+batch_size], return_children=True)
             
-            # Move to CPU immediately and append
+            # Move to CPU immediately and append (convert back from FP16)
             for key in temp_data:
                 if key in batch_result and batch_result[key] is not None:
-                    temp_data[key].append(batch_result[key].cpu())
+                    # Convert FP16 to FP32 on CPU
+                    tensor = batch_result[key].float().cpu() if batch_result[key].dtype == torch.float16 else batch_result[key].cpu()
+                    temp_data[key].append(tensor)
             
             del batch_result
             
