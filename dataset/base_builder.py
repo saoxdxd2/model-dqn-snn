@@ -225,14 +225,12 @@ class BaseDatasetBuilder(ABC):
             sets=["all"]
         )
     
-    def save(self, dataset: Dict, output_dir: str = None):
+    def save(self, dataset: Dict, output_dir: str):
         """Save dataset to disk."""
-        if output_dir is None:
-            output_dir = getattr(self.config, 'output_dir', 'datasets/output')
-        
         import os
         
         os.makedirs(output_dir, exist_ok=True)
+        print(f"\n💾 Saving dataset to: {output_dir}")
         
         # Save train (with float16 compression for memory efficiency)
         train_path = os.path.join(output_dir, 'capsule_dataset.pt')
