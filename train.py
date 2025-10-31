@@ -64,7 +64,7 @@ COMMUNICATION_ROADMAP = [
 
 MODELS = {
     "text": {
-        "name": "Text Generation (Language Model)",
+        "name": "Text Generation (WikiText-2)",
         "config": "cfg_text",
         "dataset_builder": "dataset/build_multimodal_dataset.py",
         "dataset_command": "build_text",
@@ -74,23 +74,22 @@ MODELS = {
             "num_concepts": 2048,
             "target_capsules": 12
         },
-        "description": "Train on WikiText-2 with HESC capsules + concept vocabulary"
+        "description": "Language modeling with HESC capsules (H=4, L=3, 16 recursions)"
     },
-    "text-tiny": {
-        "name": "Text Generation (TinyStories - Small)",
-        "config": "cfg_text",
+    "vision": {
+        "name": "Vision Classification (CIFAR-10)",
+        "config": "cfg_vision",
         "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build_text",
+        "dataset_command": "build_image",
         "dataset_args": {
-            "input_file": "tinystories",
-            "output_dir": "datasets/tinystories",
-            "num_concepts": 2048,
-            "target_capsules": 12
+            "dataset_name": "cifar10",
+            "output_dir": "data/vision-cifar10",
+            "image_size": 224
         },
-        "description": "Train on TinyStories with HESC (smaller, faster)"
+        "description": "Image classification with spatial reasoning (H=3, L=3, 12 recursions)"
     },
     "arc": {
-        "name": "Visual Reasoning (ARC Puzzles)",
+        "name": "ARC-AGI Reasoning (Geometric Puzzles)",
         "config": "cfg_pretrain",
         "dataset_builder": "dataset/build_multimodal_dataset.py",
         "dataset_command": "build_arc",
@@ -102,60 +101,11 @@ MODELS = {
             "num_aug": 1000,
             "seed": 42
         },
-        "description": "Train on ARC visual puzzles (original)"
-    },
-    "code": {
-        "name": "Code Generation (Python)",
-        "config": "cfg_code",
-        "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build_text",
-        "dataset_args": {
-            "input_file": "code-python",
-            "output_dir": "data/code-python",
-            "num_concepts": 2048,
-            "target_capsules": 12
-        },
-        "description": "Train on Python code with HESC capsules"
-    },
-    "vision": {
-        "name": "Image Understanding (CLIP Vision)",
-        "config": "cfg_vision",
-        "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build_image",
-        "dataset_args": {
-            "dataset_name": "cifar10",
-            "output_dir": "data/vision-cifar10",
-            "image_size": 224
-        },
-        "description": "Train on CIFAR-10 with CLIP vision encoding"
-    },
-    "alpaca": {
-        "name": "Instruction Following (Alpaca)",
-        "config": "cfg_text",
-        "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build_text",
-        "dataset_args": {
-            "input_file": "alpaca",
-            "output_dir": "data/text-alpaca",
-            "num_concepts": 2048
-        },
-        "description": "Train on Alpaca instruction-response pairs"
-    },
-    "sharegpt": {
-        "name": "Conversational (ShareGPT)",
-        "config": "cfg_text",
-        "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build_text",
-        "dataset_args": {
-            "input_file": "sharegpt",
-            "output_dir": "data/text-sharegpt",
-            "num_concepts": 2048
-        },
-        "description": "Train on ShareGPT multi-turn dialogues"
+        "description": "Visual reasoning on 30×30 grids (H=3, L=6, 21 recursions - TRM paper optimal)"
     },
     "multimodal": {
-        "name": "🌐 Unified Multimodal (ARC + Text + Vision)",
-        "config": "cfg_text",
+        "name": "Multimodal Unified (Text + Vision + ARC)",
+        "config": "cfg_multimodal",
         "dataset_builder": "dataset/build_multimodal_dataset.py",
         "dataset_command": "build_composite",
         "dataset_args": {
@@ -170,7 +120,7 @@ MODELS = {
             "target_capsules": 12,
             "enable_quality_scoring": True
         },
-        "description": "🔥 SINGLE model trained on all modalities - best cross-modal transfer"
+        "description": "Cross-modal transfer learning (H=3, L=2, 9 recursions for 12-capsule compression)"
     }
 }
 
@@ -263,31 +213,26 @@ def detect_checkpoints():
     return checkpoints
 
 
-def dataset_to_model_key(dataset_path: str) -> str:
-    """Map dataset path back to MODELS dictionary key.
+def dataset_path_to_model_key(dataset_path: str) -> str:
+    """Infer model key from dataset path.
     
     Examples:
-        data/text-wikitext2 -> text
-        data/text-tinystories -> text-tiny
-        data/arc-aug-1000 -> arc
+        datasets/wikitext2 -> text
+        data/vision-cifar10 -> vision
+        data/arc-capsules -> arc
+        datasets/multimodal_unified -> multimodal
     """
     dataset_name = dataset_path.split('/')[-1] if '/' in dataset_path else dataset_path
     
-    # Direct mapping
-    if 'wikitext' in dataset_name:
+    # Direct mapping (only 4 models)
+    if 'wikitext' in dataset_name or 'text' in dataset_name:
         return 'text'
-    elif 'tinystories' in dataset_name:
-        return 'text-tiny'
     elif 'arc' in dataset_name:
         return 'arc'
-    elif 'code' in dataset_name or 'python' in dataset_name:
-        return 'code'
     elif 'cifar' in dataset_name or 'vision' in dataset_name:
         return 'vision'
-    elif 'alpaca' in dataset_name:
-        return 'alpaca'
-    elif 'sharegpt' in dataset_name:
-        return 'sharegpt'
+    elif 'multimodal' in dataset_name or 'unified' in dataset_name:
+        return 'multimodal'
     else:
         # Fallback: return first matching key
         for key in MODELS.keys():
