@@ -529,7 +529,11 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False):
     # Add arguments
     for key, value in args.items():
         flag = f"--{key.replace('_', '-')}"
-        if isinstance(value, list):
+        if isinstance(value, bool):
+            # Boolean flags: only add flag name if True, skip if False
+            if value:
+                cmd.append(flag)
+        elif isinstance(value, list):
             cmd.extend([flag] + value)
         else:
             cmd.extend([flag, str(value)])
