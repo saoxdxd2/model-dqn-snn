@@ -378,11 +378,11 @@ def build(config: MultimodalDatasetConfig):
     builder = MultimodalDatasetBuilder(config)
     dataset = builder.build_dataset()
     
-    # Post-processing pipeline
-    _post_process(config, dataset)
-    
-    # Save
+    # Save FIRST (so post-processing can read the files)
     builder.save(dataset, config.output_dir)
+    
+    # Post-processing pipeline (concept expansion, quality scoring)
+    _post_process(config, dataset)
     
     # Print summary
     train_size = dataset['train'].get('sketches', torch.empty(0)).shape[0] if 'sketches' in dataset['train'] else len(dataset['train']) if isinstance(dataset['train'], list) else 0
@@ -488,10 +488,11 @@ def build_composite(
     """Build composite multimodal dataset from multiple sources."""
     config = MultimodalDatasetConfig(
         source_paths=sources,
-        output_dir=output_dir,
+        output_dir=output_dir,  # Pass through CLI argument
         include_text=True,
         include_images=True,
         include_grids=True,
+        use_capsules=True,  # Enable capsule encoding
         num_concepts=num_concepts,
         target_capsules=target_capsules,
         enable_quality_scoring=enable_quality_scoring
