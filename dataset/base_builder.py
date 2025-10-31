@@ -85,45 +85,54 @@ class BaseDatasetBuilder(ABC):
         return [sample]  # No augmentation by default
     
     def build_dataset(self) -> Dict[str, Any]:
-        """
-        Main pipeline: load → preprocess → augment → encode → save.
-        """
-        print(f"\n🔨 Building dataset...")
+        """Main pipeline: load → preprocess → augment → encode (chunked for memory)."""
+        print("\n🔨 Building dataset...")
         
-        # Load raw data
-        print(f"📥 Loading raw data...")
-        self.samples = self.load_raw_data()
-        print(f"   Loaded {len(self.samples)} samples")
+        # Load
+        print("📥 Loading raw data...")
+        raw_samples = self.load_raw_data()
+        print(f"   Loaded {len(raw_samples)} samples")
         
         # Preprocess
-        print(f"⚙️  Preprocessing...")
-        self.samples = [self.preprocess_sample(s) for s in self.samples]
+        print("⚙️  Preprocessing...")
+        processed = [self.preprocess_sample(s) for s in raw_samples]
+        del raw_samples  # Free memory
         
         # Augment
+        print("🔄 Augmenting...")
         if getattr(self.config, 'augment', False):
-            print(f"🔄 Augmenting...")
             augmented = []
-            for sample in self.samples:
+            for sample in processed:
                 augmented.extend(self.augment_sample(sample))
-            self.samples = augmented
-            print(f"   Augmented to {len(self.samples)} samples")
+            del processed  # Free memory
+        else:
+            augmented = processed
+        print(f"   Augmented to {len(augmented)} samples")
         
-        # Split train/test
+        # Split
         train_split = getattr(self.config, 'train_split', 0.9)
-        split_idx = int(len(self.samples) * train_split)
-        train_samples = self.samples[:split_idx]
-        test_samples = self.samples[split_idx:]
+        split_idx = int(len(augmented) * train_split)
+        train_data = augmented[:split_idx]
+        test_data = augmented[split_idx:]
+        del augmented  # Free memory immediately after split
+        print(f"   Train: {len(train_data)}, Test: {len(test_data)}")
         
-        print(f"   Train: {len(train_samples)}, Test: {len(test_samples)}")
-        
-        # Encode to capsules
+        # Encode with chunked processing to prevent RAM leak
         use_capsules = getattr(self.config, 'use_capsules', True)
         if use_capsules:
-            print(f"🧬 Encoding to HESC capsules...")
-            train_data = self.encode_to_capsules(train_samples)
-            test_data = self.encode_to_capsules(test_samples)
+            print("🧬 Encoding to HESC capsules...")
+            train_encoded = self._encode_chunked(train_data, "train")
+            del train_data  # Critical: free train data before encoding test
+            
+            import gc
+            gc.collect()
+            
+            test_encoded = self._encode_chunked(test_data, "test")
+            del test_data  # Free test data
+            gc.collect()
         else:
-            print(f"🔢 Encoding to tokens...")
+            train_encoded = {'samples': train_data}
+            test_encoded = {'samples': test_data}
             train_data = self.encode_to_tokens(train_samples)
             test_data = self.encode_to_tokens(test_samples)
         
@@ -132,6 +141,54 @@ class BaseDatasetBuilder(ABC):
             'test': test_data,
             'metadata': self.create_metadata(train_data)
         }
+    
+    def _encode_chunked(self, samples: List[DataSample], split_name: str) -> Dict[str, torch.Tensor]:
+        """Encode in chunks, processing and freeing memory incrementally."""
+        if len(samples) == 0:
+            return {'sketches': torch.empty(0, getattr(self.config, 'target_capsules', 12), getattr(self.config, 'hidden_size', 768))}
+        
+        # Process in large chunks to prevent holding all samples in memory
+        chunk_size = 5000  # Process 5000 samples at a time
+        all_chunks = []
+        
+        import gc
+        from tqdm import tqdm
+        
+        num_chunks = (len(samples) + chunk_size - 1) // chunk_size
+        print(f"   Processing {len(samples)} {split_name} samples in {num_chunks} chunks...")
+        
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min(start_idx + chunk_size, len(samples))
+            
+            # Process only this chunk
+            chunk_samples = samples[start_idx:end_idx]
+            chunk_encoded = self.encode_to_capsules(chunk_samples)
+            
+            all_chunks.append(chunk_encoded)
+            
+            # Clear chunk from memory
+            del chunk_samples
+            gc.collect()
+            
+            if chunk_idx % 2 == 0:  # Every 2 chunks
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        # Concatenate all chunks
+        if len(all_chunks) == 1:
+            return all_chunks[0]
+        
+        result = {}
+        for key in all_chunks[0].keys():
+            tensors = [chunk[key] for chunk in all_chunks if key in chunk and chunk[key].numel() > 0]
+            if tensors:
+                result[key] = torch.cat(tensors, dim=0)
+        
+        del all_chunks
+        gc.collect()
+        
+        return result
     
     def encode_to_capsules(self, samples: List[DataSample]) -> Dict[str, torch.Tensor]:
         """
@@ -152,58 +209,53 @@ class BaseDatasetBuilder(ABC):
                 capsule_grid_shape=getattr(self.config, 'capsule_grid_shape', (3, 4))
             )
             self.encoder.eval()
-            
-            if torch.cuda.is_available():
-                self.encoder = self.encoder.to('cuda')
-                print("🚀 GPU mode enabled")
-            else:
-                self.encoder = self.encoder.to('cpu')
+            self.encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Encoding with GPU optimization - process in chunks to prevent RAM leak
-        batch_size = 16 if torch.cuda.is_available() else 4  # Optimal for CLIP
-        chunk_size = 1000  # Process 1000 samples at a time
-        
-        print(f"⚡ Encoding {len(samples)} samples with batch_size={batch_size}")
+        # Process in chunks to prevent RAM accumulation from text list
+        batch_size = 4
+        chunk_size = 500  # Consolidate every 500 samples
         
         from tqdm import tqdm
         import gc
         
+        # Initialize result tensors
         result_chunks = {'sketches': [], 'checksums': [], 'children': []}
+        temp_data = {'sketches': [], 'checksums': [], 'children': []}
         
-        # Process in chunks to avoid RAM accumulation
-        num_chunks = (len(samples) + chunk_size - 1) // chunk_size
-        for chunk_idx in range(num_chunks):
-            chunk_start = chunk_idx * chunk_size
-            chunk_end = min(chunk_start + chunk_size, len(samples))
-            chunk_samples = samples[chunk_start:chunk_end]
+        # Process samples without creating full text list (prevents RAM leak)
+        total_samples = len(samples)
+        for i in tqdm(range(0, total_samples, batch_size), desc="Encoding capsules"):
+            # Convert only current batch to text (critical for RAM)
+            batch_texts = [self._sample_to_text(s) for s in samples[i:i+batch_size]]
             
-            # Convert only this chunk to text
-            texts = [self._sample_to_text(s) for s in chunk_samples]
+            with torch.no_grad():
+                batch_result = self.encoder(batch_texts, return_children=True)
             
-            # Encode chunk
-            temp_data = {'sketches': [], 'checksums': [], 'children': []}
+            # Clear batch texts immediately
+            del batch_texts
             
-            pbar = tqdm(range(0, len(texts), batch_size), desc=f"Chunk {chunk_idx+1}/{num_chunks}", leave=True)
-            for i in pbar:
-                with torch.no_grad():
-                    batch_result = self.encoder(texts[i:i+batch_size], return_children=True)
-                
-                for key in temp_data:
-                    if key in batch_result and batch_result[key] is not None:
-                        temp_data[key].append(batch_result[key].cpu())
-                
-                del batch_result
-            
-            # Concatenate chunk
+            # Move to CPU immediately and append
             for key in temp_data:
-                if temp_data[key]:
-                    result_chunks[key].append(torch.cat(temp_data[key], dim=0))
+                if key in batch_result and batch_result[key] is not None:
+                    temp_data[key].append(batch_result[key].cpu())
             
-            # Clear memory
-            del texts, chunk_samples, temp_data
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            del batch_result
+            
+            # Concatenate chunks periodically to free intermediate lists
+            if len(temp_data['sketches']) >= chunk_size // batch_size:
+                for key in temp_data:
+                    if temp_data[key]:
+                        result_chunks[key].append(torch.cat(temp_data[key], dim=0))
+                        temp_data[key] = []  # Clear temp list
+                
+                gc.collect()  # Force garbage collection
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        # Final concatenation of remaining data
+        for key in temp_data:
+            if temp_data[key]:
+                result_chunks[key].append(torch.cat(temp_data[key], dim=0))
         
         # Concatenate all chunks into final result
         result = {k: torch.cat(v, dim=0) if v else torch.empty(0) for k, v in result_chunks.items()}
