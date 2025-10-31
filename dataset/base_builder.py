@@ -93,10 +93,22 @@ class BaseDatasetBuilder(ABC):
         raw_samples = self.load_raw_data()
         print(f"   Loaded {len(raw_samples)} samples")
         
-        # Preprocess
+        # Preprocess in batches to prevent memory accumulation
         print("⚙️  Preprocessing...")
-        processed = [self.preprocess_sample(s) for s in raw_samples]
+        batch_size = 1000
+        processed = []
+        
+        import gc
+        for i in range(0, len(raw_samples), batch_size):
+            batch = [self.preprocess_sample(s) for s in raw_samples[i:i+batch_size]]
+            processed.extend(batch)
+            
+            # Periodic cleanup
+            if i % 5000 == 0:
+                gc.collect()
+        
         del raw_samples  # Free memory
+        gc.collect()
         
         # Augment
         print("🔄 Augmenting...")

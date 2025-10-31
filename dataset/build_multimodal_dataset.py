@@ -323,11 +323,16 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                     # Parse as standard ARC format
                     for split in ['train', 'test']:
                         for idx, example in enumerate(task_data.get(split, [])):
+                            output = example.get('output')
+                            # Convert output to numpy array if it's a list
+                            if isinstance(output, list):
+                                output = np.array(output)
+                            
                             samples.append(DataSample(
                                 sample_id=f"{task_id}_{split}_{idx}",
                                 modality=ModalityType.GRID,
                                 grid=np.array(example.get('input', [])),
-                                label=example.get('output'),
+                                label=output,
                                 metadata={'task_id': task_id, 'split': split}
                             ))
             
