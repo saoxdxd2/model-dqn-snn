@@ -463,8 +463,26 @@ def build_maze(source_repo: str = "sapientinc/maze-30x30-hard-1k", output_dir: s
     quick_build('maze', sources, output_dir)
 
 @cli.command()
-def build_composite(sources: List[str], output_dir: str = "datasets/composite"):
-    quick_build('composite', sources, output_dir)
+def build_composite(
+    sources: List[str], 
+    output_dir: str = "datasets/composite",
+    augment: bool = True,
+    num_concepts: int = 2048,
+    target_capsules: int = 12,
+    enable_quality_scoring: bool = True
+):
+    """Build composite multimodal dataset from multiple sources."""
+    config = MultimodalDatasetConfig(
+        source_paths=sources,
+        output_dir=output_dir,
+        include_text=True,
+        include_images=True,
+        include_grids=True,
+        num_concepts=num_concepts,
+        target_capsules=target_capsules,
+        enable_quality_scoring=enable_quality_scoring
+    )
+    build(config)
 
 
 if __name__ == "__main__":
