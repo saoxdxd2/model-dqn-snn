@@ -155,20 +155,18 @@ class BaseDatasetBuilder(ABC):
             
             if torch.cuda.is_available():
                 self.encoder = self.encoder.to('cuda')
-                # Enable mixed precision for 2x speedup
-                self.encoder = self.encoder.half()  # FP16 inference
-                print("🚀 GPU optimizations enabled: FP16 mixed precision")
+                print("🚀 GPU mode enabled")
             else:
                 self.encoder = self.encoder.to('cpu')
         
         # Unified conversion: all modalities → text representation
         texts = [self._sample_to_text(s) for s in samples]
         
-        # Encoding with GPU optimization (6x speedup target)
-        batch_size = 32 if torch.cuda.is_available() else 4  # 8x larger for GPU
+        # Encoding with GPU optimization
+        batch_size = 16 if torch.cuda.is_available() else 4  # Optimal for CLIP
         chunk_size = 500  # Concatenate every 500 samples to prevent RAM leak
         
-        print(f"⚡ Encoding with batch_size={batch_size} (GPU optimized)")
+        print(f"⚡ Encoding with batch_size={batch_size}")
         
         from tqdm import tqdm
         import gc
@@ -178,15 +176,13 @@ class BaseDatasetBuilder(ABC):
         temp_data = {'sketches': [], 'checksums': [], 'children': []}
         
         for i in tqdm(range(0, len(texts), batch_size), desc="Encoding capsules"):
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            with torch.no_grad():
                 batch_result = self.encoder(texts[i:i+batch_size], return_children=True)
             
-            # Move to CPU immediately and append (convert back from FP16)
+            # Move to CPU immediately and append
             for key in temp_data:
                 if key in batch_result and batch_result[key] is not None:
-                    # Convert FP16 to FP32 on CPU
-                    tensor = batch_result[key].float().cpu() if batch_result[key].dtype == torch.float16 else batch_result[key].cpu()
-                    temp_data[key].append(tensor)
+                    temp_data[key].append(batch_result[key].cpu())
             
             del batch_result
             
