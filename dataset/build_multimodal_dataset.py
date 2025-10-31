@@ -426,7 +426,7 @@ PRESETS = {
 }
 
 @cli.command()
-def quick_build(preset: str, sources: List[str], output_dir: str, **kwargs):
+def quick_build(preset: str, sources: List[str], output_dir: str):
     """Quick build with preset config (arc, text, image, maze, composite)."""
     if preset not in PRESETS:
         print(f"❌ Unknown preset: {preset}. Available: {list(PRESETS.keys())}")
@@ -435,36 +435,36 @@ def quick_build(preset: str, sources: List[str], output_dir: str, **kwargs):
     config = MultimodalDatasetConfig(
         source_paths=sources,
         output_dir=output_dir,
-        **{**PRESETS[preset], **kwargs}
+        **PRESETS[preset]
     )
     build(config)
 
 # Legacy command aliases
 @cli.command()
-def build_arc(input_file_prefix: str = "kaggle/combined/arc-agi", output_dir: str = "data/arc-capsules", **kw):
+def build_arc(input_file_prefix: str = "kaggle/combined/arc-agi", output_dir: str = "data/arc-capsules"):
     import glob
-    quick_build('arc', glob.glob(f"{input_file_prefix}*.json"), output_dir, **kw)
+    quick_build('arc', glob.glob(f"{input_file_prefix}*.json"), output_dir)
 
 @cli.command()
-def build_text(input_file: str = "wikitext2", output_dir: str = "datasets/wikitext2", **kw):
-    quick_build('text', [input_file], output_dir, **kw)
+def build_text(input_file: str = "wikitext2", output_dir: str = "datasets/wikitext2"):
+    quick_build('text', [input_file], output_dir)
 
 @cli.command()
-def build_image(dataset_name: str = "cifar10", output_dir: str = "datasets/cifar10", **kw):
-    quick_build('image', [dataset_name], output_dir, **kw)
+def build_image(dataset_name: str = "cifar10", output_dir: str = "datasets/cifar10"):
+    quick_build('image', [dataset_name], output_dir)
 
 @cli.command()
-def build_maze(source_repo: str = "sapientinc/maze-30x30-hard-1k", output_dir: str = "data/maze", **kw):
+def build_maze(source_repo: str = "sapientinc/maze-30x30-hard-1k", output_dir: str = "data/maze"):
     try:
         from huggingface_hub import hf_hub_download
         sources = [hf_hub_download(source_repo, f"{s}.csv", repo_type="dataset") for s in ['train', 'test']]
     except:
         sources = [f"{output_dir}/{s}.csv" for s in ['train', 'test']]
-    quick_build('maze', sources, output_dir, **kw)
+    quick_build('maze', sources, output_dir)
 
 @cli.command()
-def build_composite(sources: List[str], output_dir: str = "datasets/composite", **kw):
-    quick_build('composite', sources, output_dir, **kw)
+def build_composite(sources: List[str], output_dir: str = "datasets/composite"):
+    quick_build('composite', sources, output_dir)
 
 
 if __name__ == "__main__":
