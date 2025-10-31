@@ -117,8 +117,176 @@ class TrainState:
     last_checkpoint_step: int = 0  # Track last saved checkpoint
 
 
-def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
-    dataset_paths = config.data_paths_test if len(config.data_paths_test)>0 and split=="test" else config.data_paths
+def detect_dataset_features(data_path: str) -> dict:
+    """Auto-detect dataset type and features from data."""
+    import torch
+    
+    features = {
+        'is_capsule': False,
+        'is_vision': False,
+        'is_text': False,
+        'has_checksums': False,
+        'has_children': False,
+        'enable_dqn': False,
+        'enable_expansion': False
+    }
+    
+    # Try loading as capsule dataset
+    capsule_paths = [
+        data_path.replace('semantic_embeddings', 'capsule_dataset'),
+        os.path.join(data_path, 'capsule_dataset.pt')
+    ]
+    
+    for path in capsule_paths:
+        if os.path.exists(path):
+            try:
+                data = torch.load(path, map_location='cpu')
+                if 'sketches' in data:
+                    features['is_capsule'] = True
+                    features['has_checksums'] = 'checksums' in data
+                    features['has_children'] = 'children' in data
+                    features['enable_expansion'] = features['has_children']
+                    features['enable_dqn'] = features['enable_expansion']
+                    return features
+            except Exception:
+                pass
+    
+    # Detect from path patterns
+    path_lower = data_path.lower()
+    if 'arc' in path_lower or 'vision' in path_lower or 'cifar' in path_lower or 'image' in path_lower:
+        features['is_vision'] = True
+    elif 'text' in path_lower or 'wikitext' in path_lower or 'stories' in path_lower:
+        features['is_text'] = True
+    
+    return features
+
+
+def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str = 'train'):
+    """Unified dataset loading with auto-detection."""
+    
+    # Auto-detect dataset features
+    dataset_path = config.data_paths[0] if config.data_paths else ''
+    features = detect_dataset_features(dataset_path)
+    
+    # Override config if not explicitly set
+    semantic_mode = getattr(config, 'semantic_mode', features['is_capsule'])
+    
+    if rank == 0 and features['is_capsule']:
+        print(f"\n🔍 Auto-detected HESC capsule dataset")
+        print(f"   Checksums: {features['has_checksums']}")
+        print(f"   Children: {features['has_children']}")
+        print(f"   DQN recommended: {features['enable_dqn']}")
+    
+    if semantic_mode:
+        # Load precomputed HESC capsule dataset
+        import torch
+        
+        # Try new capsule format first, fallback to legacy semantic
+        capsule_path = config.semantic_dataset.replace('semantic_embeddings', 'capsule_dataset') if split == 'train' else config.semantic_eval_dataset.replace('semantic_embeddings', 'capsule_dataset')
+        
+        if os.path.exists(capsule_path):
+            # New HESC format
+            print(f"\n📦 Loading HESC capsules: {capsule_path}")
+            data = torch.load(capsule_path)
+            sketches = data['sketches']  # [N, k, hidden_size]
+            checksums = data.get('checksums', None)  # [N, k, checksum_dim]
+            children = data.get('children', None)  # [N, k, m, hidden_size]
+            
+            print(f"   Sketches: {sketches.shape}")
+            if children is not None:
+                print(f"   Children: {children.shape}")
+            print(f"   Compression: ~{sketches.shape[1]} capsules (expandable)")
+            
+            # Create metadata
+            # Concept vocab: num_concepts + 4 control symbols
+            num_concepts = getattr(config.arch, 'num_concepts', 2048)
+            vocab_size = num_concepts + 4  # <EXPAND>, <STOP>, <MERGE>, <PAD>
+            
+            metadata = PuzzleDatasetMetadata(
+                seq_len=sketches.shape[1],
+                vocab_size=vocab_size,
+                pad_id=0,
+                ignore_label_id=-100,
+                blank_identifier_id=0,
+                num_puzzle_identifiers=0,
+                total_groups=sketches.shape[0],
+                mean_puzzle_examples=1.0,
+                total_puzzles=sketches.shape[0],
+                sets=["all"]
+            )
+            
+            # Dataset with all capsule components
+            from torch.utils.data import TensorDataset
+            if children is not None and checksums is not None:
+                dataset = TensorDataset(sketches, checksums, children)
+            elif checksums is not None:
+                dataset = TensorDataset(sketches, checksums)
+            else:
+                dataset = TensorDataset(sketches)
+            
+            dataloader = DataLoader(
+                dataset,
+                batch_size=config.global_batch_size // world_size,
+                shuffle=(split == 'train'),
+                num_workers=0,
+                pin_memory=True
+            )
+            
+            return dataloader, metadata
+        
+        else:
+            # Fallback: legacy semantic embeddings
+            semantic_path = config.semantic_dataset if split == 'train' else config.semantic_eval_dataset
+            
+            if not os.path.exists(semantic_path):
+                raise FileNotFoundError(
+                    f"Capsule dataset not found: {capsule_path}\n"
+                    f"Build it: python dataset/build_text_dataset.py --semantic_mode --input_file wikitext2 --output_dir datasets/wikitext2"
+                )
+            
+            print(f"\n📦 Loading legacy semantic embeddings: {semantic_path}")
+            data = torch.load(semantic_path)
+            embeddings = data.get('embeddings', data.get('sketches'))  # [N, k, hidden_size]
+            print(f"   Shape: {embeddings.shape}")
+            
+            # Use concept vocab even for legacy mode
+            num_concepts = getattr(config.arch, 'num_concepts', 2048)
+            vocab_size = num_concepts + 4
+            
+            metadata = PuzzleDatasetMetadata(
+                seq_len=embeddings.shape[1],
+                vocab_size=vocab_size,
+                pad_id=0,
+                ignore_label_id=-100,
+                blank_identifier_id=0,
+                num_puzzle_identifiers=0,
+                total_groups=embeddings.shape[0],
+                mean_puzzle_examples=1.0,
+                total_puzzles=embeddings.shape[0],
+                sets=["all"]
+            )
+            
+            from torch.utils.data import TensorDataset
+            dataset = TensorDataset(embeddings)
+            dataloader = DataLoader(
+                dataset,
+                batch_size=config.global_batch_size // world_size,
+                shuffle=(split == 'train'),
+                num_workers=0,
+                pin_memory=True
+            )
+            
+            return dataloader, metadata
+    
+    # Token-based mode (original logic)
+    dataset_paths = config.data_paths if split == 'train' else config.data_paths_test
+    
+    kwargs = {}
+    if hasattr(config, 'group_batch_size') and config.group_batch_size is not None:
+        kwargs['group_batch_size'] = config.group_batch_size
+    
+    if hasattr(config, 'groups_per_batch'):
+        kwargs['groups_per_batch'] = config.groups_per_batch
     
     try:
         dataset = PuzzleDataset(PuzzleDatasetConfig(
@@ -186,10 +354,31 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     # __pydantic_extra__ contains all extra YAML fields (causal, input_vocab_size, etc.)
     # Dataset metadata overrides seq_len/vocab_size/num_puzzle_identifiers
     
+    # Auto-detect dataset type and enable appropriate training techniques
+    semantic_mode = getattr(config, 'semantic_mode', False)
+    enable_capsule_expansion = getattr(config.arch, 'enable_capsule_expansion', False)
+    
+    if rank == 0:
+        print(f"\n🔍 Dataset Analysis:")
+        print(f"   Semantic/Capsule mode: {semantic_mode}")
+        print(f"   Capsule expansion: {enable_capsule_expansion}")
+    
     # Filter out keys that will be explicitly set to avoid duplicate keyword argument error
     # IMPORTANT: Keep input_vocab_size from YAML (for vision with separate input/output vocabs)
     extra_config = {k: v for k, v in config.arch.__pydantic_extra__.items() 
                    if k not in ['batch_size', 'vocab_size', 'seq_len', 'num_puzzle_identifiers']}
+    
+    # Auto-enable DQN for capsule datasets with expansion
+    if semantic_mode and enable_capsule_expansion:
+        if 'enable_dqn' not in extra_config or not extra_config['enable_dqn']:
+            if rank == 0:
+                print(f"   ⚙️  Auto-enabling DQN for capsule expansion control")
+            extra_config['enable_dqn'] = True
+            # Set expansion-friendly DQN params
+            if 'dqn_loss_weight' not in extra_config:
+                extra_config['dqn_loss_weight'] = 0.5
+            if 'enable_per' not in extra_config:
+                extra_config['enable_per'] = True  # Prioritized experience replay
     
     model_cfg = dict(
         **extra_config,
@@ -306,8 +495,35 @@ def cosine_schedule_with_warmup_lr_lambda(
 
 
 def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+    # Auto-adjust hyperparameters based on dataset characteristics
+    semantic_mode = getattr(config, 'semantic_mode', False)
+    dataset_size = train_metadata.total_groups
+    
+    if rank == 0:
+        print(f"\n⚙️  Auto-tuning hyperparameters:")
+        print(f"   Dataset size: {dataset_size:,} samples")
+    
+    # Adjust learning rate based on dataset size and mode
+    adjusted_lr = config.lr
+    if semantic_mode:
+        # Capsule mode: can use higher LR due to compressed inputs
+        adjusted_lr = config.lr * 1.5
+        if rank == 0:
+            print(f"   LR boost for capsule mode: {config.lr:.2e} → {adjusted_lr:.2e}")
+    elif dataset_size < 1000:
+        # Small dataset: reduce LR to prevent overfitting
+        adjusted_lr = config.lr * 0.5
+        if rank == 0:
+            print(f"   LR reduction for small dataset: {config.lr:.2e} → {adjusted_lr:.2e}")
+    
+    # Store adjusted hyperparameters
+    config.lr = adjusted_lr
+    
     # Estimated total training steps
     total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
+    
+    if rank == 0:
+        print(f"   Total training steps: {total_steps:,}")
 
     # Model
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)
@@ -580,8 +796,43 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     if train_state.step > train_state.total_steps:  # At most train_total_steps
         return
 
-    # To device
-    batch = {k: v.cuda() for k, v in batch.items()}
+    # Handle HESC capsules (tuple) vs dict batches
+    if isinstance(batch, tuple):
+        # HESC mode: batch from TensorDataset
+        if len(batch) == 3:
+            # Full capsule data: (sketches, checksums, children)
+            sketches, checksums, children = batch
+            batch = {
+                'input': sketches.cuda(),
+                'capsule_sketches': sketches.cuda(),
+                'capsule_checksums': checksums.cuda(),
+                'capsule_children': children.cuda(),
+                'labels': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
+                'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
+                'num_expansions': torch.zeros(sketches.shape[0], dtype=torch.long).cuda()
+            }
+        elif len(batch) == 2:
+            # Capsules without children: (sketches, checksums)
+            sketches, checksums = batch
+            batch = {
+                'input': sketches.cuda(),
+                'capsule_sketches': sketches.cuda(),
+                'capsule_checksums': checksums.cuda(),
+                'labels': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
+                'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
+                'num_expansions': torch.zeros(sketches.shape[0], dtype=torch.long).cuda()
+            }
+        else:
+            # Legacy semantic: (embeddings,)
+            embeddings = batch[0].cuda()
+            batch = {
+                'input': embeddings,
+                'labels': torch.zeros(embeddings.shape[0], dtype=torch.long).cuda(),
+                'puzzle_identifiers': torch.zeros(embeddings.shape[0], dtype=torch.long).cuda()
+            }
+    else:
+        # Standard token mode: batch is dict
+        batch = {k: v.cuda() for k, v in batch.items()}
 
     # Init carry if it is None
     if train_state.carry is None:
@@ -686,8 +937,37 @@ def evaluate(
             if rank == 0:
                 print(f"Processing batch {processed_batches}: {set_name}")
             
-            # To device
-            batch = {k: v.cuda() for k, v in batch.items()}
+            # Handle capsule mode (same as train_batch)
+            if isinstance(batch, tuple):
+                if len(batch) == 3:
+                    sketches, checksums, children = batch
+                    batch = {
+                        'input': sketches.cuda(),
+                        'capsule_sketches': sketches.cuda(),
+                        'capsule_checksums': checksums.cuda(),
+                        'capsule_children': children.cuda(),
+                        'labels': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
+                        'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).cuda()
+                    }
+                elif len(batch) == 2:
+                    sketches, checksums = batch
+                    batch = {
+                        'input': sketches.cuda(),
+                        'capsule_sketches': sketches.cuda(),
+                        'capsule_checksums': checksums.cuda(),
+                        'labels': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
+                        'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).cuda()
+                    }
+                else:
+                    embeddings = batch[0].cuda()
+                    batch = {
+                        'input': embeddings,
+                        'labels': torch.zeros(embeddings.shape[0], dtype=torch.long).cuda(),
+                        'puzzle_identifiers': torch.zeros(embeddings.shape[0], dtype=torch.long).cuda()
+                    }
+            else:
+                # Standard dict mode
+                batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 

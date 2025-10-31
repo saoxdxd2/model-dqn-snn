@@ -14,6 +14,15 @@ data_paths_test: []
 
 evaluators: []  # Can add perplexity evaluator later
 
+# HESC capsule mode
+semantic_mode: true
+semantic_dataset: "datasets/wikitext2/capsule_dataset.pt"  # Precomputed capsules
+semantic_eval_dataset: "datasets/wikitext2/capsule_dataset_test.pt"
+
+# Legacy token datasets (fallback)
+text_dataset: "datasets/wikitext2/train_dataset.pt"
+eval_dataset: "datasets/wikitext2/test_dataset.pt"
+
 # Hyperparams - Training (optimized for 15GB T4 GPU)
 global_batch_size: 128  # Increased from 32 to utilize GPU memory
 epochs: 5000  # Extended for better convergence on small dataset

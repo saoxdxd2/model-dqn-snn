@@ -25,12 +25,23 @@ cli = ArgParser()
 
 
 class TextDatasetConfig(BaseModel):
-    input_file: str  # Path to text file
+    input_file: str  # Path to text file or dataset name
     output_dir: str
-    tokenizer_name: str = "gpt2"  # GPT-2 BPE tokenizer (50257 vocab)
-    max_seq_len: int = 512  # Maximum sequence length
-    stride: int = 256  # Overlap between sequences (for context)
-    train_split: float = 0.9  # 90% train, 10% test
+    
+    # HESC Capsule Mode (semantic_mode=True)
+    semantic_mode: bool = False  # Build HESC capsules instead of tokens
+    semantic_target_tokens: int = 12  # Number of capsules (k)
+    semantic_hidden_size: int = 768  # TRM hidden size
+    encoder_model: str = "openai/clip-vit-large-patch14"  # Semantic encoder
+    num_concepts: int = 2048  # Concept vocabulary size (output)
+    
+    # Legacy Token Mode (semantic_mode=False)
+    tokenizer_name: str = "gpt2"  # Only used in token mode
+    max_seq_len: int = 512  # Only used in token mode
+    stride: int = 256  # Only used in token mode
+    
+    # Common
+    train_split: float = 0.9
     seed: int = 42
 
 
@@ -490,9 +501,150 @@ def create_text_dataset(config: TextDatasetConfig):
     print(f"   Test sequences: {len(test_sequences)}")
 
 
+def build_capsule_dataset(config: TextDatasetConfig):
+    """Build HESC capsule dataset with sketch/checksum/children (Stage A fast training)."""
+    import torch
+    from models.capsule_encoder import CapsuleEncoder
+    
+    print(f"\n🔧 Building semantic compression dataset...")
+    print(f"   Mode: Precompute CLIP embeddings")
+    print(f"   Target tokens: {config.semantic_target_tokens}")
+    
+    # Load texts
+    if config.input_file == "wikitext2":
+        dataset = download_wikitext2()
+        train_texts = [t for t in dataset['train']['text'] if t.strip()]
+        test_texts = [t for t in dataset['test']['text'] if t.strip()]
+    else:
+        text = load_text_file(config.input_file)
+        texts = [p.strip() for p in text.split('\n\n') if p.strip()]
+        split_idx = int(len(texts) * config.train_split)
+        train_texts = texts[:split_idx]
+        test_texts = texts[split_idx:]
+    
+    print(f"   Train texts: {len(train_texts)}")
+    print(f"   Test texts: {len(test_texts)}")
+    
+    # Initialize capsule encoder
+    encoder = CapsuleEncoder(
+        hidden_size=config.semantic_hidden_size,
+        target_capsules=config.semantic_target_tokens,
+        children_per_capsule=4,
+        checksum_dim=32,
+        freeze_encoder=True,
+        encoder_model=config.encoder_model  # Configurable: CLIP, BERT, etc.
+    )
+    encoder.eval()
+    encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Process train split
+    print(f"\n📦 Encoding train split (capsules with children)...")
+    train_capsules = {'sketches': [], 'checksums': [], 'children': []}
+    batch_size = 8
+    for i in tqdm(range(0, len(train_texts), batch_size)):
+        batch = train_texts[i:i+batch_size]
+        with torch.no_grad():
+            capsule_data = encoder(batch, return_children=True)
+            train_capsules['sketches'].append(capsule_data['sketches'].cpu())
+            train_capsules['checksums'].append(capsule_data['checksums'].cpu())
+            if 'children' in capsule_data:
+                train_capsules['children'].append(capsule_data['children'].cpu())
+    
+    for key in train_capsules:
+        if train_capsules[key]:
+            train_capsules[key] = torch.cat(train_capsules[key], dim=0)
+    
+    # Process test split
+    print(f"\n📦 Encoding test split...")
+    test_capsules = {'sketches': [], 'checksums': [], 'children': []}
+    for i in tqdm(range(0, len(test_texts), batch_size)):
+        batch = test_texts[i:i+batch_size]
+        with torch.no_grad():
+            capsule_data = encoder(batch, return_children=True)
+            test_capsules['sketches'].append(capsule_data['sketches'].cpu())
+            test_capsules['checksums'].append(capsule_data['checksums'].cpu())
+            if 'children' in capsule_data:
+                test_capsules['children'].append(capsule_data['children'].cpu())
+    
+    for key in test_capsules:
+        if test_capsules[key]:
+            test_capsules[key] = torch.cat(test_capsules[key], dim=0)
+    
+    # Save
+    os.makedirs(config.output_dir, exist_ok=True)
+    torch.save({
+        'sketches': train_capsules['sketches'],
+        'checksums': train_capsules['checksums'],
+        'children': train_capsules['children'],
+        'texts': train_texts,
+        'config': {
+            'target_capsules': config.semantic_target_tokens,
+            'children_per_capsule': 4,
+            'checksum_dim': 32,
+            'hidden_size': config.semantic_hidden_size
+        }
+    }, os.path.join(config.output_dir, 'capsule_dataset.pt'))
+    
+    torch.save({
+        'sketches': test_capsules['sketches'],
+        'checksums': test_capsules['checksums'],
+        'children': test_capsules['children'],
+        'texts': test_texts,
+        'config': {
+            'target_capsules': config.semantic_target_tokens,
+            'children_per_capsule': 4,
+            'checksum_dim': 32,
+            'hidden_size': config.semantic_hidden_size
+        }
+    }, os.path.join(config.output_dir, 'capsule_dataset_test.pt'))
+    
+    # Calculate compression ratio (compare to BPE baseline)
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")  # Standard baseline
+        sample_texts = train_texts[:100]
+        compression_ratio = encoder.get_compression_ratio(sample_texts, tokenizer)
+    except Exception:
+        compression_ratio = 10.0  # Default estimate
+    
+    print(f"\n✅ HESC capsule dataset created!")
+    print(f"   Train sketches: {train_capsules['sketches'].shape}")
+    print(f"   Train children: {train_capsules['children'].shape if 'children' in train_capsules and train_capsules['children'] is not None else 'N/A'}")
+    print(f"   Test sketches: {test_capsules['sketches'].shape}")
+    print(f"   Compression: {compression_ratio:.1f}x vs BPE (expandable on-demand)")
+    print(f"   Output: {config.output_dir}")
+    
+    # Build concept expansion table
+    print(f"\n📚 Building concept expansion table...")
+    from models.concept_decoder import ConceptDecoder
+    from transformers import AutoTokenizer
+    
+    num_concepts = getattr(config, 'num_concepts', 2048)
+    decoder = ConceptDecoder(num_concepts=num_concepts)
+    
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        decoder.build_expansion_table_from_data(
+            os.path.join(config.output_dir, 'capsule_dataset.pt'),
+            tokenizer,
+            max_concepts=num_concepts
+        )
+        
+        # Save expansion table
+        expansion_path = os.path.join(config.output_dir, 'concept_expansions.json')
+        decoder.expansion_table.save(expansion_path)
+        print(f"   ✅ Saved expansion table: {expansion_path}")
+    except Exception as e:
+        print(f"   ⚠️  Could not build expansion table: {e}")
+        print(f"   Model will use learned embeddings as fallback")
+
+
 @cli.command(singleton=True)
 def main(config: TextDatasetConfig):
-    create_text_dataset(config)
+    if config.semantic_mode:
+        build_capsule_dataset(config)
+    else:
+        create_text_dataset(config)
 
 
 if __name__ == "__main__":

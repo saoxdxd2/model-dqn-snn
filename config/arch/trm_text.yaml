@@ -5,10 +5,26 @@ loss:
   enable_dqn: False  # Keep simple for initial training
   deep_supervision_steps: 4  # Moderate supervision
 
-# Dataset parameters (CRITICAL - must match tokenizer)
-seq_len: 1023  # Increased from 511 for better context (1024 - 1)
-vocab_size: 50257  # GPT-2 BPE vocab
-batch_size: 128  # Match global_batch_size in cfg_text.yaml
+# Dataset parameters (CRITICAL - HESC: Hierarchical Expandable Semantic Capsules (10-50x compression)
+use_semantic_encoder: true
+freeze_capsule_encoder: true  # Stage A: freeze encoder
+target_capsules: 12  # k coarse capsules (concept-level)
+children_per_capsule: 4  # m children tokens per capsule
+checksum_dim: 32  # Reconstructability signature size
+enable_capsule_expansion: true  # DQN can expand capsules on-demand
+
+# Encoder Configuration (Input: text → capsules)
+encoder_model: "openai/clip-vit-large-patch14"  # Options: CLIP, BERT, RoBERTa, etc.
+
+# Output Configuration (Capsules → Concepts)
+num_concepts: 2048  # Semantic concept vocabulary (vs 50k BPE tokens)
+use_vq_codebook: true  # Vector quantization for discrete concepts
+# Total output vocab = num_concepts + 4 control symbols (<EXPAND>, <STOP>, <MERGE>, <PAD>)
+
+# Legacy fallback (for non-capsule datasets)
+seq_len: 1024
+vocab_size: 2052  # num_concepts + control symbols (overridden at runtime)
+batch_size: 128
 
 # Halting parameters
 halt_exploration_prob: 0.1

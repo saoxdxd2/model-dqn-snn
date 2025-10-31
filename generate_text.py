@@ -31,17 +31,36 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
     model.eval()
     model.to(device)
     
-    return model, config
+    # Check if using concept vocabulary
+    use_concepts = hasattr(model, 'capsule_encoder') and model.capsule_encoder is not None
+    
+    # Load concept decoder if needed
+    decoder = None
+    if use_concepts:
+        from models.concept_decoder import ConceptDecoder
+        num_concepts = getattr(model.config, 'num_concepts', 2048)
+        expansion_table_path = Path(checkpoint_path).parent / "concept_expansions.json"
+        decoder = ConceptDecoder(
+            num_concepts=num_concepts,
+            expansion_table_path=str(expansion_table_path) if expansion_table_path.exists() else None
+        )
+        print(f"\n📚 Concept vocabulary: {num_concepts} concepts")
+        if expansion_table_path.exists():
+            print(f"   Expansion table loaded: {len(decoder.expansion_table.expansions)} mappings")
+    
+    return model, config, decoder
 
 
 def generate_text(
     model,
     tokenizer,
+    decoder,
     prompt: str,
     max_new_tokens: int = 100,
     temperature: float = 1.0,
     top_p: float = 0.9,
     use_act: bool = True,
+    use_capsules: bool = False,
     device: str = "cuda"
 ):
     """
@@ -55,10 +74,18 @@ def generate_text(
         temperature: Sampling temperature (1.0 = default, <1 = more focused)
         top_p: Nucleus sampling threshold
         use_act: Use ACT halting (adaptive cycles per token)
+        use_capsules: Use HESC capsule encoding
         device: cuda or cpu
     """
-    # Encode prompt
-    input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+    # Encode prompt (capsule or token mode)
+    if use_capsules and hasattr(model, 'capsule_encoder'):
+        # HESC mode: encode to capsules
+        capsule_data = model.encode_text([prompt], return_children=True)
+        input_embeddings = capsule_data['sketches'].to(device)  # [1, k, D]
+    else:
+        # Token mode
+        input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+        input_embeddings = input_ids
     
     # Initialize carry
     batch = {
@@ -86,24 +113,39 @@ def generate_text(
             
             # Get logits for last token
             logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-            next_token_logits = logits[:, -1, :] / temperature
-            
-            # Apply top-p (nucleus) sampling
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+            # Handle concept vocabulary vs BPE
+            if hasattr(model, 'lm_head') and hasattr(model.lm_head, 'total_vocab'):
+                # Concept vocabulary mode
+                concept_id = torch.argmax(logits, dim=-1).item()
+                generated_tokens.append(concept_id)
                 
-                # Remove tokens with cumulative prob > top_p
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                sorted_indices_to_remove[..., 0] = 0
+                # Check for control symbols
+                if concept_id >= model.lm_head.num_concepts:
+                    control_type = model.lm_head.decode_token(concept_id)
+                    if '<STOP>' in control_type:
+                        break
+            else:
+                # BPE token mode
+                if temperature > 0:
+                    probs = torch.softmax(logits / temperature, dim=-1)
+                    
+                    # Top-p sampling
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                    
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    
+                    indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                    probs[indices_to_remove] = 0
+                    probs = probs / probs.sum()
+                    
+                    next_token = torch.multinomial(probs, num_samples=1)
+                else:
+                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
                 
-                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-                next_token_logits[indices_to_remove] = float('-inf')
-            
-            # Sample next token
-            probs = torch.softmax(next_token_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).item()
+                generated_tokens.append(next_token.item())
             
             # Track ACT steps
             if use_act:
@@ -117,15 +159,34 @@ def generate_text(
             generated_tokens.append(next_token)
             carry = carry_out
     
-    # Decode
-    generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+    # Decode based on mode
+    if hasattr(model, 'lm_head') and hasattr(model.lm_head, 'total_vocab'):
+        # Concept vocabulary mode - use ConceptDecoder
+        if decoder is None:
+            print("Warning: No decoder provided for concept mode, returning concept IDs")
+            generated_text = f"Concept IDs: {generated_tokens}"
+        else:
+            # Build control symbols and expand mask tensors
+            concept_ids_tensor = torch.tensor([generated_tokens], device=device)
+            control_symbols = (concept_ids_tensor >= model.lm_head.num_concepts).long()
+            expand_mask = torch.zeros_like(concept_ids_tensor, dtype=torch.bool)
+            
+            # Decode concept sequence to text
+            decoded_texts = decoder.decode_sequence(
+                concept_ids_tensor,
+                control_symbols,
+                expand_mask,
+                tokenizer
+            )
+            generated_text = decoded_texts[0] if decoded_texts else ""
+    else:
+        # BPE token mode - standard decoding
+        generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
     
+    # Stats
     if use_act and act_steps:
         avg_steps = sum(act_steps) / len(act_steps)
-        print(f"\n📊 ACT Statistics:")
-        print(f"   Average cycles per token: {avg_steps:.2f}")
-        print(f"   Total tokens: {len(act_steps)}")
-        print(f"   Efficiency gain: {(16 - avg_steps) / 16 * 100:.1f}% (vs max 16 cycles)")
+        print(f"\nACT Stats: Avg {avg_steps:.1f} steps/token, Total: {sum(act_steps)} steps")
     
     return generated_text
 
@@ -133,40 +194,48 @@ def generate_text(
 def main():
     parser = argparse.ArgumentParser(description="Generate text with TRM")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
-    parser.add_argument("--tokenizer", type=str, default="gpt2", help="Tokenizer name")
-    parser.add_argument("--prompt", type=str, default="Once upon a time", help="Text prompt")
-    parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens to generate")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
-    parser.add_argument("--top-p", type=float, default=0.9, help="Nucleus sampling threshold")
-    parser.add_argument("--device", type=str, default="cuda", help="Device: cuda or cpu")
-    parser.add_argument("--no-act", action="store_true", help="Disable ACT halting")
+    parser.add_argument("--prompt", type=str, default="Once upon a time", help="Prompt text")
+    parser.add_argument("--max_tokens", type=int, default=100, help="Max tokens to generate")
+    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
+    parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus sampling threshold")
+    parser.add_argument("--use_act", action="store_true", help="Use ACT halting")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     
     args = parser.parse_args()
     
-    # Load model
+    # Load model and decoder
     print(f"Loading model from {args.checkpoint}...")
-    model, config = load_model(args.checkpoint, args.device)
+    model, config, decoder = load_model(args.checkpoint, args.device)
     
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    # Load tokenizer (for BPE decoding even in concept mode)
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
     
-    print(f"\n🎯 Prompt: {args.prompt}")
-    print(f"⚙️  Temperature: {args.temperature}, Top-p: {args.top_p}")
-    print(f"🔄 ACT: {'Enabled' if not args.no_act else 'Disabled'}\n")
+    # Detect mode
+    use_capsules = hasattr(model, 'capsule_encoder') and model.capsule_encoder is not None
     
     # Generate
+    print(f"\nPrompt: {args.prompt}")
+    print(f"Mode: {'Concept Vocabulary' if use_capsules else 'BPE Tokens'}")
+    print(f"\nGenerating...")
+    
     generated = generate_text(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=args.prompt,
+        model,
+        tokenizer,
+        decoder,
+        args.prompt,
         max_new_tokens=args.max_tokens,
         temperature=args.temperature,
         top_p=args.top_p,
-        use_act=not args.no_act,
+        use_act=args.use_act,
+        use_capsules=use_capsules,
         device=args.device
     )
     
-    print(f"\n📝 Generated text:\n{generated}\n")
+    print(f"\n{'='*70}")
+    print(f"Generated Text:")
+    print(f"{'='*70}")
+    print(generated)
+    print(f"{'='*70}")
 
 
 if __name__ == "__main__":

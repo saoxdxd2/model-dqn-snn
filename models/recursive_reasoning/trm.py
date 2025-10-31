@@ -218,24 +218,40 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.embed_scale = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        # Support separate input/output vocabularies (for vision classification)
-        # input_vocab_size: patch tokens (e.g., 2048 for VQ-VAE)
-        # output_vocab_size: classes (e.g., 10 for CIFAR-10)
-        # For text: input_vocab_size not set, so default to vocab_size
-        input_vocab_size = getattr(self.config, 'input_vocab_size', None)
-        if input_vocab_size is None:
-            input_vocab_size = self.config.vocab_size
-        output_vocab_size = self.config.vocab_size  # Always use vocab_size for output
-        
-        print(f"\n📊 Vocabulary Config:")
-        print(f"   Input vocab: {input_vocab_size}")
-        print(f"   Output vocab: {output_vocab_size}")
-        print(f"   Hidden size: {self.config.hidden_size}")
-        
-        # Vision: CNN tokenizer or embedding table
+        # Semantic compression mode: use SemanticEncoder for text or CNNTokenizer for images
+        use_semantic = getattr(self.config, 'use_semantic_encoder', True)  # Default to semantic
         use_cnn_tokenizer = getattr(self.config, 'use_cnn_tokenizer', False)
-        if use_cnn_tokenizer:
-            # CNN stem for vision (CCT-style)
+        
+        print(f"\n📊 Input Config:")
+        print(f"   Semantic encoder: {use_semantic}")
+        print(f"   CNN tokenizer: {use_cnn_tokenizer}")
+        print(f"   Hidden size: {self.config.hidden_size}")
+        print(f"   Output vocab: {self.config.vocab_size}")
+        
+        if use_semantic:
+            # HESC: Hierarchical Expandable Semantic Capsules
+            from models.capsule_encoder import CapsuleEncoder
+            target_capsules = getattr(self.config, 'target_capsules', 12)
+            children_per_capsule = getattr(self.config, 'children_per_capsule', 4)
+            encoder_model = getattr(self.config, 'encoder_model', 'openai/clip-vit-large-patch14')
+            
+            print(f"\n🔧 Capsule Encoder Configuration:")
+            print(f"   Input encoder: {encoder_model}")
+            print(f"   Output vocab: {self.config.vocab_size} (GPT-2)")
+            print(f"   Compression: {target_capsules} capsules × {children_per_capsule} children")
+            
+            self.capsule_encoder = CapsuleEncoder(
+                hidden_size=self.config.hidden_size,
+                target_capsules=target_capsules,
+                children_per_capsule=children_per_capsule,
+                checksum_dim=getattr(self.config, 'checksum_dim', 32),
+                freeze_encoder=getattr(self.config, 'freeze_capsule_encoder', True),
+                encoder_model=encoder_model
+            )
+            self.embed_tokens = None
+            self.cnn_tokenizer = None
+        elif use_cnn_tokenizer:
+            # CNN tokenizer for vision tasks
             cnn_in_channels = getattr(self.config, 'cnn_in_channels', 3)
             cnn_conv_channels = getattr(self.config, 'cnn_conv_channels', [64, 128, self.config.hidden_size])
             self.cnn_tokenizer = CNNTokenizer(
@@ -246,13 +262,36 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 use_batch_norm=True,
                 activation='relu'
             )
-            self.embed_tokens = None  # No embedding table needed
+            self.capsule_encoder = None
+            self.embed_tokens = None
         else:
-            # Standard embedding table
+            # Token embedding mode (for non-semantic datasets)
+            input_vocab_size = getattr(self.config, 'input_vocab_size', self.config.vocab_size)
             self.embed_tokens = CastedEmbedding(input_vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+            self.capsule_encoder = None
             self.cnn_tokenizer = None
         
-        self.lm_head = CastedLinear(self.config.hidden_size, output_vocab_size, bias=False)
+        # Output head: concept vocab or BPE tokens
+        if use_semantic:
+            # Hybrid head: semantic concepts + control symbols
+            from models.concept_vocab import HybridOutputHead
+            num_concepts = getattr(self.config, 'num_concepts', 2048)
+            use_vq = getattr(self.config, 'use_vq_codebook', True)
+            
+            print(f"   Output: {num_concepts} concepts + 4 control symbols")
+            print(f"   VQ codebook: {use_vq}")
+            
+            self.lm_head = HybridOutputHead(
+                hidden_size=self.config.hidden_size,
+                num_concepts=num_concepts,
+                concept_dim=self.config.hidden_size,
+                use_vq=use_vq
+            )
+            self.output_vocab_size = num_concepts + 4  # concepts + control
+        else:
+            # Standard BPE token output
+            self.lm_head = CastedLinear(self.config.hidden_size, output_vocab_size, bias=False)
+            self.output_vocab_size = output_vocab_size
         
         # Q-head: Configurable architecture (MLP/RNN/Mini-Attention)
         self.q_head = create_q_head(self.config)
@@ -336,16 +375,25 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             self.lm_head
         )
     
+    def encode_text(self, texts: list, return_children: bool = True):
+        """Encode raw text using capsule encoder (on-the-fly mode)."""
+        if hasattr(self, 'capsule_encoder') and self.capsule_encoder is not None:
+            return self.capsule_encoder(texts, return_children=return_children)
+        raise RuntimeError("Capsule encoder not initialized")
+    
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
-        # Token embedding: CNN tokenizer or embedding table
-        if self.cnn_tokenizer is not None:
+        # HESC capsules or CNN/token embedding
+        if hasattr(self, 'capsule_encoder') and self.capsule_encoder is not None:
+            # Input is pre-encoded capsule sketches [B, k, hidden_size]
+            # For precomputed capsule datasets (Stage A training)
+            embedding = input.to(self.forward_dtype)
+        elif self.cnn_tokenizer is not None:
             # CNN tokenizer: input is raw images
-            # Transpose from [B, H, W, C] to [B, C, H, W] (PyTorch convention)
-            if input.dim() == 4 and input.shape[-1] in [1, 3]:  # Detect [B, H, W, C]
-                input = input.permute(0, 3, 1, 2)  # -> [B, C, H, W]
-            embedding = self.cnn_tokenizer(input)  # -> [B, seq_len, hidden_size]
+            if input.dim() == 4 and input.shape[-1] in [1, 3]:
+                input = input.permute(0, 3, 1, 2)
+            embedding = self.cnn_tokenizer(input)
         else:
-            # Standard embedding: input is token IDs [B, seq_len]
+            # Legacy: standard token embedding
             embedding = self.embed_tokens(input.to(torch.int32))
 
         # Puzzle embeddings
@@ -436,6 +484,13 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # Final outputs
         new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+        
+        # Get output from lm_head (may include VQ loss for concept vocab)
+        vq_loss = None
+        if hasattr(self.lm_head, 'use_vq') and self.lm_head.use_vq and self.training:
+            # Quantize hidden states to get VQ loss
+            _, vq_loss = self.lm_head.quantize_hidden(z_H[:, self.puzzle_emb_len:])
+        
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
         q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
         
@@ -460,16 +515,18 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 mtp_logits.append(logits)
                 h_prev = h_current
         
-        # Store intermediate outputs and MTP in dict
-        if intermediate_outputs or mtp_logits:
+        # Store intermediate outputs, MTP, and VQ loss in dict
+        if intermediate_outputs or mtp_logits or vq_loss is not None:
             output_dict = {'final': output if not isinstance(output, dict) else output}
             if intermediate_outputs:
                 output_dict['intermediate'] = intermediate_outputs
             if mtp_logits:
-                output_dict['mtp_logits'] = mtp_logits
+                output_dict['mtp'] = mtp_logits
+            if vq_loss is not None:
+                output_dict['vq_loss'] = vq_loss
             output = output_dict
         
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
+        return new_carry, output, (q_logits[:, 0], q_logits[:, 1])
 
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):

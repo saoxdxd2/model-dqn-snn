@@ -145,78 +145,8 @@ def select_action_epsilon_greedy(
     return action
 
 
-def compute_shaped_reward(
-    prev_accuracy: Tensor,
-    curr_accuracy: Tensor,
-    step: Tensor,
-    max_steps: int,
-    is_terminal: Tensor,
-    seq_is_correct: Tensor,
-    no_improvement_counter: Optional[Tensor] = None,
-    reward_accuracy_scale: float = 10.0,
-    reward_step_penalty: float = 0.02,
-    reward_terminal_correct: float = 10.0,
-    reward_terminal_incorrect: float = -5.0,
-    reward_stagnation_penalty: float = 0.1,
-    reward_stagnation_threshold: int = 3,
-) -> Tensor:
-    """
-    Compute dense shaped reward for reasoning steps.
-    
-    Args:
-        prev_accuracy: Accuracy at previous step [batch_size]
-        curr_accuracy: Accuracy at current step [batch_size]
-        step: Current step number [batch_size]
-        max_steps: Maximum allowed steps
-        is_terminal: Whether this is the final step [batch_size]
-        seq_is_correct: Whether final answer is correct [batch_size]
-        no_improvement_counter: Steps since last improvement [batch_size]
-        reward_accuracy_scale: Scale for accuracy improvement reward
-        reward_step_penalty: Penalty per step (encourage efficiency)
-        reward_terminal_correct: Bonus for correct final answer
-        reward_terminal_incorrect: Penalty for incorrect early halt
-        reward_stagnation_penalty: Penalty for no progress
-        reward_stagnation_threshold: Steps before stagnation penalty applies
-    
-    Returns:
-        Shaped reward [batch_size]
-    """
-    batch_size = prev_accuracy.shape[0]
-    device = prev_accuracy.device
-    reward = torch.zeros(batch_size, device=device)
-    
-    # Component 1: Accuracy improvement
-    acc_delta = curr_accuracy - prev_accuracy
-    reward += reward_accuracy_scale * acc_delta
-    
-    # Component 2: Step penalty (encourage efficiency)
-    reward -= reward_step_penalty
-    
-    # Component 3: Stagnation penalty (penalize wasted computation)
-    if no_improvement_counter is not None:
-        stagnation_mask = no_improvement_counter >= reward_stagnation_threshold
-        stagnation_amount = (no_improvement_counter - reward_stagnation_threshold + 1).float()
-        reward -= torch.where(
-            stagnation_mask,
-            reward_stagnation_penalty * stagnation_amount,
-            torch.zeros_like(reward)
-        )
-    
-    # Component 4: Terminal reward (large signal at halt)
-    terminal_reward = torch.where(
-        is_terminal,
-        torch.where(
-            seq_is_correct,
-            # Correct: large positive + efficiency bonus
-            reward_terminal_correct + (max_steps - step).float() * 0.5,
-            # Incorrect: penalty
-            torch.full_like(reward, reward_terminal_incorrect)
-        ),
-        torch.zeros_like(reward)
-    )
-    reward += terminal_reward
-    
-    return reward
+# Note: Reward shaping is now handled in losses.py ACTLossHead._store_transitions()
+# This consolidates all reward logic in one place for semantic compression
 
 
 def soft_update_target_network(

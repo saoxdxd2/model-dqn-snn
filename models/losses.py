@@ -212,9 +212,58 @@ class ACTLossHead(nn.Module):
             entropy_bonus = -self.model.config.entropy_regularization_weight * entropy.sum()  # Negative because we want to maximize entropy
             metrics["q_entropy"] = entropy.mean().detach()
         
+        # HESC reconstruction loss (capsule-aware)
+        reconstruction_loss = 0
+        if (hasattr(self.model.inner, 'capsule_encoder') and 
+            self.model.inner.capsule_encoder is not None and
+            'capsule_sketches' in new_carry.current_data and
+            'z_H' in outputs):
+            try:
+                # Reconstruction: TRM output → should reconstruct original sketches
+                original_sketches = new_carry.current_data['capsule_sketches']
+                
+                # Pool TRM hidden states
+                k = min(original_sketches.size(1), outputs['z_H'].size(1))
+                trm_output = outputs['z_H'][:, :k]
+                orig_sketch = original_sketches[:, :k]
+                
+                # Cosine similarity loss (preserve semantic content)
+                if trm_output.size(-1) == orig_sketch.size(-1):
+                    reconstruction_loss = 1 - F.cosine_similarity(
+                        trm_output.reshape(-1, trm_output.size(-1)),
+                        orig_sketch.reshape(-1, orig_sketch.size(-1)),
+                        dim=-1
+                    ).mean()
+                
+                # Add checksum consistency if available
+                if 'capsule_checksums' in new_carry.current_data:
+                    checksums = new_carry.current_data['capsule_checksums']
+                    # Checksum should signal high reconstructability
+                    checksum_loss = -checksums.norm(dim=-1).mean() * 0.01
+                    reconstruction_loss += checksum_loss
+                    
+            except Exception:
+                reconstruction_loss = 0
+        
+                
+        # Expansion cost tracking (HESC)
+        expansion_cost = 0
+        if 'num_expansions' in new_carry.current_data:
+            num_expansions = new_carry.current_data['num_expansions']
+            children_per_capsule = getattr(self.model.config, 'children_per_capsule', 4)
+            expansion_cost = 0.01 * num_expansions.float().mean() * children_per_capsule
+        
+        # VQ codebook loss (for concept vocabulary)
+        vq_loss = 0
+        if 'vq_loss' in outputs:
+            vq_loss = outputs['vq_loss']
+        
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
+            "reconstruction_loss": reconstruction_loss.detach() if isinstance(reconstruction_loss, torch.Tensor) else 0,
+            "expansion_cost": expansion_cost.detach() if isinstance(expansion_cost, torch.Tensor) else 0,
+            "vq_loss": vq_loss.detach() if isinstance(vq_loss, torch.Tensor) else 0,
         })
         # Q continue (bootstrapping target loss); Alexia: This fits Q-learning, but seems totally unecessary
         q_continue_loss = 0
@@ -379,8 +428,22 @@ class ACTLossHead(nn.Module):
         # Filter outputs for return
         detached_outputs = {k: outputs[k].detach() for k in return_keys if k in outputs}
         
-        # Total loss
+        # Total loss with HESC components
         total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + entropy_bonus
+        
+        # Add reconstruction loss (weight: 0.3)
+        if isinstance(reconstruction_loss, torch.Tensor) and reconstruction_loss != 0:
+            total_loss = total_loss + 0.3 * reconstruction_loss
+        
+        # Add expansion penalty (weight: 0.1)
+        if isinstance(expansion_cost, torch.Tensor) and expansion_cost != 0:
+            total_loss = total_loss + 0.1 * expansion_cost
+        
+        # Add VQ codebook loss (weight: 0.25)
+        if isinstance(vq_loss, torch.Tensor) and vq_loss != 0:
+            total_loss = total_loss + 0.25 * vq_loss
+        
+        # Add DQN loss
         if self.enable_dqn and isinstance(dqn_loss, torch.Tensor):
             total_loss = total_loss + self.dqn_loss_weight * dqn_loss
         

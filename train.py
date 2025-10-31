@@ -68,13 +68,15 @@ MODELS = {
         "config": "cfg_text",
         "dataset_builder": "dataset/build_text_dataset.py",
         "dataset_args": {
-            "input_file": "wikitext-2",
-            "output_dir": "data/text-wikitext2",
-            "tokenizer_name": "gpt2",
-            "max_seq_len": 512,
-            "stride": 256
+            "input_file": "wikitext2",
+            "output_dir": "datasets/wikitext2",
+            "semantic_mode": True,
+            "semantic_hidden_size": 768,
+            "num_concepts": 2048,
+            "semantic_target_tokens": 12,
+            "encoder_model": "openai/clip-vit-large-patch14"
         },
-        "description": "Train on WikiText-2 for general text generation"
+        "description": "Train on WikiText-2 with HESC (Hierarchical Expandable Semantic Capsules)"
     },
     "text-tiny": {
         "name": "Text Generation (TinyStories - Small)",
@@ -82,12 +84,14 @@ MODELS = {
         "dataset_builder": "dataset/build_text_dataset.py",
         "dataset_args": {
             "input_file": "tinystories",
-            "output_dir": "data/text-tinystories",
-            "tokenizer_name": "gpt2",
-            "max_seq_len": 256,
-            "stride": 128
+            "output_dir": "datasets/tinystories",
+            "semantic_mode": True,
+            "semantic_hidden_size": 768,
+            "num_concepts": 2048,
+            "semantic_target_tokens": 12,
+            "encoder_model": "openai/clip-vit-large-patch14"
         },
-        "description": "Train on TinyStories (smaller, faster convergence)"
+        "description": "Train on TinyStories with HESC (smaller, faster convergence)"
     },
     "arc": {
         "name": "Visual Reasoning (ARC Puzzles)",
@@ -628,8 +632,9 @@ def train_model(model_config: dict, extra_args: list, checkpoint_path: str = Non
 
 
 def main():
+    """Simplified training entry point - just calls pretrain.py with config."""
     parser = argparse.ArgumentParser(
-        description="Unified TRM Training Pipeline",
+        description="TRM Training - Unified Entry Point",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
