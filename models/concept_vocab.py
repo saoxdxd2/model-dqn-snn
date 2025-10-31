@@ -131,6 +131,67 @@ class ConceptCodebook(nn.Module):
             return self.ema_cluster_size / self.ema_cluster_size.sum()
         else:
             return torch.ones(self.num_concepts) / self.num_concepts
+    
+    def reset_dead_codes(self, min_usage: float = 0.01):
+        """Reset least-used codebook entries to prevent collapse.
+        
+        Args:
+            min_usage: Minimum usage threshold (as fraction of average usage)
+        """
+        if not self.use_ema:
+            return
+        
+        # Identify dead codes (usage below threshold)
+        avg_usage = self.ema_cluster_size.mean()
+        threshold = avg_usage * min_usage
+        dead_mask = self.ema_cluster_size < threshold
+        num_dead = dead_mask.sum().item()
+        
+        if num_dead > 0:
+            print(f"🔄 Resetting {num_dead}/{self.num_concepts} dead codebook entries (threshold={threshold:.4f})")
+            
+            # Re-initialize dead codes with random perturbations of active codes
+            active_mask = ~dead_mask
+            active_indices = active_mask.nonzero(as_tuple=True)[0]
+            
+            if len(active_indices) > 0:
+                # Sample random active codes
+                random_active_idx = active_indices[torch.randint(0, len(active_indices), (num_dead,), device=active_indices.device)]
+                
+                # Add Gaussian noise for diversity
+                noise = torch.randn(num_dead, self.concept_dim, device=self.embeddings.weight.device) * 0.1
+                new_embeddings = self.embeddings.weight[random_active_idx] + noise
+                
+                # Update dead code embeddings
+                self.embeddings.weight.data[dead_mask] = new_embeddings
+                
+                # Reset EMA statistics for dead codes
+                self.ema_cluster_size[dead_mask] = avg_usage * 0.1  # Small initial value
+                self.ema_embeddings[dead_mask] = new_embeddings
+    
+    def get_usage_stats(self) -> dict:
+        """Get codebook health statistics for monitoring."""
+        if not self.use_ema:
+            return {
+                'active_codes': self.num_concepts,
+                'dead_codes': 0,
+                'utilization': 1.0,
+                'max_usage': 1.0,
+                'mean_usage': 1.0,
+            }
+        
+        usage = self.ema_cluster_size
+        avg_usage = usage.mean()
+        
+        return {
+            'active_codes': (usage > avg_usage * 0.01).sum().item(),
+            'dead_codes': (usage < avg_usage * 0.01).sum().item(),
+            'utilization': (usage > 0).float().mean().item(),
+            'max_usage': usage.max().item(),
+            'mean_usage': avg_usage.item(),
+            'min_usage': usage.min().item(),
+            'std_usage': usage.std().item(),
+        }
 
 
 class HybridOutputHead(nn.Module):

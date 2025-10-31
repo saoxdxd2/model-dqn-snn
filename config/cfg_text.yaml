@@ -2,7 +2,7 @@
 # Small-scale TRM for language modeling on local hardware
 
 defaults:
-  - arch: trm_text
+  - arch: text_optimized
   - _self_
 
 hydra:

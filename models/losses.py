@@ -69,8 +69,8 @@ class ACTLossHead(nn.Module):
             self.reward_stats = RunningStats()
             self.dqn_step_counter = 0
             # Adaptive DQN loss weight: curriculum learning schedule
-            # Start low (0.01) when predictions are random, increase to 0.5 as model improves
-            self.dqn_loss_weight_min = 0.01
+            # Start low (0.005) when predictions are random, increase to 0.5 as model improves
+            self.dqn_loss_weight_min = 0.005  # Lowered from 0.01 to prevent early instability
             self.dqn_loss_weight_max = 0.5
             self.dqn_loss_weight = self.dqn_loss_weight_min
             self.running_accuracy = 0.0  # Track accuracy for weight adaptation
@@ -235,6 +235,14 @@ class ACTLossHead(nn.Module):
                         dim=-1
                     ).mean()
                 
+                # Cycle-consistency: sketch → children → reconstructed sketch
+                if 'capsule_children' in new_carry.current_data:
+                    children = new_carry.current_data['capsule_children']
+                    # Pool children back to sketch representation
+                    reconstructed_sketch = children.mean(dim=2)  # [B, k, hidden]
+                    cycle_loss = F.mse_loss(reconstructed_sketch[:, :k], orig_sketch)
+                    reconstruction_loss = reconstruction_loss + 0.2 * cycle_loss
+                
                 # Add checksum consistency if available
                 if 'capsule_checksums' in new_carry.current_data:
                     checksums = new_carry.current_data['capsule_checksums']
@@ -258,6 +266,29 @@ class ACTLossHead(nn.Module):
         if 'vq_loss' in outputs:
             vq_loss = outputs['vq_loss']
         
+        # Per-capsule reconstruction metrics for detailed monitoring
+        if (isinstance(reconstruction_loss, torch.Tensor) and 
+            'capsule_sketches' in new_carry.current_data and 
+            'z_H' in outputs):
+            try:
+                original_sketches = new_carry.current_data['capsule_sketches']
+                k = min(original_sketches.size(1), outputs['z_H'].size(1))
+                trm_output = outputs['z_H'][:, :k]
+                orig_sketch = original_sketches[:, :k]
+                
+                if trm_output.size(-1) == orig_sketch.size(-1):
+                    # Per-capsule cosine similarity [B, k]
+                    per_capsule_cos = F.cosine_similarity(
+                        trm_output.reshape(-1, k, trm_output.size(-1)),
+                        orig_sketch.reshape(-1, k, orig_sketch.size(-1)),
+                        dim=-1
+                    )
+                    metrics["cos_sim_mean"] = per_capsule_cos.mean().detach()
+                    metrics["cos_sim_min"] = per_capsule_cos.min().detach()
+                    metrics["cos_sim_std"] = per_capsule_cos.std().detach()
+            except Exception:
+                pass
+        
         metrics.update({
             "lm_loss": lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
@@ -275,6 +306,30 @@ class ACTLossHead(nn.Module):
         # DQN loss computation
         dqn_loss = 0
         if self.enable_dqn and self.training:
+            # Oracle warm-start: use heuristic policy for first N steps
+            warmstart_steps = getattr(self.model.config, 'dqn_warmstart_steps', 10000)
+            use_oracle = self.dqn_step_counter < warmstart_steps
+            
+            if use_oracle and 'capsule_children' in new_carry.current_data:
+                # Heuristic oracle: expand capsules with high child-reconstruction error
+                with torch.no_grad():
+                    children = new_carry.current_data['capsule_children']
+                    sketches = new_carry.current_data['capsule_sketches']
+                    
+                    # Compute reconstruction error per capsule
+                    k = min(children.size(1), sketches.size(1))
+                    child_avg = children[:, :k].mean(dim=2)  # [B, k, hidden]
+                    recon_error = 1 - F.cosine_similarity(
+                        child_avg.reshape(-1, child_avg.size(-1)),
+                        sketches[:, :k].reshape(-1, sketches.size(-1)),
+                        dim=-1
+                    ).reshape(child_avg.size(0), -1)  # [B, k]
+                    
+                    # Oracle decision: expand if any capsule has high error
+                    should_expand_oracle = (recon_error > 0.1).any(dim=-1)  # [B]
+                    metrics["oracle_expansion_rate"] = should_expand_oracle.float().mean().detach()
+                    metrics["oracle_recon_error"] = recon_error.mean().detach()
+            
             # Compute current accuracy for reward shaping
             curr_accuracy = torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), torch.zeros_like(seq_is_correct.float()))
             
@@ -431,9 +486,9 @@ class ACTLossHead(nn.Module):
         # Total loss with HESC components
         total_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss) + entropy_bonus
         
-        # Add reconstruction loss (weight: 0.3)
+        # Add reconstruction loss (weight: 0.5) - Increased to prevent reconstructability collapse
         if isinstance(reconstruction_loss, torch.Tensor) and reconstruction_loss != 0:
-            total_loss = total_loss + 0.3 * reconstruction_loss
+            total_loss = total_loss + 0.5 * reconstruction_loss
         
         # Add expansion penalty (weight: 0.1)
         if isinstance(expansion_cost, torch.Tensor) and expansion_cost != 0:

@@ -179,7 +179,7 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
         )
         self.norm_eps = config.rms_norm_eps
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, spatial_bias=None) -> torch.Tensor:
         # B, L, D = hidden_states.shape
         # Post Norm
         if self.config.mlp_t:
@@ -188,8 +188,9 @@ class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
             hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
             hidden_states = hidden_states.transpose(1,2)
         else:
-            # Self Attention
-            hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
+            # Self Attention with optional spatial bias
+            attn_out = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states, attn_bias=spatial_bias)
+            hidden_states = rms_norm(hidden_states + attn_out, variance_epsilon=self.norm_eps)
         # Fully Connected
         out = self.mlp(hidden_states)
         hidden_states = rms_norm(hidden_states + out, variance_epsilon=self.norm_eps)
@@ -200,10 +201,10 @@ class TinyRecursiveReasoningModel_ACTV1ReasoningModule(nn.Module):
         super().__init__()
         self.layers = torch.nn.ModuleList(layers)
 
-    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, spatial_bias=None, **kwargs) -> torch.Tensor:
         hidden_states = hidden_states + input_injection
         for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states, **kwargs)
+            hidden_states = layer(hidden_states=hidden_states, spatial_bias=spatial_bias, **kwargs)
         return hidden_states
 
 
@@ -645,6 +646,15 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                         halted = halted | (q_halt_logits > 0)
                     else:
                         halted = halted | (q_halt_logits > q_continue_logits)
+                
+                # Checksum-aware HALT gating: prevent halting if reconstructability is too low
+                if 'capsule_checksums' in new_current_data:
+                    checksums = new_current_data['capsule_checksums']
+                    checksum_norms = checksums.norm(dim=-1).mean(dim=-1)  # [B]
+                    checksum_threshold = getattr(self.config, 'checksum_halt_threshold', 0.5)
+                    reconstructable_mask = checksum_norms > checksum_threshold
+                    # Only allow HALT if reconstructability is sufficient
+                    halted = halted & reconstructable_mask
 
                     # Exploration
                     min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)

@@ -1,7 +1,7 @@
 # Code Generation Training Config
 
 defaults:
-  - arch: trm_code
+  - arch: code_optimized
   - _self_
 
 hydra:

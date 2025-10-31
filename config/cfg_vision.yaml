@@ -2,7 +2,7 @@
 # TRM + ViT for image classification/understanding
 
 defaults:
-  - arch: trm_vision
+  - arch: vision_optimized
   - _self_
 
 hydra:
@@ -15,7 +15,7 @@ data_paths_test: []
 evaluators: []
 
 # Training hyperparams (optimized for patch tokens)
-global_batch_size: 32  # Match trm_vision.yaml batch_size
+global_batch_size: 256  # Optimized for vision tasks
 epochs: 200
 eval_interval: 10
 checkpoint_every_eval: True

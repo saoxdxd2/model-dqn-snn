@@ -30,7 +30,9 @@ class CapsuleEncoder(nn.Module):
         children_per_capsule: int = 4,
         checksum_dim: int = 32,
         freeze_encoder: bool = True,
-        encoder_model: str = "openai/clip-vit-large-patch14",  # Configurable encoder
+        encoder_model: str = "openai/clip-vit-large-patch14",
+        use_spatial: bool = True,  # NEW: Enable spatial organization
+        capsule_grid_shape: tuple = (3, 4),  # NEW: 3x4 grid = 12 capsules
     ):
         super().__init__()
         
@@ -44,21 +46,26 @@ class CapsuleEncoder(nn.Module):
         self.children_per_capsule = children_per_capsule
         self.checksum_dim = checksum_dim
         self.encoder_model = encoder_model
+        self.use_spatial = use_spatial
+        self.capsule_grid_shape = capsule_grid_shape
+        
+        assert capsule_grid_shape[0] * capsule_grid_shape[1] == target_capsules, \
+            f"Grid shape {capsule_grid_shape} must multiply to {target_capsules}"
         
         # Semantic encoder (default: CLIP, but configurable)
         print(f"\n🔧 Initializing CapsuleEncoder:")
         print(f"   Encoder: {encoder_model}")
         print(f"   Target capsules: {target_capsules}")
-        print(f"   Children per capsule: {children_per_capsule}")
+        print(f"   Spatial mode: {use_spatial}")
+        if use_spatial:
+            print(f"   Capsule grid: {capsule_grid_shape[0]}×{capsule_grid_shape[1]}")
         
         if "clip" in encoder_model.lower():
-            # CLIP models use get_text_features()
             self.encoder = AutoModel.from_pretrained(encoder_model)
             self.tokenizer = AutoTokenizer.from_pretrained(encoder_model)
             self.encoder_type = "clip"
             self.encoder_dim = 768 if "large" in encoder_model else 512
         else:
-            # Other encoders (BERT, RoBERTa, etc.)
             self.encoder = AutoModel.from_pretrained(encoder_model)
             self.tokenizer = AutoTokenizer.from_pretrained(encoder_model)
             self.encoder_type = "transformer"
@@ -68,7 +75,7 @@ class CapsuleEncoder(nn.Module):
             for param in self.encoder.parameters():
                 param.requires_grad = False
         
-        # Capsule components (adapt to encoder dimension)
+        # Capsule components
         self.sketch_projection = nn.Linear(self.encoder_dim, hidden_size)
         self.checksum_head = nn.Sequential(
             nn.Linear(hidden_size, 128),
@@ -76,6 +83,26 @@ class CapsuleEncoder(nn.Module):
             nn.Linear(128, checksum_dim)
         )
         self.children_projection = nn.Linear(self.encoder_dim, hidden_size)
+        
+        # NEW: Spatial components
+        if use_spatial:
+            # 2D convolutions for spatial feature extraction
+            self.spatial_conv = nn.Sequential(
+                nn.Conv2d(self.encoder_dim, hidden_size, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(hidden_size, hidden_size, kernel_size=3, padding=1)
+            )
+            
+            # Spatial positional encoding (3x4 grid)
+            self.spatial_pos_embed = nn.Parameter(
+                torch.randn(1, target_capsules, hidden_size) * 0.02
+            )
+            
+            # Spatial attention bias (nearby capsules attend more)
+            self.register_buffer('spatial_bias', self._build_spatial_bias())
+        else:
+            self.spatial_conv = None
+            self.spatial_pos_embed = None
         
         self._init_weights()
     
@@ -88,6 +115,45 @@ class CapsuleEncoder(nn.Module):
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
+    
+    def _build_spatial_bias(self):
+        """Build attention bias matrix based on capsule spatial positions."""
+        H, W = self.capsule_grid_shape
+        positions = [(i // W, i % W) for i in range(self.target_capsules)]
+        
+        # Distance-based bias (Manhattan distance)
+        bias = torch.zeros(self.target_capsules, self.target_capsules)
+        for i, (r1, c1) in enumerate(positions):
+            for j, (r2, c2) in enumerate(positions):
+                dist = abs(r1 - r2) + abs(c1 - c2)
+                bias[i, j] = -0.1 * dist  # Closer = higher attention
+        
+        return bias
+    
+    def _spatial_pool(self, embeddings):
+        """Apply spatial convolutions and pool to grid layout.
+        
+        Args:
+            embeddings: [k, D] embeddings (k <= target_capsules)
+            
+        Returns:
+            [k, D] spatially-processed embeddings
+        """
+        if not self.use_spatial or embeddings.size(0) != self.target_capsules:
+            return embeddings
+        
+        H, W = self.capsule_grid_shape
+        
+        # Reshape to 2D grid: [k, D] -> [1, D, H, W]
+        grid = embeddings.view(H, W, -1).permute(2, 0, 1).unsqueeze(0)
+        
+        # Apply spatial convolutions (preserves spatial relationships)
+        spatial_features = self.spatial_conv(grid)  # [1, hidden_size, H, W]
+        
+        # Flatten back to sequence: [1, hidden_size, H, W] -> [k, hidden_size]
+        output = spatial_features.squeeze(0).permute(1, 2, 0).reshape(self.target_capsules, -1)
+        
+        return output
     
     def forward(self, texts=None, images=None, return_children: bool = True):
         """
@@ -157,18 +223,27 @@ class CapsuleEncoder(nn.Module):
             sketches_list.append(coarse_embeddings[idx:idx+count])
             idx += count
         
-        # Pad to target_capsules
+        # Pad to target_capsules and apply spatial pooling
         padded_sketches = []
         for emb in sketches_list:
             if emb.size(0) > self.target_capsules:
                 emb = emb[:self.target_capsules]
             elif emb.size(0) < self.target_capsules:
-                pad = torch.zeros(self.target_capsules - emb.size(0), 768, device=device)
+                pad = torch.zeros(self.target_capsules - emb.size(0), self.encoder_dim, device=device)
                 emb = torch.cat([emb, pad], dim=0)
+            
+            # NEW: Apply spatial pooling if enabled
+            if self.use_spatial:
+                emb = self._spatial_pool(emb)
+            
             padded_sketches.append(emb)
         
-        sketches_raw = torch.stack(padded_sketches, dim=0)  # [B, k, 768]
+        sketches_raw = torch.stack(padded_sketches, dim=0)  # [B, k, encoder_dim]
         sketches = self.sketch_projection(sketches_raw)  # [B, k, hidden_size]
+        
+        # NEW: Add spatial positional encoding
+        if self.use_spatial:
+            sketches = sketches + self.spatial_pos_embed
         
         # Compute checksums (reconstructability signals)
         checksums = self.checksum_head(sketches)  # [B, k, checksum_dim]

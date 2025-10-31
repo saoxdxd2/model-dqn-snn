@@ -1,0 +1,51 @@
+# Multimodal Training Config (HESC)
+# Text + Vision + Structured data with capsule compression
+
+defaults:
+  - arch: multimodal_hesc
+  - _self_
+
+hydra:
+  output_subdir: null
+
+# Data paths
+data_paths: ['data/multimodal-mixed']
+data_paths_test: []
+
+evaluators: []
+
+# HESC capsule mode (REQUIRED)
+semantic_mode: true
+semantic_dataset: "datasets/multimodal/capsule_dataset.pt"
+semantic_eval_dataset: "datasets/multimodal/capsule_dataset_test.pt"
+
+# Training hyperparameters (optimized for 12-capsule sequences)
+global_batch_size: 768  # High batch for capsule compression
+epochs: 50000
+eval_interval: 1000
+checkpoint_every_eval: True
+
+# Learning rates
+lr: 3e-4  # Higher for multimodal (diverse data)
+lr_min_ratio: 0.1
+lr_warmup_steps: 1000
+
+# Optimizer (AdamW)
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.05  # Medium regularization
+
+# Puzzle embeddings (for multi-task)
+puzzle_emb_lr: 1e-3
+puzzle_emb_weight_decay: 0.1
+
+seed: 42
+min_eval_interval: 0
+
+checkpoint_path: "checkpoints/multimodal-hesc"
+
+# EMA (stability for mixed data)
+ema: True
+ema_rate: 0.999
+
+freeze_weights: False

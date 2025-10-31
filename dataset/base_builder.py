@@ -142,7 +142,9 @@ class BaseDatasetBuilder(ABC):
                 children_per_capsule=4,
                 checksum_dim=32,
                 freeze_encoder=True,
-                encoder_model=getattr(self.config, 'encoder_model', 'openai/clip-vit-large-patch14')
+                encoder_model=getattr(self.config, 'encoder_model', 'openai/clip-vit-large-patch14'),
+                use_spatial=getattr(self.config, 'use_spatial_capsules', True),
+                capsule_grid_shape=getattr(self.config, 'capsule_grid_shape', (3, 4))
             )
             self.encoder.eval()
             self.encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
@@ -218,15 +220,37 @@ class BaseDatasetBuilder(ABC):
         
         os.makedirs(output_dir, exist_ok=True)
         
-        # Save train
+        # Save train (with float16 compression for memory efficiency)
         train_path = os.path.join(output_dir, 'capsule_dataset.pt')
-        torch.save(data['train'], train_path)
-        print(f"✅ Saved train: {train_path}")
+        train_compressed = {
+            'sketches': data['train']['sketches'].half() if 'sketches' in data['train'] else data['train'].get('sketches'),
+            'checksums': data['train'].get('checksums'),  # Keep checksums in float32 for precision
+        }
+        if 'children' in data['train']:
+            train_compressed['children'] = data['train']['children'].half()  # 50% memory reduction
+        # Copy any other keys
+        for key in data['train']:
+            if key not in train_compressed:
+                train_compressed[key] = data['train'][key]
         
-        # Save test
+        torch.save(train_compressed, train_path)
+        print(f"✅ Saved train (float16 compressed): {train_path}")
+        
+        # Save test (with float16 compression)
         test_path = os.path.join(output_dir, 'capsule_dataset_test.pt')
-        torch.save(data['test'], test_path)
-        print(f"✅ Saved test: {test_path}")
+        test_compressed = {
+            'sketches': data['test']['sketches'].half() if 'sketches' in data['test'] else data['test'].get('sketches'),
+            'checksums': data['test'].get('checksums'),
+        }
+        if 'children' in data['test']:
+            test_compressed['children'] = data['test']['children'].half()
+        # Copy any other keys
+        for key in data['test']:
+            if key not in test_compressed:
+                test_compressed[key] = data['test'][key]
+        
+        torch.save(test_compressed, test_path)
+        print(f"✅ Saved test (float16 compressed): {test_path}")
         
         # Save metadata
         import json

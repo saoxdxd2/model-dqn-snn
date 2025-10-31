@@ -854,6 +854,22 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 for key, value in grad_stats.items():
                     reduced_metrics[f"train/grad/{key}"] = value
             
+            # Periodic codebook maintenance (prevent collapse)
+            if hasattr(train_state.model, 'model') and hasattr(train_state.model.model, 'inner'):
+                inner = train_state.model.model.inner
+                if hasattr(inner, 'lm_head') and hasattr(inner.lm_head, 'codebook'):
+                    codebook = inner.lm_head.codebook
+                    
+                    # Reset dead codes every 5000 steps
+                    if train_state.step % 5000 == 0 and train_state.step > 0:
+                        codebook.reset_dead_codes(min_usage=0.01)
+                    
+                    # Log usage stats every 1000 steps
+                    if train_state.step % 1000 == 0:
+                        stats = codebook.get_usage_stats()
+                        for key, value in stats.items():
+                            reduced_metrics[f"train/codebook/{key}"] = value
+            
             return reduced_metrics
 
 def evaluate(

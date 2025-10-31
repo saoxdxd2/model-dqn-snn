@@ -1,7 +1,7 @@
 # ARC training config
 
 defaults:
-  - arch: trm
+  - arch: arc_optimized
   - _self_
 
 hydra:
@@ -14,25 +14,26 @@ data_paths_test: []
 evaluators:
   - name: arc@ARC
 
-# Hyperparams - Training
-global_batch_size: 768
+# Training hyperparameters (TRM paper-derived)
+global_batch_size: 768  # Paper uses 768
 
 epochs: 100000
 eval_interval: 10000
 checkpoint_every_eval: True
 
-lr: 1e-4
+# Learning rates (TRM paper exact)
+lr: 1e-4  # Paper uses 1e-4 for ARC
 lr_min_ratio: 1.0
-lr_warmup_steps: 2000
+lr_warmup_steps: 2000  # Paper uses 2K warmup
 
-# Standard hyperparameter settings for LM, as used in Llama
+# Optimizer (TRM paper exact)
 beta1: 0.9
 beta2: 0.95
-weight_decay: 0.1
+weight_decay: 0.1  # Paper: 0.1 for ARC (1.0 for Sudoku)
 puzzle_emb_weight_decay: 0.1
 
-# Hyperparams - Puzzle embeddings training
-puzzle_emb_lr: 1e-2
+# Puzzle embeddings
+puzzle_emb_lr: 1e-2  # Paper: 1e-2 for embeddings
 
 seed: 0
 min_eval_interval: 0 # when to start the eval
