@@ -229,8 +229,40 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         return None
     
     def _load_arc_json(self, json_path: str) -> List[DataSample]:
-        """Load ARC JSON - unified format parser."""
-        return self._parse_json_format(json_path, 'arc')
+        """Load ARC JSON - unified parser with auto-detection."""
+        import glob
+        
+        # If exact path exists, use it
+        if Path(json_path).exists():
+            return self._parse_json_format(json_path, 'arc')
+        
+        # Try to find ARC files with pattern matching
+        base_dir = Path(json_path).parent
+        if base_dir.exists():
+            # Look for ARC challenge files (training2 or training)
+            patterns = [
+                str(base_dir / "*training2_challenges.json"),  # Larger dataset
+                str(base_dir / "*training_challenges.json"),    # Original
+            ]
+            
+            for pattern in patterns:
+                matches = glob.glob(pattern)
+                if matches:
+                    challenges_file = matches[0]
+                    # Find corresponding solutions file
+                    solutions_file = challenges_file.replace('_challenges.json', '_solutions.json')
+                    
+                    if Path(solutions_file).exists():
+                        print(f"🔍 Found ARC files:")
+                        print(f"   Challenges: {Path(challenges_file).name}")
+                        print(f"   Solutions: {Path(solutions_file).name}")
+                        return self._parse_arc_files(challenges_file, solutions_file)
+                    else:
+                        print(f"🔍 Found {challenges_file} but no solutions file")
+                        return self._parse_json_format(challenges_file, 'arc')
+        
+        print(f"⚠️  Skipping ARC: No training files found in {base_dir}")
+        return []
     
     def _load_maze_csv(self, csv_path: str) -> List[DataSample]:
         """Load maze CSV - unified format parser."""
@@ -242,9 +274,23 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
     
     def _load_text_dataset(self, path: str) -> List[DataSample]:
         """Load text - unified smart loader."""
-        # HuggingFace datasets
-        if path in ['wikitext2', 'wikitext-2', 'tinystories']:
-            return self._smart_load_data(path, is_hf=True)
+        # HuggingFace datasets - map to correct names
+        hf_name_mapping = {
+            'wikitext2': 'wikitext',
+            'wikitext-2': 'wikitext',
+            'tinystories': 'roneneldan/TinyStories'
+        }
+        
+        if path in hf_name_mapping:
+            actual_name = hf_name_mapping[path]
+            print(f"📦 Loading: {path} (using HF: {actual_name})")
+            try:
+                dataset = load_dataset(actual_name, 'wikitext-2-raw-v1' if 'wikitext' in actual_name else None)
+                data = dataset.get('train', dataset)
+                return [self._parse_item(item, f"{path}_{i}") for i, item in enumerate(data)]
+            except Exception as e:
+                print(f"⚠️  Skipping {path}: {e}")
+                return []
         # Local file chunking
         return self._chunk_text_file(path) if Path(path).exists() else []
     
@@ -253,6 +299,43 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         if path.lower() in ['cifar10', 'cifar-10', 'cifar100', 'cifar-100']:
             return self._smart_load_data(path, is_hf=True)
         return self._smart_load_data(path, is_hf=False)
+    
+    def _parse_arc_files(self, challenges_file: str, solutions_file: str) -> List[DataSample]:
+        """Parse ARC challenge and solution files together."""
+        import json
+        
+        try:
+            with open(challenges_file, 'r') as f:
+                challenges = json.load(f)
+            with open(solutions_file, 'r') as f:
+                solutions = json.load(f)
+            
+            samples = []
+            for task_id in challenges:
+                if task_id in solutions:
+                    # Each task has train and test examples
+                    task_data = {
+                        'train': challenges[task_id].get('train', []),
+                        'test': [{'input': ex['input'], 'output': solutions[task_id][i]}
+                                for i, ex in enumerate(challenges[task_id].get('test', []))]
+                    }
+                    
+                    # Parse as standard ARC format
+                    for split in ['train', 'test']:
+                        for idx, example in enumerate(task_data.get(split, [])):
+                            samples.append(DataSample(
+                                sample_id=f"{task_id}_{split}_{idx}",
+                                modality=ModalityType.GRID,
+                                grid=np.array(example.get('input', [])),
+                                label=example.get('output'),
+                                metadata={'task_id': task_id, 'split': split}
+                            ))
+            
+            print(f"   Loaded {len(samples)} ARC samples from {len(challenges)} tasks")
+            return samples
+        except Exception as e:
+            print(f"⚠️  Error parsing ARC files: {e}")
+            return []
     
     def _parse_json_format(self, json_path: str, format_type: str) -> List[DataSample]:
         """Unified JSON parser (ARC, custom formats)."""

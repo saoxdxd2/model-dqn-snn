@@ -157,32 +157,50 @@ class BaseDatasetBuilder(ABC):
         # Unified conversion: all modalities → text representation
         texts = [self._sample_to_text(s) for s in samples]
         
-        # Single batch encoding loop
-        all_data = {'sketches': [], 'checksums': [], 'children': []}
-        batch_size = 8
+        # Encoding with incremental concatenation to prevent RAM accumulation
+        batch_size = 4  # Reduced from 8 to lower memory usage
+        chunk_size = 500  # Concatenate every 500 samples to prevent RAM leak
         
         from tqdm import tqdm
         import gc
         
+        # Initialize result tensors
+        result_chunks = {'sketches': [], 'checksums': [], 'children': []}
+        temp_data = {'sketches': [], 'checksums': [], 'children': []}
+        
         for i in tqdm(range(0, len(texts), batch_size), desc="Encoding capsules"):
             with torch.no_grad():
-                result = self.encoder(texts[i:i+batch_size], return_children=True)
+                batch_result = self.encoder(texts[i:i+batch_size], return_children=True)
             
-            for key in all_data:
-                if key in result and result[key] is not None:
-                    all_data[key].append(result[key].cpu())
+            # Move to CPU immediately and append
+            for key in temp_data:
+                if key in batch_result and batch_result[key] is not None:
+                    temp_data[key].append(batch_result[key].cpu())
             
-            # Clear intermediate results
-            del result
+            del batch_result
             
-            # Periodic memory cleanup (every 100 batches)
-            if i % (batch_size * 100) == 0:
-                gc.collect()
+            # Concatenate chunks periodically to free intermediate lists
+            if len(temp_data['sketches']) >= chunk_size // batch_size:
+                for key in temp_data:
+                    if temp_data[key]:
+                        result_chunks[key].append(torch.cat(temp_data[key], dim=0))
+                        temp_data[key] = []  # Clear temp list
+                
+                gc.collect()  # Force garbage collection
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         
-        # Concatenate all batches
-        result = {k: torch.cat(v, dim=0) if v else torch.empty(0) for k, v in all_data.items()}
+        # Final concatenation of remaining data
+        for key in temp_data:
+            if temp_data[key]:
+                result_chunks[key].append(torch.cat(temp_data[key], dim=0))
+        
+        # Concatenate all chunks into final result
+        result = {k: torch.cat(v, dim=0) if v else torch.empty(0) for k, v in result_chunks.items()}
+        
+        # Final cleanup
+        del temp_data, result_chunks
+        gc.collect()
         
         # Ensure at least 'sketches' key exists for compatibility
         if 'sketches' not in result or result['sketches'].numel() == 0:
