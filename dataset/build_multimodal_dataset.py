@@ -45,7 +45,7 @@ class MultimodalDatasetConfig(BaseModel):
     
     # Data sources (auto-detects format)
     source_paths: List[str] = []  # Can be: HF dataset name, JSON, CSV, image dir, etc.
-    output_dir: str = "datasets/multimodal"
+    output_dir: str = "datasets/output"  # Default, should be overridden by CLI
     
     # Auto-detection (override if needed)
     source_type: Optional[str] = None  # Auto-detect if None: "hf", "arc_json", "maze_csv", "image_dir", etc.
@@ -409,8 +409,8 @@ def _post_process(config: MultimodalDatasetConfig, dataset: Dict):
             from models.concept_decoder import ConceptDecoder
             from transformers import AutoTokenizer
             
+            # Path already saved by builder.save(), just reference it
             train_path = f"{config.output_dir}/capsule_dataset.pt"
-            torch.save(dataset['train'], train_path)
             
             decoder = ConceptDecoder(num_concepts=config.num_concepts)
             decoder.build_expansion_table_from_data(train_path, AutoTokenizer.from_pretrained("gpt2"), config.num_concepts)

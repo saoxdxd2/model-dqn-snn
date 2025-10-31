@@ -164,12 +164,18 @@ def detect_dataset_features(data_path: str) -> dict:
 def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str = 'train'):
     """Unified dataset loading with auto-detection."""
     
-    # Auto-detect dataset features
-    dataset_path = config.data_paths[0] if config.data_paths else ''
-    features = detect_dataset_features(dataset_path)
+    # Check if semantic_mode is explicitly set in config
+    semantic_mode = getattr(config, 'semantic_mode', None)
     
-    # Override config if not explicitly set
-    semantic_mode = getattr(config, 'semantic_mode', features['is_capsule'])
+    # Auto-detect dataset features only if semantic_mode not explicitly set
+    if semantic_mode is None:
+        dataset_path = config.data_paths[0] if config.data_paths else ''
+        features = detect_dataset_features(dataset_path)
+        semantic_mode = features['is_capsule']
+    else:
+        # Still detect features for logging purposes
+        dataset_path = config.data_paths[0] if config.data_paths else ''
+        features = detect_dataset_features(dataset_path) if os.path.exists(dataset_path) else {'is_capsule': semantic_mode, 'has_checksums': False, 'has_children': False, 'enable_dqn': False}
     
     if rank == 0 and features['is_capsule']:
         print(f"\n🔍 Auto-detected HESC capsule dataset")
