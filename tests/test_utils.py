@@ -24,7 +24,7 @@ def test_gradient_monitor():
         nn.Linear(20, 5)
     )
     
-    monitor = GradientFlowMonitor(model, log_interval=1)
+    monitor = GradientFlowMonitor(model)
     
     # Forward + backward
     x = torch.randn(2, 10, requires_grad=True)

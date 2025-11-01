@@ -11,6 +11,9 @@ flash-attn
 # Numerical and scientific stack
 numba
 einops
+adam-atan2-pytorch
+scikit-learn
+tqdm
 
 # AI & model management
 wandb

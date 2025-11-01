@@ -19,11 +19,20 @@ def test_act_loss_head_basic():
     
     config = TinyRecursiveReasoningModel_ACTV1Config(
         hidden_size=256,
-        num_heads=4,
+        num_heads=8,
+        num_key_value_heads=2,
         H_layers=0,
         L_layers=2,
+        H_cycles=3,
+        L_cycles=2,
         seq_len=12,
         vocab_size=2048,
+        batch_size=2,
+        num_puzzle_identifiers=0,
+        expansion=4.0,
+        pos_encodings='rope',
+        halt_max_steps=16,
+        halt_exploration_prob=0.1,
         use_semantic_encoder=True,
         enable_dqn=False
     )
@@ -47,11 +56,20 @@ def test_act_loss_head_with_dqn():
     
     config = TinyRecursiveReasoningModel_ACTV1Config(
         hidden_size=256,
-        num_heads=4,
+        num_heads=8,
+        num_key_value_heads=2,
         H_layers=0,
         L_layers=2,
+        H_cycles=3,
+        L_cycles=2,
         seq_len=12,
         vocab_size=2048,
+        batch_size=2,
+        num_puzzle_identifiers=0,
+        expansion=4.0,
+        pos_encodings='rope',
+        halt_max_steps=16,
+        halt_exploration_prob=0.1,
         use_semantic_encoder=True,
         enable_dqn=True,
         dqn_buffer_capacity=1000

@@ -20,7 +20,7 @@ def test_text_to_capsule_pipeline():
     
     renderer = TextRenderer(width=512, height=384)
     text = "The quick brown fox jumps over the lazy dog."
-    rendered_image = renderer.render_text(text)
+    rendered_image = renderer.render_code(text)
     
     encoder = CapsuleEncoder(
         hidden_size=768,

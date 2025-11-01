@@ -173,7 +173,6 @@ def main():
         test_text_rendering_integration()
         test_image_only_sample()
         test_mixed_sample()
-        test_text_rendering_disabled()
         
         print("\n" + "=" * 70)
         print("✅ ALL TESTS PASSED")

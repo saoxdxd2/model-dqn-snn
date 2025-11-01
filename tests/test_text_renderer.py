@@ -15,7 +15,7 @@ def test_text_renderer():
     renderer = TextRenderer(width=512, height=384)
     
     text = "Hello World!\nThis is a test of the text rendering system.\n\nIt should wrap text nicely."
-    image = renderer.render_text(text)
+    image = renderer.render_code(text)
     
     assert image is not None, "Image should not be None"
     assert image.size == (512, 384), f"Image size should be (512, 384), got {image.size}"

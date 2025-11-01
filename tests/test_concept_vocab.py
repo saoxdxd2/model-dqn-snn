@@ -13,14 +13,13 @@ import numpy as np
 
 def test_concept_vocab_basic():
     """Test basic concept vocabulary."""
-    from models.concept_vocab import ConceptVocabulary
+    from models.concept_vocab import ConceptCodebook
     
     print("\n=== Test 1: Concept Vocabulary Basic ===")
     
-    vocab = ConceptVocabulary(
+    vocab = ConceptCodebook(
         num_concepts=2048,
-        hidden_size=256,
-        use_sparse=False
+        hidden_size=256
     )
     
     # Test encoding
@@ -119,11 +118,11 @@ def test_sparse_embedding():
 
 def test_concept_checksum():
     """Test concept checksum for integrity."""
-    from models.concept_vocab import ConceptVocabulary
+    from models.concept_vocab import ConceptCodebook
     
     print("\n=== Test 5: Concept Checksum ===")
     
-    vocab = ConceptVocabulary(num_concepts=2048, hidden_size=256)
+    vocab = ConceptCodebook(num_concepts=2048, hidden_size=256)
     
     # Encode
     inputs = torch.randn(1, 12, 256)
