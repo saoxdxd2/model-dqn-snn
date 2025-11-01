@@ -9,14 +9,13 @@ pydantic-core
 flash-attn
 
 # Numerical and scientific stack
-numba>=0.59.1,<0.62  # CUDA compatibility
+numba
 einops
 
 # AI & model management
 wandb
-datasets>=4.0.0
-huggingface-hub>=0.34.0,<1.0  # transformers compatibility
-
+datasets
+huggingface-hub
 opencv-python
 gradio
 pylibcudf-cu12
