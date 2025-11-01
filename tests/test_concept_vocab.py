@@ -65,9 +65,30 @@ def test_hybrid_output_head():
 
 def test_concept_decoder():
     """Test concept decoder with expansion."""
+    from models.concept_decoder import ConceptDecoder
+    
     print("\n=== Test 3: Concept Decoder ===")
-    print("⚠️  ConceptDecoder test skipped (optional component)")
-    return None
+    
+    # Create decoder with correct parameters
+    decoder = ConceptDecoder(
+        num_concepts=2048,
+        bpe_vocab_size=50257,
+        expansion_table_path=None  # No pre-built table for test
+    )
+    
+    # Test expansion table exists
+    assert decoder.expansion_table is not None
+    assert decoder.num_concepts == 2048
+    print(f"✓ ConceptDecoder initialized: {decoder.num_concepts} concepts")
+    
+    # Add a test concept
+    test_tokens = [100, 200, 300]
+    decoder.expansion_table.add_concept(0, test_tokens, "test concept")
+    
+    # Verify retrieval
+    expansion = decoder.expansion_table.get_expansion(0)
+    assert expansion == test_tokens
+    print(f"✓ Concept expansion storage works")
     
     return decoder
 
