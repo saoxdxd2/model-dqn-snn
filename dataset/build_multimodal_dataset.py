@@ -462,7 +462,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         if sample.text and self.text_renderer is not None and sample.image is None:
             # Render text to image for unified vision processing
             try:
-                rendered_image = self.text_renderer.render_text(sample.text)
+                rendered_image = self.text_renderer.render_code(sample.text)
                 sample.image = rendered_image  # PIL Image
                 sample.metadata['text_rendered'] = True
                 sample.metadata['original_text'] = sample.text[:200]  # Keep snippet for debugging

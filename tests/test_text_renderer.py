@@ -56,12 +56,12 @@ def test_auto_detection():
     
     # Should detect as code
     code_sample = "def foo():\n    return 42"
-    image1 = renderer.render_text(code_sample)
+    image1 = renderer.render_code(code_sample)
     print("✓ Code auto-detection works")
     
     # Should detect as plain text
     text_sample = "This is just plain text without any code."
-    image2 = renderer.render_text(text_sample)
+    image2 = renderer.render_code(text_sample)
     print("✓ Plain text rendering works")
     
     return image1, image2

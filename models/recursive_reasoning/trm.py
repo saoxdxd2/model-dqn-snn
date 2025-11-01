@@ -535,7 +535,16 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
     def __init__(self, config_dict: dict):
         super().__init__()
-        self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)
+        # Handle config as dict or object
+        if isinstance(config_dict, TinyRecursiveReasoningModel_ACTV1Config):
+            # Already a config object, use directly
+            self.config = config_dict
+        elif isinstance(config_dict, dict):
+            # Dict, convert to config
+            self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict)
+        else:
+            # Other object with __dict__
+            self.config = TinyRecursiveReasoningModel_ACTV1Config(**config_dict.__dict__)
         self.inner = TinyRecursiveReasoningModel_ACTV1_Inner(self.config)
 
     @property

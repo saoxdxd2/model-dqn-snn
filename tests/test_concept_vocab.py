@@ -19,7 +19,7 @@ def test_concept_vocab_basic():
     
     vocab = ConceptCodebook(
         num_concepts=2048,
-        hidden_size=256
+        concept_dim=256  # Use concept_dim, not hidden_size
     )
     
     # Test encoding
@@ -122,7 +122,7 @@ def test_concept_checksum():
     
     print("\n=== Test 5: Concept Checksum ===")
     
-    vocab = ConceptCodebook(num_concepts=2048, hidden_size=256)
+    vocab = ConceptCodebook(num_concepts=2048, concept_dim=256)
     
     # Encode
     inputs = torch.randn(1, 12, 256)
