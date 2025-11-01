@@ -48,5 +48,5 @@ setuptools-scm>=9.2.2
 
 # Intel iGPU or CPU deployment (optional — OpenVINO)
 # Comment out these two if you only use GPU (CUDA)
-openvino==2024.6.0
-openvino-dev==2024.6.0
+openvino
+openvino-dev
