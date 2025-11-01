@@ -19,5 +19,3 @@ huggingface-hub
 
 opencv-python
 gradio
-openvino-dev
-openvino
