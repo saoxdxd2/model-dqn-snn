@@ -69,11 +69,9 @@ MODELS = {
         "dataset_builder": "dataset/build_multimodal_dataset.py",
         "dataset_command": "build-composite",
         "dataset_args": [
-            "--sources", "wikitext2", "cifar10", "kaggle/combined/arc-agi",  # Fixed: sources not source-paths
+            "--sources", "wikitext2", "cifar10", "kaggle/combined/arc-agi",
             "--output-dir", "datasets/vision_unified",
-            "--render-text-to-image", "True",  # Text → Images via rendering
-            "--use-capsules", "True",  # 12-capsule HESC compression
-            "--image-encoder", "hybrid"  # DINOv2 + CLIP fusion
+            "--augment"  # Enable augmentation
         ],
         "description": (
             "Single vision model handles ALL modalities:\n"
