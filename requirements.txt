@@ -1,43 +1,53 @@
-adam-atan2-pytorch
-einops
+# Core utilities
 tqdm
 coolname
-pydantic
-pydantic-core
-argdantic
-wandb
+packaging
+pygments
 omegaconf
 hydra-core
+argdantic
+pydantic
+pydantic-core
+
+# PyTorch ecosystem (Colab comes with torch preinstalled, so we just add extensions)
+torchvision
+torchaudio
+flash-attn
+
+# Numerical and scientific stack
+numpy>=2.1,<2.3
+numba
+scikit-learn
+joblib
+einops
+lz4
+orjson
+
+# AI & model management
+wandb
+datasets
 huggingface-hub
-packaging
+huggingface_hub[hf_xet]
+fastai
+ultralytics
+
+# OpenCV suite (full vision tools)
+opencv-python
+opencv-python-headless
+opencv-contrib-python
+
+# Visualization & UI
+gradio
+Pillow
+ipython
+
+# Build tools (required for compiling flash-attn and similar)
 ninja>=1.13.0
 wheel>=0.45.1
 setuptools>=80.9.0
 setuptools-scm>=9.2.2
-numba
-fastai 
-gradio 
-triton-windows; platform_system == "Windows"
-triton; platform_system != "Windows"
-ipython
-torchaudio 
-torchvision
-flash-attn
-datasets
-scikit-learn 
 
-joblib
-opencv-python
-opencv-python-headless 
-opencv-contrib-python
-orjson
-lz4
-
-# Intel iGPU deployment
-openvino
-openvino-dev
-
-Pillow
-pygments
-ultralytics
-huggingface_hub[hf_xet]
+# Intel iGPU or CPU deployment (optional — OpenVINO)
+# Comment out these two if you only use GPU (CUDA)
+openvino==2024.6.0
+openvino-dev==2024.6.0
