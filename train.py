@@ -69,7 +69,7 @@ MODELS = {
         "dataset_builder": "dataset/build_multimodal_dataset.py",
         "dataset_command": "build-composite",
         "dataset_args": [
-            "--source-paths", "wikitext2", "cifar10", "kaggle/combined/arc-agi",
+            "--sources", "wikitext2", "cifar10", "kaggle/combined/arc-agi",  # Fixed: sources not source-paths
             "--output-dir", "datasets/vision_unified",
             "--render-text-to-image", "True",  # Text → Images via rendering
             "--use-capsules", "True",  # 12-capsule HESC compression

@@ -55,8 +55,10 @@ def test_hybrid_output_head():
     hidden = torch.randn(2, 12, 256)
     logits = head(hidden)
     
-    assert logits.shape == (2, 12, 2048), f"Logits shape: {logits.shape}"
-    print(f"✓ Hybrid head output: {logits.shape}")
+    # HybridOutputHead adds 4 control tokens: EXPAND, STOP, MERGE, PAD
+    expected_vocab = 2048 + 4  # concepts + control tokens
+    assert logits.shape == (2, 12, expected_vocab), f"Logits shape: {logits.shape}, expected (2, 12, {expected_vocab})"
+    print(f"✓ Hybrid head output: {logits.shape} (2048 concepts + 4 control tokens)")
     
     return head
 
