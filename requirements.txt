@@ -6,34 +6,18 @@ hydra-core
 argdantic
 pydantic
 pydantic-core
-
-# PyTorch ecosystem
-# (torch, torchvision, torchaudio already available)
 flash-attn
 
 # Numerical and scientific stack
 numba
 einops
-lz4
-orjson
 
 # AI & model management
 wandb
 datasets
 huggingface-hub
-huggingface_hub[hf_xet]
-fastai
-ultralytics
 
-# OpenCV suite (full vision tools)
 opencv-python
-opencv-python-headless
-opencv-contrib-python
-
-# Visualization & UI
 gradio
-
-# Intel iGPU or CPU deployment (optional — OpenVINO)
-# Comment out if using only CUDA
-openvino
 openvino-dev
+openvino
