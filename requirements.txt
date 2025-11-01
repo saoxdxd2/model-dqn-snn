@@ -19,3 +19,5 @@ huggingface-hub>=0.34.0,<1.0  # transformers compatibility
 
 opencv-python
 gradio
+pylibcudf-cu12
+cudf-cu12
