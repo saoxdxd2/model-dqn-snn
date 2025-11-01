@@ -465,12 +465,32 @@ def check_dataset_exists(output_dir: str) -> bool:
 
 def download_and_build_dataset(model_config: dict, force_rebuild: bool = False):
     """Download dataset and build preprocessed files."""
-    output_dir = model_config['dataset_args']['output_dir']
+    dataset_args = model_config['dataset_args']
+    
+    # Handle both list and dict formats
+    if isinstance(dataset_args, list):
+        # Convert list format to dict
+        args_dict = {}
+        i = 0
+        while i < len(dataset_args):
+            if dataset_args[i].startswith('--'):
+                key = dataset_args[i][2:].replace('-', '_')  # Remove -- and normalize
+                if i + 1 < len(dataset_args) and not dataset_args[i + 1].startswith('--'):
+                    args_dict[key] = dataset_args[i + 1]
+                    i += 2
+                else:
+                    args_dict[key] = True
+                    i += 1
+            else:
+                i += 1
+        dataset_args = args_dict
+    
+    output_dir = dataset_args.get('output_dir', 'datasets/default')
     
     # Check if already exists
     if check_dataset_exists(output_dir):
         if not force_rebuild:
-            print(f"\n✅ Dataset found at: {output_dir}")
+            print(f"\nDataset found at: {output_dir}")
             print("   Skipping dataset building (use --rebuild-dataset to force rebuild)")
             return True
         else:

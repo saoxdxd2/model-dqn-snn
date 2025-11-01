@@ -22,18 +22,14 @@ def test_concept_vocab_basic():
         concept_dim=256  # Use concept_dim, not hidden_size
     )
     
-    # Test encoding
+    # Test encoding (forward pass)
     inputs = torch.randn(2, 12, 256)
-    concepts, scores = vocab.encode(inputs)
+    quantized, vq_loss, perplexity = vocab(inputs)
     
-    assert concepts.shape == (2, 12), f"Concepts shape: {concepts.shape}"
-    assert scores.shape == (2, 12, 2048), f"Scores shape: {scores.shape}"
-    print(f"✓ Encoding works: concepts {concepts.shape}, scores {scores.shape}")
-    
-    # Test decoding
-    decoded = vocab.decode(concepts)
-    assert decoded.shape == (2, 12, 256), f"Decoded shape: {decoded.shape}"
-    print(f"✓ Decoding works: {decoded.shape}")
+    assert quantized.shape == (2, 12, 256), f"Quantized shape: {quantized.shape}"
+    assert isinstance(vq_loss, torch.Tensor), "VQ loss should be a tensor"
+    assert isinstance(perplexity, torch.Tensor), "Perplexity should be a tensor"
+    print(f"✓ Forward pass works: quantized {quantized.shape}, loss {vq_loss.item():.4f}, perplexity {perplexity.item():.2f}")
     
     return vocab
 
@@ -124,17 +120,16 @@ def test_concept_checksum():
     
     vocab = ConceptCodebook(num_concepts=2048, concept_dim=256)
     
-    # Encode
+    # Forward pass
     inputs = torch.randn(1, 12, 256)
-    concepts, _ = vocab.encode(inputs)
+    quantized_1, _, _ = vocab(inputs)
     
-    # Decode and re-encode (should be consistent)
-    decoded = vocab.decode(concepts)
-    concepts_2, _ = vocab.encode(decoded)
+    # Second forward pass (should be deterministic)
+    quantized_2, _, _ = vocab(inputs)
     
-    # Check consistency
-    match_rate = (concepts == concepts_2).float().mean()
-    print(f"✓ Checksum consistency: {match_rate.item():.2%} match")
+    # Check consistency (should be identical for same input)
+    diff = (quantized_1 - quantized_2).abs().mean()
+    print(f"✓ Consistency: diff={diff.item():.6f} (should be ~0)")
     
     return match_rate
 
