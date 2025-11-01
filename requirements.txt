@@ -28,6 +28,8 @@ scikit-learn
 
 joblib
 opencv-python
+opencv-python-headless 
+opencv-contrib-python
 orjson
 lz4
 
