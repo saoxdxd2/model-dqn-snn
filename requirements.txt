@@ -1,15 +1,15 @@
 adam-atan2-pytorch
-einops>=0.8.1
-tqdm>=4.67.1
-coolname>=2.2.0
+einops
+tqdm
+coolname
 pydantic
 pydantic-core
-argdantic>=1.3.3
-wandb>=0.22.2
-omegaconf>=2.3.0
-hydra-core>=1.3.2
+argdantic
+wandb
+omegaconf
+hydra-core
 huggingface-hub
-packaging>=25.0
+packaging
 ninja>=1.13.0
 wheel>=0.45.1
 setuptools>=80.9.0
@@ -26,16 +26,16 @@ flash-attn
 datasets
 scikit-learn 
 
-joblib>=1.3.0        
-opencv-python>=4.8.0   
-orjson>=3.9.0         
-lz4>=4.3.0
+joblib
+opencv-python
+orjson
+lz4
 
 # Intel iGPU deployment
-openvino>=2024.0.0
-openvino-dev>=2024.0.0
+openvino
+openvino-dev
 
 Pillow
-pygments>=2.15.0     # Syntax highlighting for code rendering
-ultralytics>=8.0.0     
+pygments
+ultralytics
 huggingface_hub[hf_xet]

@@ -63,64 +63,27 @@ COMMUNICATION_ROADMAP = [
 ]
 
 MODELS = {
-    "text": {
-        "name": "Text Generation (WikiText-2)",
-        "config": "cfg_text",
-        "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build-text",
-        "dataset_args": {
-            "input_file": "wikitext2",
-            "output_dir": "datasets/wikitext2",
-            "num_concepts": 2048,
-            "target_capsules": 12
-        },
-        "description": "Language modeling with HESC capsules (H=4, L=3, 16 recursions)"
-    },
-    "vision": {
-        "name": "Vision Classification (CIFAR-10)",
-        "config": "cfg_vision",
-        "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build-image",
-        "dataset_args": {
-            "dataset_name": "cifar10",
-            "output_dir": "data/vision-cifar10",
-            "image_size": 224
-        },
-        "description": "Image classification with spatial reasoning (H=3, L=3, 12 recursions)"
-    },
-    "arc": {
-        "name": "ARC-AGI Reasoning (Geometric Puzzles)",
-        "config": "cfg_pretrain",
-        "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build-arc",
-        "dataset_args": {
-            "input_file_prefix": "kaggle/combined/arc-agi",
-            "output_dir": "data/arc-capsules",
-            "subsets": ["training", "training2"],
-            "test_set_name": "evaluation",
-            "num_aug": 1000,
-            "seed": 42
-        },
-        "description": "Visual reasoning on 30×30 grids (H=3, L=6, 21 recursions - TRM paper optimal)"
-    },
-    "multimodal": {
-        "name": "Multimodal Unified (Text + Vision + ARC)",
+    "vision-unified": {
+        "name": "Vision-Unified Model (Text + Images + Puzzles)",
         "config": "cfg_multimodal",
         "dataset_builder": "dataset/build_multimodal_dataset.py",
         "dataset_command": "build-composite",
-        "dataset_args": {
-            "sources": [
-                "kaggle/combined/arc-agi_training.json",
-                "wikitext2",
-                "cifar10"
-            ],
-            "output_dir": "datasets/multimodal_unified",
-            "augment": True,
-            "num_concepts": 2048,
-            "target_capsules": 12,
-            "enable_quality_scoring": True
-        },
-        "description": "Cross-modal transfer learning (H=3, L=2, 9 recursions for 12-capsule compression)"
+        "dataset_args": [
+            "--source-paths", "wikitext2", "cifar10", "kaggle/combined/arc-agi",
+            "--output-dir", "datasets/vision_unified",
+            "--render-text-to-image", "True",  # Text → Images via rendering
+            "--use-capsules", "True",  # 12-capsule HESC compression
+            "--image-encoder", "hybrid"  # DINOv2 + CLIP fusion
+        ],
+        "description": (
+            "Single vision model handles ALL modalities:\n"
+            "  • Text → rendered to images with syntax highlighting\n"
+            "  • Images → DINOv2/CLIP hybrid encoder with patch attention\n"
+            "  • Puzzles → 30×30 grids compressed to 12 capsules\n"
+            "  • Architecture: H=3, L=2 (9 recursions optimal for 12 capsules)\n"
+            "  • Features: DQN halting, Memory Bank, MTP, Curiosity rewards\n"
+            "  • Everything runs through unified vision pipeline"
+        )
     }
 }
 
