@@ -96,7 +96,11 @@ class ConceptCodebook(nn.Module):
         # Straight-through estimator: copy gradients from z_q to z
         z_q = z + (z_q - z).detach()
         
-        return z_q, concept_ids, vq_loss
+        # Compute perplexity (measure of codebook usage)
+        avg_probs = torch.mean(F.one_hot(concept_ids_flat, self.num_concepts).float(), dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        
+        return z_q, vq_loss, perplexity
     
     def _ema_update(self, z_flat: torch.Tensor, concept_ids_flat: torch.Tensor):
         """EMA update of codebook (VQ-VAE2 style)."""

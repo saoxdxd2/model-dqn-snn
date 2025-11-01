@@ -29,7 +29,11 @@ def test_concept_vocab_basic():
     assert quantized.shape == (2, 12, 256), f"Quantized shape: {quantized.shape}"
     assert isinstance(vq_loss, torch.Tensor), "VQ loss should be a tensor"
     assert isinstance(perplexity, torch.Tensor), "Perplexity should be a tensor"
-    print(f"✓ Forward pass works: quantized {quantized.shape}, loss {vq_loss.item():.4f}, perplexity {perplexity.item():.2f}")
+    
+    # Handle scalar or tensor loss
+    loss_val = vq_loss.item() if vq_loss.numel() == 1 else vq_loss.mean().item()
+    perp_val = perplexity.item() if perplexity.numel() == 1 else perplexity.mean().item()
+    print(f"✓ Forward pass works: quantized {quantized.shape}, loss {loss_val:.4f}, perplexity {perp_val:.2f}")
     
     return vocab
 

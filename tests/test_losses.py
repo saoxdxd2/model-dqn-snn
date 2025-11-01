@@ -34,6 +34,7 @@ def test_act_loss_head_basic():
         halt_max_steps=16,
         halt_exploration_prob=0.1,
         use_semantic_encoder=True,
+        encoder_model='openai/clip-vit-base-patch32',  # Smaller for tests
         enable_dqn=False
     )
     
@@ -71,6 +72,7 @@ def test_act_loss_head_with_dqn():
         halt_max_steps=16,
         halt_exploration_prob=0.1,
         use_semantic_encoder=True,
+        encoder_model='openai/clip-vit-base-patch32',  # Smaller for tests
         enable_dqn=True,
         dqn_buffer_capacity=1000
     )

@@ -34,6 +34,7 @@ def test_trm_initialization():
         halt_max_steps=16,
         halt_exploration_prob=0.1,
         use_semantic_encoder=True,  # Vision-unified
+        encoder_model='openai/clip-vit-base-patch32',  # Smaller model for tests
         target_capsules=12,
         enable_dqn=False,
         enable_memory=False,
