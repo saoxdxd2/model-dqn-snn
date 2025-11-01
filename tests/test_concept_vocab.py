@@ -131,7 +131,7 @@ def test_concept_checksum():
     diff = (quantized_1 - quantized_2).abs().mean()
     print(f"✓ Consistency: diff={diff.item():.6f} (should be ~0)")
     
-    return match_rate
+    return diff
 
 
 def main():
