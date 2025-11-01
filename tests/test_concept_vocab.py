@@ -47,8 +47,8 @@ def test_hybrid_output_head():
     head = HybridOutputHead(
         hidden_size=256,
         num_concepts=2048,
-        num_tokens=2048,
-        use_concepts=True
+        concept_dim=256,
+        use_vq=True
     )
     
     # Test forward

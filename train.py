@@ -509,11 +509,27 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False):
     if 'dataset_command' in model_config:
         cmd.append(model_config['dataset_command'])
     
-    # Add arguments
+    # Convert to dict if it's a list
+    if isinstance(args, list):
+        args_dict = {}
+        i = 0
+        while i < len(args):
+            if args[i].startswith('--'):
+                key = args[i][2:].replace('-', '_')
+                if i + 1 < len(args) and not args[i + 1].startswith('--'):
+                    args_dict[key] = args[i + 1]
+                    i += 2
+                else:
+                    args_dict[key] = True
+                    i += 1
+            else:
+                i += 1
+        args = args_dict
+    
+    # Build arguments
     for key, value in args.items():
         flag = f"--{key.replace('_', '-')}"
         if isinstance(value, bool):
-            # Boolean flags: only add flag name if True, skip if False
             if value:
                 cmd.append(flag)
         elif isinstance(value, list):
