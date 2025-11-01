@@ -1,7 +1,5 @@
 # Core utilities
-tqdm
 coolname
-packaging
 pygments
 omegaconf
 hydra-core
@@ -9,15 +7,12 @@ argdantic
 pydantic
 pydantic-core
 
-# PyTorch ecosystem (Colab comes with torch preinstalled, so we just add extensions)
-torchvision
-torchaudio
+# PyTorch ecosystem
+# (torch, torchvision, torchaudio already available)
 flash-attn
 
 # Numerical and scientific stack
 numba
-scikit-learn
-joblib
 einops
 lz4
 orjson
@@ -37,16 +32,8 @@ opencv-contrib-python
 
 # Visualization & UI
 gradio
-Pillow
-ipython
-
-# Build tools (required for compiling flash-attn and similar)
-ninja>=1.13.0
-wheel>=0.45.1
-setuptools>=80.9.0
-setuptools-scm>=9.2.2
 
 # Intel iGPU or CPU deployment (optional — OpenVINO)
-# Comment out these two if you only use GPU (CUDA)
+# Comment out if using only CUDA
 openvino
 openvino-dev
