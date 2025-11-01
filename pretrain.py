@@ -270,13 +270,13 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             print(f"{'='*60}\n")
             
             import subprocess
+            # Use NEW multimodal builder with text rendering support
             build_cmd = [
-                "python", "dataset/build_arc_dataset.py",
-                "--input-file-prefix", "kaggle/combined/arc-agi",
+                "python", "dataset/build_multimodal_dataset.py",
+                "--source-paths", "kaggle/combined/arc-agi",
                 "--output-dir", "data/arc-aug-5000",
-                "--subsets", "training", "training2",
-                "--test-set-name", "evaluation",
-                "--num-aug", "5000",
+                "--render-text-to-image", "True",
+                "--use-capsules", "True",
                 "--seed", "42"
             ]
             

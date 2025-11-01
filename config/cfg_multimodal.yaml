@@ -20,6 +20,7 @@ semantic_dataset: "datasets/multimodal_unified/capsule_dataset.pt"
 semantic_eval_dataset: "datasets/multimodal_unified/capsule_dataset_test.pt"
 
 # Training hyperparameters (optimized for 12-capsule sequences)
+image_size: 128  # Reduced from 224 to fit 100k samples in 12GB RAM
 global_batch_size: 768  # High batch for capsule compression
 epochs: 50000
 eval_interval: 1000

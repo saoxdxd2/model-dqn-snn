@@ -26,3 +26,16 @@ flash-attn
 datasets
 scikit-learn 
 
+joblib>=1.3.0        
+opencv-python>=4.8.0   
+orjson>=3.9.0         
+lz4>=4.3.0
+
+# Intel iGPU deployment
+openvino>=2024.0.0
+openvino-dev>=2024.0.0
+
+Pillow
+pygments>=2.15.0     # Syntax highlighting for code rendering
+ultralytics>=8.0.0     
+huggingface_hub[hf_xet]

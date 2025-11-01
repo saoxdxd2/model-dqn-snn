@@ -31,8 +31,13 @@ class CapsuleEncoder(nn.Module):
         checksum_dim: int = 32,
         freeze_encoder: bool = True,
         encoder_model: str = "openai/clip-vit-large-patch14",
-        use_spatial: bool = True,  # NEW: Enable spatial organization
-        capsule_grid_shape: tuple = (3, 4),  # NEW: 3x4 grid = 12 capsules
+        use_spatial: bool = True,  # Enable spatial organization
+        capsule_grid_shape: tuple = (3, 4),  # 3x4 grid = 12 capsules
+        # NEW: Multi-encoder support (from cnn_tokenizer migration)
+        use_dinov2: bool = False,  # Add DINOv2 for stronger visual reasoning
+        dinov2_model: str = "facebook/dinov2-base",
+        use_hybrid: bool = False,  # Concatenate CLIP + DINOv2 features
+        output_mode: str = "capsules",  # "capsules" (hierarchical) or "patches" (flat)
     ):
         super().__init__()
         
@@ -48,32 +53,59 @@ class CapsuleEncoder(nn.Module):
         self.encoder_model = encoder_model
         self.use_spatial = use_spatial
         self.capsule_grid_shape = capsule_grid_shape
+        self.use_dinov2 = use_dinov2
+        self.use_hybrid = use_hybrid or (use_dinov2 and "clip" in encoder_model.lower())
+        self.output_mode = output_mode
+        self.freeze_encoder = freeze_encoder
         
         assert capsule_grid_shape[0] * capsule_grid_shape[1] == target_capsules, \
             f"Grid shape {capsule_grid_shape} must multiply to {target_capsules}"
         
-        # Semantic encoder (default: CLIP, but configurable)
+        # Initialize encoders
         print(f"\n🔧 Initializing CapsuleEncoder:")
-        print(f"   Encoder: {encoder_model}")
+        print(f"   Primary encoder: {encoder_model}")
+        print(f"   DINOv2: {use_dinov2}")
+        print(f"   Hybrid mode: {self.use_hybrid}")
+        print(f"   Output mode: {output_mode}")
         print(f"   Target capsules: {target_capsules}")
         print(f"   Spatial mode: {use_spatial}")
         if use_spatial:
             print(f"   Capsule grid: {capsule_grid_shape[0]}×{capsule_grid_shape[1]}")
         
+        # Initialize primary encoder (CLIP or other)
         if "clip" in encoder_model.lower():
             self.encoder = AutoModel.from_pretrained(encoder_model)
             self.tokenizer = AutoTokenizer.from_pretrained(encoder_model)
             self.encoder_type = "clip"
-            self.encoder_dim = 768 if "large" in encoder_model else 512
+            clip_dim = 768 if "large" in encoder_model else 512
         else:
             self.encoder = AutoModel.from_pretrained(encoder_model)
             self.tokenizer = AutoTokenizer.from_pretrained(encoder_model)
             self.encoder_type = "transformer"
-            self.encoder_dim = self.encoder.config.hidden_size
+            clip_dim = self.encoder.config.hidden_size
         
         if freeze_encoder:
             for param in self.encoder.parameters():
                 param.requires_grad = False
+        
+        # Initialize DINOv2 encoder (optional)
+        self.dinov2_encoder = None
+        dinov2_dim = 0
+        if use_dinov2:
+            print(f"   Loading DINOv2: {dinov2_model}")
+            self.dinov2_encoder = AutoModel.from_pretrained(dinov2_model)
+            if freeze_encoder:
+                for param in self.dinov2_encoder.parameters():
+                    param.requires_grad = False
+                self.dinov2_encoder.eval()
+            dinov2_dim = self.dinov2_encoder.config.hidden_size
+        
+        # Set encoder dimension based on mode
+        if self.use_hybrid and use_dinov2:
+            self.encoder_dim = clip_dim + dinov2_dim
+            print(f"   ✓ Hybrid: CLIP({clip_dim}) + DINOv2({dinov2_dim}) = {self.encoder_dim}")
+        else:
+            self.encoder_dim = dinov2_dim if use_dinov2 and not self.use_hybrid else clip_dim
         
         # Capsule components
         self.sketch_projection = nn.Linear(self.encoder_dim, hidden_size)
@@ -345,13 +377,109 @@ class CapsuleEncoder(nn.Module):
                 image_tensors = torch.stack([preprocess(img) for img in images]).to(device)
             
             # Encode with CLIP vision encoder
-            with torch.no_grad() if not self.training else torch.enable_grad():
-                image_features = self.encoder.get_image_features(pixel_values=image_tensors)
+            batch_size = image_tensors.shape[0]
+            all_features = []
             
-            # image_features: [B, encoder_dim]
-            # Split into k capsules (spatial or semantic regions)
-            batch_size = image_features.shape[0]
-            sketches = image_features.unsqueeze(1).repeat(1, self.target_capsules, 1)  # [B, k, D]
+            # CLIP features
+            with torch.no_grad() if not self.training else torch.enable_grad():
+                if self.use_hybrid or not self.use_dinov2:
+                    # Use CLIP
+                    clip_features = self.encoder.get_image_features(pixel_values=image_tensors)
+                    all_features.append(clip_features)
+            
+            # DINOv2 features
+            if self.dinov2_encoder is not None:
+                with torch.no_grad() if not self.training else torch.enable_grad():
+                    dinov2_features = self.dinov2_encoder(pixel_values=image_tensors).last_hidden_state[:, 0]  # CLS token
+                    all_features.append(dinov2_features)
+            
+            # Combine features
+            if self.use_hybrid and len(all_features) > 1:
+                image_features = torch.cat(all_features, dim=-1)  # [B, clip_dim + dinov2_dim]
+            else:
+                image_features = all_features[0]  # [B, encoder_dim]
+            
+            if self.output_mode == "patches":
+                # Flat patches mode (from cnn_tokenizer): return raw patch embeddings
+                from transformers import CLIPVisionModel
+                all_patch_features = []
+                
+                # CLIP patches
+                if self.use_hybrid or not self.use_dinov2:
+                    if isinstance(self.encoder, CLIPVisionModel):
+                        with torch.no_grad() if not self.training else torch.enable_grad():
+                            outputs = self.encoder.vision_model(pixel_values=image_tensors, output_hidden_states=True)
+                            clip_patches = outputs.last_hidden_state  # [B, num_patches+1, clip_dim]
+                        all_patch_features.append(clip_patches)
+                
+                # DINOv2 patches
+                if self.dinov2_encoder is not None:
+                    with torch.no_grad() if not self.training else torch.enable_grad():
+                        dinov2_outputs = self.dinov2_encoder(pixel_values=image_tensors)
+                        dinov2_patches = dinov2_outputs.last_hidden_state  # [B, num_patches+1, dinov2_dim]
+                    all_patch_features.append(dinov2_patches)
+                
+                # Combine patches
+                if self.use_hybrid and len(all_patch_features) > 1:
+                    # Concatenate along feature dimension
+                    sketches = torch.cat(all_patch_features, dim=-1)  # [B, seq_len, combined_dim]
+                else:
+                    sketches = all_patch_features[0]
+                
+            elif self.use_spatial:
+                # Spatial capsules mode: extract spatial patch features
+                from transformers import CLIPVisionModel
+                all_spatial_features = []
+                
+                # CLIP spatial features
+                if self.use_hybrid or not self.use_dinov2:
+                    if isinstance(self.encoder, CLIPVisionModel):
+                        # Get patch embeddings before pooling [B, num_patches+1, dim]
+                        with torch.no_grad() if not self.training else torch.enable_grad():
+                            outputs = self.encoder.vision_model(pixel_values=image_tensors, output_hidden_states=True)
+                            patch_embeddings = outputs.last_hidden_state[:, 1:]  # Remove CLS token
+                        
+                        # Adaptive pooling to 3×4 grid
+                        H, W = self.capsule_grid_shape
+                        num_patches = patch_embeddings.size(1)
+                        patch_grid_size = int(num_patches ** 0.5)  # CLIP uses square grids
+                        
+                        # Reshape to spatial grid
+                        patch_grid = patch_embeddings.view(batch_size, patch_grid_size, patch_grid_size, -1)
+                        
+                        # Adaptive average pooling to target grid size
+                        patch_grid = patch_grid.permute(0, 3, 1, 2)  # [B, D, H_p, W_p]
+                        pooled = F.adaptive_avg_pool2d(patch_grid, (H, W))  # [B, D, H, W]
+                        
+                        # Flatten to capsule sequence
+                        clip_spatial = pooled.permute(0, 2, 3, 1).reshape(batch_size, H * W, -1)  # [B, k, clip_dim]
+                        all_spatial_features.append(clip_spatial)
+                
+                # DINOv2 spatial features
+                if self.dinov2_encoder is not None:
+                    with torch.no_grad() if not self.training else torch.enable_grad():
+                        dinov2_outputs = self.dinov2_encoder(pixel_values=image_tensors)
+                        dinov2_patches = dinov2_outputs.last_hidden_state[:, 1:]  # Remove CLS
+                    
+                    # Pool DINOv2 patches to grid
+                    H, W = self.capsule_grid_shape
+                    num_patches = dinov2_patches.size(1)
+                    patch_grid_size = int(num_patches ** 0.5)
+                    
+                    patch_grid = dinov2_patches.view(batch_size, patch_grid_size, patch_grid_size, -1)
+                    patch_grid = patch_grid.permute(0, 3, 1, 2)
+                    pooled = F.adaptive_avg_pool2d(patch_grid, (H, W))
+                    dinov2_spatial = pooled.permute(0, 2, 3, 1).reshape(batch_size, H * W, -1)
+                    all_spatial_features.append(dinov2_spatial)
+                
+                # Combine spatial features
+                if self.use_hybrid and len(all_spatial_features) > 1:
+                    sketches = torch.cat(all_spatial_features, dim=-1)  # [B, k, combined_dim]
+                else:
+                    sketches = all_spatial_features[0] if all_spatial_features else image_features.unsqueeze(1).repeat(1, self.target_capsules, 1)
+            else:
+                # Non-spatial mode: repeat global feature
+                sketches = image_features.unsqueeze(1).repeat(1, self.target_capsules, 1)  # [B, k, encoder_dim]
             
             # Project to hidden size
             sketches = self.sketch_projection(sketches)  # [B, k, hidden_size]

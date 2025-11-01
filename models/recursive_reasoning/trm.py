@@ -16,7 +16,6 @@ from models.common import *
 from models.dqn_utils import compute_epsilon, select_action_epsilon_greedy
 from models.q_heads import create_q_head
 from models.memory_bank import AssociativeMemoryBank
-from models.cnn_tokenizer import CNNTokenizer
 
 # Selective checkpointing policy: save matmuls, recompute cheap ops
 try:
@@ -219,26 +218,31 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         self.embed_scale = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
 
-        # Semantic compression mode: use SemanticEncoder for text or CNNTokenizer for images
-        use_semantic = getattr(self.config, 'use_semantic_encoder', True)  # Default to semantic
-        use_cnn_tokenizer = getattr(self.config, 'use_cnn_tokenizer', False)
+        # Input mode: vision-unified (capsule_encoder) vs tokens-legacy (embed_tokens)
+        use_vision_unified = getattr(self.config, 'use_semantic_encoder', True)  # Default to vision-unified
         
         print(f"\n📊 Input Config:")
-        print(f"   Semantic encoder: {use_semantic}")
-        print(f"   CNN tokenizer: {use_cnn_tokenizer}")
+        print(f"   Vision-unified mode: {use_vision_unified}")
         print(f"   Hidden size: {self.config.hidden_size}")
         print(f"   Output vocab: {self.config.vocab_size}")
         
-        if use_semantic:
-            # HESC: Hierarchical Expandable Semantic Capsules
+        if use_vision_unified:
+            # Vision-unified: CapsuleEncoder handles text, images, and multimodal inputs
             from models.capsule_encoder import CapsuleEncoder
             target_capsules = getattr(self.config, 'target_capsules', 12)
             children_per_capsule = getattr(self.config, 'children_per_capsule', 4)
             encoder_model = getattr(self.config, 'encoder_model', 'openai/clip-vit-large-patch14')
             
-            print(f"\n🔧 Capsule Encoder Configuration:")
-            print(f"   Input encoder: {encoder_model}")
-            print(f"   Output vocab: {self.config.vocab_size} (GPT-2)")
+            # NEW: Enhanced encoder options from merged cnn_tokenizer
+            use_dinov2 = getattr(self.config, 'use_dinov2', False)
+            use_hybrid = getattr(self.config, 'use_hybrid_encoder', False)
+            output_mode = getattr(self.config, 'encoder_output_mode', 'capsules')
+            
+            print(f"\n🔧 Vision-Unified Encoder Configuration:")
+            print(f"   Encoder model: {encoder_model}")
+            print(f"   DINOv2: {use_dinov2}")
+            print(f"   Hybrid mode: {use_hybrid}")
+            print(f"   Output mode: {output_mode}")
             print(f"   Compression: {target_capsules} capsules × {children_per_capsule} children")
             
             self.capsule_encoder = CapsuleEncoder(
@@ -247,33 +251,21 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 children_per_capsule=children_per_capsule,
                 checksum_dim=getattr(self.config, 'checksum_dim', 32),
                 freeze_encoder=getattr(self.config, 'freeze_capsule_encoder', True),
-                encoder_model=encoder_model
+                encoder_model=encoder_model,
+                use_dinov2=use_dinov2,
+                use_hybrid=use_hybrid,
+                output_mode=output_mode
             )
-            self.embed_tokens = None
-            self.cnn_tokenizer = None
-        elif use_cnn_tokenizer:
-            # CNN tokenizer for vision tasks
-            cnn_in_channels = getattr(self.config, 'cnn_in_channels', 3)
-            cnn_conv_channels = getattr(self.config, 'cnn_conv_channels', [64, 128, self.config.hidden_size])
-            self.cnn_tokenizer = CNNTokenizer(
-                in_channels=cnn_in_channels,
-                hidden_size=self.config.hidden_size,
-                num_conv_layers=len(cnn_conv_channels),
-                conv_channels=cnn_conv_channels,
-                use_batch_norm=True,
-                activation='relu'
-            )
-            self.capsule_encoder = None
             self.embed_tokens = None
         else:
-            # Token embedding mode (for non-semantic datasets)
+            # Legacy token embedding mode (for baselines and backward compatibility)
             input_vocab_size = getattr(self.config, 'input_vocab_size', self.config.vocab_size)
+            print(f"\n🔧 Legacy Token Mode (baselines only)")
             self.embed_tokens = CastedEmbedding(input_vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
             self.capsule_encoder = None
-            self.cnn_tokenizer = None
         
         # Output head: concept vocab or BPE tokens
-        if use_semantic:
+        if use_vision_unified:
             # Hybrid head: semantic concepts + control symbols
             from models.concept_vocab import HybridOutputHead
             num_concepts = getattr(self.config, 'num_concepts', 2048)
@@ -349,18 +341,28 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
     def _create_mtp_module(self):
         """Create single MTP module that shares weights with main model."""
         class MTPDepthModule(nn.Module):
-            def __init__(self, config, embedding, output_head):
+            def __init__(self, config, embedding, output_head, use_concept_vocab):
                 super().__init__()
-                self.embedding = embedding  # Shared
+                self.embedding = embedding  # Shared (may be None)
                 self.output_head = output_head  # Shared
+                self.use_concept_vocab = use_concept_vocab
                 # Projection: [h_prev; token_emb] -> h_combined
                 self.projection = nn.Linear(config.hidden_size * 2, config.hidden_size)
                 # Lightweight transformer (1 layer)
                 self.transformer = TinyRecursiveReasoningModel_ACTV1Block(config)
             
             def forward(self, h_prev, next_token_ids, **seq_info):
-                # Embed next tokens
-                token_emb = self.embedding(next_token_ids.to(torch.int32))
+                # Embed next tokens/concepts
+                if self.embedding is not None:
+                    # Token mode: use embed_tokens
+                    token_emb = self.embedding(next_token_ids.to(torch.int32))
+                elif self.use_concept_vocab:
+                    # Vision-unified mode: use concept codebook
+                    token_emb = self.output_head.codebook.embeddings(next_token_ids.to(torch.int32))
+                else:
+                    # Fallback: zero embedding
+                    token_emb = torch.zeros_like(h_prev)
+                
                 # Combine with previous state
                 combined = torch.cat([h_prev, token_emb], dim=-1)
                 h_combined = self.projection(combined)
@@ -370,10 +372,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 logits = self.output_head(h_current)
                 return h_current, logits
         
+        # Determine if using concept vocab
+        use_concept_vocab = hasattr(self.lm_head, 'use_vq') and self.lm_head.use_vq
+        
         return MTPDepthModule(
             self.config,
             self.embed_tokens if self.embed_tokens is not None else None,
-            self.lm_head
+            self.lm_head,
+            use_concept_vocab
         )
     
     def encode_text(self, texts: list, return_children: bool = True):
@@ -384,17 +390,11 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
     
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # HESC capsules or CNN/token embedding
-        if hasattr(self, 'capsule_encoder') and self.capsule_encoder is not None:
-            # Input is pre-encoded capsule sketches [B, k, hidden_size]
-            # For precomputed capsule datasets (Stage A training)
-            embedding = input.to(self.forward_dtype)
-        elif self.cnn_tokenizer is not None:
-            # CNN tokenizer: input is raw images
-            if input.dim() == 4 and input.shape[-1] in [1, 3]:
-                input = input.permute(0, 3, 1, 2)
-            embedding = self.cnn_tokenizer(input)
+        if self.capsule_encoder is not None:
+            # Vision-unified mode: input already encoded as capsules
+            embedding = input
         else:
-            # Legacy: standard token embedding
+            # Legacy token mode: standard token embedding
             embedding = self.embed_tokens(input.to(torch.int32))
 
         # Puzzle embeddings

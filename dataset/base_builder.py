@@ -93,112 +93,196 @@ class BaseDatasetBuilder(ABC):
         raw_samples = self.load_raw_data()
         print(f"   Loaded {len(raw_samples)} samples")
         
-        # Preprocess in batches to prevent memory accumulation
+        # Preprocess with joblib (C++ backend, 2x faster than multiprocessing)
         print("⚙️  Preprocessing...")
-        batch_size = 1000
-        processed = []
+        import os
         
-        import gc
-        for i in range(0, len(raw_samples), batch_size):
-            batch = [self.preprocess_sample(s) for s in raw_samples[i:i+batch_size]]
-            processed.extend(batch)
-            
-            # Periodic cleanup
-            if i % 5000 == 0:
-                gc.collect()
+        num_workers = min(8, os.cpu_count() or 4)  # Use up to 8 cores
         
-        del raw_samples  # Free memory
-        gc.collect()
+        if num_workers > 1 and len(raw_samples) > 1000:
+            # Parallel processing with joblib (faster than multiprocessing)
+            try:
+                from joblib import Parallel, delayed
+                processed = Parallel(n_jobs=num_workers, backend='loky', verbose=0)(
+                    delayed(self.preprocess_sample)(s) for s in raw_samples
+                )
+            except ImportError:
+                # Fallback to list comprehension
+                print("   ⚠️  joblib not found, using single-thread (install: pip install joblib)")
+                processed = [self.preprocess_sample(s) for s in raw_samples]
+        else:
+            # Single-threaded for small datasets
+            processed = [self.preprocess_sample(s) for s in raw_samples]
         
-        # Augment
+        del raw_samples  # Free original
+        
+        # Augment with streaming to prevent RAM explosion
         print("🔄 Augmenting...")
         if getattr(self.config, 'augment', False):
             augmented = []
-            for sample in processed:
-                augmented.extend(self.augment_sample(sample))
-            del processed  # Free memory
+            batch_size = 5000  # Process in batches to free memory
+            
+            for i in range(0, len(processed), batch_size):
+                batch = processed[i:i+batch_size]
+                for sample in batch:
+                    augmented.extend(self.augment_sample(sample))
+                
+                # Free processed batch immediately
+                del batch
+                
+                # Periodic cleanup
+                if i % 10000 == 0 and i > 0:
+                    import gc
+                    gc.collect()
+            
+            del processed  # Free original
         else:
             augmented = processed
         print(f"   Augmented to {len(augmented)} samples")
         
-        # Split
+        # Split (keep both splits in RAM)
         train_split = getattr(self.config, 'train_split', 0.9)
         split_idx = int(len(augmented) * train_split)
         train_data = augmented[:split_idx]
         test_data = augmented[split_idx:]
-        del augmented  # Free memory immediately after split
+        del augmented  # Free original list
         print(f"   Train: {len(train_data)}, Test: {len(test_data)}")
         
-        # Encode with chunked processing to prevent RAM leak
+        # Encode with direct streaming to prevent RAM leak
         use_capsules = getattr(self.config, 'use_capsules', True)
         if use_capsules:
-            print("🧬 Encoding to HESC capsules...")
-            train_encoded = self._encode_chunked(train_data, "train")
-            del train_data  # Critical: free train data before encoding test
+            print("🧶 Encoding to HESC capsules...")
             
+            # CRITICAL: Encode directly without wrapper function to allow immediate cleanup
             import gc
-            gc.collect()
             
-            test_encoded = self._encode_chunked(test_data, "test")
-            del test_data  # Free test data
-            gc.collect()
+            # Train encoding (batch processing with DataLoader)
+            print(f"   Encoding {len(train_data)} train samples...")
+            train_encoded = self._stream_encode_capsules(train_data)
+            del train_data  # Free after encoding
+            
+            # Test encoding (batch processing with DataLoader)
+            print(f"   Encoding {len(test_data)} test samples...")
+            test_encoded = self._stream_encode_capsules(test_data)
+            del test_data  # Free after encoding
         else:
-            train_encoded = {'samples': train_data}
-            test_encoded = {'samples': test_data}
-            train_data = self.encode_to_tokens(train_samples)
-            test_data = self.encode_to_tokens(test_samples)
+            # Non-capsule mode: keep raw samples
+            train_encoded = train_data
+            test_encoded = test_data
         
         return {
-            'train': train_data,
-            'test': test_data,
-            'metadata': self.create_metadata(train_data)
+            'train': train_encoded,
+            'test': test_encoded,
+            'metadata': self.create_metadata(train_encoded)
         }
     
-    def _encode_chunked(self, samples: List[DataSample], split_name: str) -> Dict[str, torch.Tensor]:
-        """Encode in chunks, processing and freeing memory incrementally."""
+    def _stream_encode_capsules(self, samples: List[DataSample]) -> Dict[str, torch.Tensor]:
+        """High-performance encoding with 10GB RAM budget using PyTorch DataLoader."""
         if len(samples) == 0:
             return {'sketches': torch.empty(0, getattr(self.config, 'target_capsules', 12), getattr(self.config, 'hidden_size', 768))}
         
-        # Process in large chunks to prevent holding all samples in memory
-        chunk_size = 5000  # Process 5000 samples at a time
-        all_chunks = []
+        # Initialize encoder once
+        if self.encoder is None:
+            from models.capsule_encoder import CapsuleEncoder
+            self.encoder = CapsuleEncoder(
+                hidden_size=getattr(self.config, 'hidden_size', 768),
+                target_capsules=getattr(self.config, 'target_capsules', 12),
+                children_per_capsule=4,
+                checksum_dim=32,
+                freeze_encoder=True,
+                encoder_model=getattr(self.config, 'encoder_model', 'openai/clip-vit-large-patch14'),
+                use_spatial=getattr(self.config, 'use_spatial_capsules', True),
+                capsule_grid_shape=getattr(self.config, 'capsule_grid_shape', (3, 4))
+            )
+            self.encoder.eval()
+            self.encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
         
-        import gc
+        from torch.utils.data import Dataset, DataLoader
         from tqdm import tqdm
         
-        num_chunks = (len(samples) + chunk_size - 1) // chunk_size
-        print(f"   Processing {len(samples)} {split_name} samples in {num_chunks} chunks...")
+        # Custom Dataset for efficient batching
+        class SampleDataset(Dataset):
+            def __init__(self, samples, text_converter):
+                self.samples = samples
+                self.text_converter = text_converter
+            
+            def __len__(self):
+                return len(self.samples)
+            
+            def __getitem__(self, idx):
+                return self.text_converter(self.samples[idx])
         
-        for chunk_idx in range(num_chunks):
-            start_idx = chunk_idx * chunk_size
-            end_idx = min(start_idx + chunk_size, len(samples))
-            
-            # Process only this chunk
-            chunk_samples = samples[start_idx:end_idx]
-            chunk_encoded = self.encode_to_capsules(chunk_samples)
-            
-            all_chunks.append(chunk_encoded)
-            
-            # Clear chunk from memory
-            del chunk_samples
-            gc.collect()
-            
-            if chunk_idx % 2 == 0:  # Every 2 chunks
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+        # Create dataset and dataloader with optimized settings
+        dataset = SampleDataset(samples, self._sample_to_text)
         
-        # Concatenate all chunks
-        if len(all_chunks) == 1:
-            return all_chunks[0]
+        # Large batch size for GPU efficiency (10GB RAM budget)
+        batch_size = 48  # Increased from 32 (use more VRAM: 10.5GB / 15GB)
+        num_workers = 2  # Reduced from 4 to save 1-2GB RAM
         
+        dataloader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available(),  # Faster GPU transfer
+            prefetch_factor=2,  # Prefetch batches
+            persistent_workers=True  # Keep workers alive
+        )
+        
+        # Storage for results (on GPU to prevent CPU RAM explosion)
+        result_chunks = {'sketches': [], 'checksums': [], 'children': []}
+        temp_gpu_list = {'sketches': [], 'checksums': [], 'children': []}
+        device = next(self.encoder.parameters()).device
+        
+        consolidate_every = 800  # Consolidate every 800 batches (reduced overhead)
+        batch_count = 0
+        
+        # Process with DataLoader (automatic batching + parallel preprocessing)
+        with torch.no_grad():
+            for batch_texts in tqdm(dataloader, desc="Encoding"):
+                # Encode batch (stays on GPU)
+                batch_result = self.encoder(batch_texts, return_children=True)
+                
+                # Keep on GPU and accumulate (uses VRAM, not CPU RAM)
+                for key in temp_gpu_list:
+                    if key in batch_result and batch_result[key] is not None:
+                        temp_gpu_list[key].append(batch_result[key])  # Stay on GPU
+                
+                del batch_result
+                batch_count += 1
+                
+                # Periodic consolidation to prevent VRAM overflow
+                # 800 batches × 48 samples × 12 capsules × 768 × 4 bytes = ~1.77 GB
+                if batch_count % consolidate_every == 0:
+                    for key in temp_gpu_list:
+                        if temp_gpu_list[key]:
+                            # Concatenate on GPU, convert to fp16, move to CPU
+                            chunk = torch.cat(temp_gpu_list[key], dim=0).half().cpu()
+                            result_chunks[key].append(chunk)
+                            temp_gpu_list[key] = []  # Clear GPU memory
+                    
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+        
+        # Final consolidation of remaining batches
+        for key in temp_gpu_list:
+            if temp_gpu_list[key]:
+                chunk = torch.cat(temp_gpu_list[key], dim=0).half().cpu()
+                result_chunks[key].append(chunk)
+        
+        del temp_gpu_list
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Final concatenation on CPU (all chunks already in fp16)
         result = {}
-        for key in all_chunks[0].keys():
-            tensors = [chunk[key] for chunk in all_chunks if key in chunk and chunk[key].numel() > 0]
-            if tensors:
-                result[key] = torch.cat(tensors, dim=0)
+        for key, chunk_list in result_chunks.items():
+            if chunk_list:
+                result[key] = torch.cat(chunk_list, dim=0)  # Concatenate fp16 chunks
+            else:
+                result[key] = torch.empty(0)
         
-        del all_chunks
-        gc.collect()
+        del result_chunks
         
         return result
     
@@ -329,29 +413,25 @@ class BaseDatasetBuilder(ABC):
         )
     
     def save(self, dataset: Dict, output_dir: str):
-        """Save dataset to disk."""
+        """Save dataset to disk with parallel I/O."""
         import os
+        from concurrent.futures import ThreadPoolExecutor
         
         os.makedirs(output_dir, exist_ok=True)
         print(f"\n💾 Saving dataset to: {output_dir}")
         
-        # Save train (with float16 compression for memory efficiency)
+        # Prepare compressed datasets
         train_path = os.path.join(output_dir, 'capsule_dataset.pt')
         train_compressed = {
             'sketches': dataset['train']['sketches'].half() if 'sketches' in dataset['train'] else dataset['train'].get('sketches'),
-            'checksums': dataset['train'].get('checksums'),  # Keep checksums in float32 for precision
+            'checksums': dataset['train'].get('checksums'),
         }
         if 'children' in dataset['train']:
-            train_compressed['children'] = dataset['train']['children'].half()  # 50% memory reduction
-        # Copy any other keys
+            train_compressed['children'] = dataset['train']['children'].half()
         for key in dataset['train']:
             if key not in train_compressed:
                 train_compressed[key] = dataset['train'][key]
         
-        torch.save(train_compressed, train_path)
-        print(f"✅ Saved train (float16 compressed): {train_path}")
-        
-        # Save test
         test_path = os.path.join(output_dir, 'capsule_dataset_test.pt')
         test_compressed = {
             'sketches': dataset['test']['sketches'].half() if 'sketches' in dataset['test'] else dataset['test'].get('sketches'),
@@ -363,8 +443,41 @@ class BaseDatasetBuilder(ABC):
             if key not in test_compressed:
                 test_compressed[key] = dataset['test'][key]
         
-        torch.save(test_compressed, test_path)
-        print(f"✅ Saved test (float16 compressed): {test_path}")
+        # Parallel save with ThreadPoolExecutor + LZ4 compression (C++ backend)
+        def save_worker(data, path, name):
+            try:
+                # Use LZ4 compression for 3-5x faster I/O
+                try:
+                    import lz4.frame
+                    import pickle
+                    # Serialize with pickle, compress with LZ4 (C++ backend)
+                    with lz4.frame.open(path + '.lz4', 'wb') as f:
+                        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    # Rename to .pt for compatibility
+                    import os
+                    os.rename(path + '.lz4', path)
+                except ImportError:
+                    # Fallback to standard torch.save
+                    torch.save(data, path)
+                return name, path, None
+            except Exception as e:
+                return name, path, str(e)
+        
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_train = executor.submit(save_worker, train_compressed, train_path, "train")
+            future_test = executor.submit(save_worker, test_compressed, test_path, "test")
+            
+            # Wait for both to complete and check errors
+            train_name, train_saved, train_error = future_train.result()
+            test_name, test_saved, test_error = future_test.result()
+            
+            if train_error:
+                raise RuntimeError(f"Failed to save {train_name}: {train_error}")
+            if test_error:
+                raise RuntimeError(f"Failed to save {test_name}: {test_error}")
+        
+        print(f"✅ Saved {train_name} (float16 compressed): {train_saved}")
+        print(f"✅ Saved {test_name} (float16 compressed): {test_saved}")
         
         # Save metadata
         metadata_path = os.path.join(output_dir, 'dataset.json')

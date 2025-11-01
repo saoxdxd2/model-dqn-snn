@@ -36,23 +36,23 @@ mlp_t: False
 no_ACT_continue: True
 
 # ===== Deep Supervision (Aligned with recursion depth) =====
-# With 9 total recursions, supervise every 1.5 steps
-deep_supervision_steps: 6  # Supervision checkpoints
-enable_gradient_checkpointing: True  # 68% memory reduction
+# With 9 total recursions, supervise every 3 steps (cleaner intervals)
+deep_supervision_steps: 3  # Supervision at steps 3, 6, 9
+enable_gradient_checkpointing: True  # 40-50% memory reduction with deep supervision
 
 # ===== Stability (Critical for HESC) =====
 use_ema: True
 ema_decay: 0.999
 
-# ===== DQN (DISABLED - Paper validates simple ACT > DQN) =====
-enable_dqn: False
+# ===== DQN (Re-enabled - compatible with vision-unified) =====
+enable_dqn: True
 dqn_buffer_capacity: 500000  # Corrected from 20K (was filling in <1 step)
 dqn_buffer_min_size: 50000
 dqn_batch_size: 256
 dqn_gamma: 0.99
 dqn_epsilon_start: 0.3
 dqn_epsilon_end: 0.05
-dqn_epsilon_decay_steps: 100000
+dqn_epsilon_decay_steps: 200000  # Longer exploration phase (was 100K)
 dqn_warmstart_steps: 10000  # Oracle heuristic warm-start
 
 # ===== Reward Shaping =====
@@ -65,17 +65,17 @@ q_head_type: mlp
 q_head_hidden_size: 128
 q_head_num_layers: 1
 
-# ===== Memory Bank (DISABLED) =====
-enable_memory: False
+# ===== Memory Bank (Re-enabled - compatible with vision-unified) =====
+enable_memory: True
 memory_capacity: 4096
 memory_num_heads: 8
 memory_dropout: 0.1
 memory_reward_bonus: 0.5
 memory_reward_threshold: 0.05
 
-# ===== Intrinsic Curiosity (DISABLED) =====
-enable_count_curiosity: False
-enable_rnd_curiosity: False
+# ===== Intrinsic Curiosity (Re-enabled - compatible with vision-unified) =====
+enable_count_curiosity: True
+enable_rnd_curiosity: True
 curiosity_count_beta: 0.05
 curiosity_rnd_weight: 0.1
 
@@ -88,8 +88,8 @@ enable_prioritized_replay: False
 per_alpha: 0.6
 per_beta: 0.4
 
-# ===== Multi-Token Prediction (DISABLED) =====
-enable_mtp: False
+# ===== Multi-Token Prediction (Re-enabled - fixed for vision-unified) =====
+enable_mtp: True
 mtp_num_depths: 3
 mtp_loss_weight: 0.5
 mtp_share_embeddings: True

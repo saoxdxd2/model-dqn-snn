@@ -307,6 +307,163 @@ def quantize_model_int8(model: nn.Module) -> nn.Module:
     return quantized_model
 
 
+def export_to_openvino(
+    model: nn.Module,
+    output_path: str,
+    input_shape: tuple = (1, 12, 768),  # [batch, seq_len, hidden_dim]
+    fp16: bool = True,
+    dynamic_batch: bool = False
+):
+    """
+    Export model to OpenVINO IR format for Intel iGPU deployment.
+    
+    Args:
+        model: PyTorch model to export
+        output_path: Path to save .xml and .bin files
+        input_shape: Input tensor shape
+        fp16: Use FP16 precision (recommended for iGPU)
+        dynamic_batch: Support dynamic batch size
+    
+    Returns:
+        Path to exported model
+    """
+    try:
+        import openvino as ov
+        from openvino.tools import mo
+    except ImportError:
+        raise ImportError("Install OpenVINO: pip install openvino openvino-dev")
+    
+    import tempfile
+    import os
+    
+    print(f"\n📦 Exporting to OpenVINO IR format...")
+    print(f"   Input shape: {input_shape}")
+    print(f"   FP16: {fp16}")
+    
+    # Step 1: Export to ONNX (intermediate format)
+    model.eval()
+    dummy_input = torch.randn(*input_shape)
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = os.path.join(tmpdir, 'model.onnx')
+        
+        # Export with dynamic axes if requested
+        dynamic_axes = {'input': {0: 'batch'}} if dynamic_batch else None
+        
+        torch.onnx.export(
+            model,
+            dummy_input,
+            onnx_path,
+            input_names=['input'],
+            output_names=['output'],
+            dynamic_axes=dynamic_axes,
+            opset_version=13,
+            do_constant_folding=True
+        )
+        
+        print(f"   ✓ ONNX export complete")
+        
+        # Step 2: Convert ONNX to OpenVINO IR
+        model_ir = mo.convert_model(
+            onnx_path,
+            compress_to_fp16=fp16,
+            input_shape=input_shape if not dynamic_batch else None
+        )
+        
+        print(f"   ✓ OpenVINO IR conversion complete")
+        
+        # Step 3: Save IR files
+        ov.save_model(model_ir, output_path)
+        
+    print(f"   ✓ Saved to: {output_path}")
+    
+    # Print deployment info
+    model_size_mb = os.path.getsize(output_path.replace('.xml', '.bin')) / (1024 ** 2)
+    print(f"   Model size: {model_size_mb:.1f} MB")
+    
+    if fp16:
+        print(f"   Compression: ~2× (FP16)")
+    
+    return output_path
+
+
+def benchmark_openvino(
+    model_path: str,
+    input_shape: tuple = (1, 12, 768),
+    device: str = 'GPU',  # GPU = Intel iGPU, CPU = fallback
+    num_iterations: int = 100
+):
+    """
+    Benchmark OpenVINO model on Intel iGPU.
+    
+    Args:
+        model_path: Path to .xml model file
+        input_shape: Input shape for benchmark
+        device: 'GPU' for iGPU, 'CPU' for fallback
+        num_iterations: Number of inference iterations
+    
+    Returns:
+        dict with latency and throughput stats
+    """
+    try:
+        import openvino as ov
+    except ImportError:
+        raise ImportError("Install OpenVINO: pip install openvino")
+    
+    import time
+    
+    print(f"\n⚡ Benchmarking OpenVINO on {device}...")
+    
+    # Initialize OpenVINO runtime
+    core = ov.Core()
+    
+    # List available devices
+    available_devices = core.available_devices
+    print(f"   Available devices: {available_devices}")
+    
+    if device not in available_devices:
+        print(f"   ⚠️  {device} not available, falling back to CPU")
+        device = 'CPU'
+    
+    # Load model
+    model = core.read_model(model_path)
+    compiled_model = core.compile_model(model, device)
+    
+    # Get input/output info
+    input_layer = compiled_model.input(0)
+    output_layer = compiled_model.output(0)
+    
+    # Prepare input
+    dummy_input = np.random.randn(*input_shape).astype(np.float32)
+    
+    # Warmup
+    for _ in range(10):
+        compiled_model([dummy_input])
+    
+    # Benchmark
+    latencies = []
+    for _ in range(num_iterations):
+        start = time.perf_counter()
+        result = compiled_model([dummy_input])
+        end = time.perf_counter()
+        latencies.append((end - start) * 1000)  # ms
+    
+    stats = {
+        'device': device,
+        'avg_latency_ms': np.mean(latencies),
+        'std_latency_ms': np.std(latencies),
+        'min_latency_ms': np.min(latencies),
+        'max_latency_ms': np.max(latencies),
+        'throughput_fps': 1000 / np.mean(latencies)
+    }
+    
+    print(f"   Avg latency: {stats['avg_latency_ms']:.2f} ms")
+    print(f"   Std: {stats['std_latency_ms']:.2f} ms")
+    print(f"   Throughput: {stats['throughput_fps']:.1f} FPS")
+    
+    return stats
+
+
 def benchmark_inference(model: nn.Module, input_shape: Tuple[int, ...], 
                        num_iterations: int = 1000, device: str = 'cpu') -> dict:
     """

@@ -31,6 +31,13 @@ except ImportError:
     PIL_AVAILABLE = False
 
 try:
+    from models.text_renderer import TextRenderer
+    TEXT_RENDERER_AVAILABLE = True
+except ImportError:
+    TEXT_RENDERER_AVAILABLE = False
+    print("⚠️  TextRenderer not available - text will not be rendered to images")
+
+try:
     from datasets import load_dataset
     HF_DATASETS_AVAILABLE = True
 except ImportError:
@@ -74,6 +81,11 @@ class MultimodalDatasetConfig(BaseModel):
     # Image processing
     image_size: int = 224
     
+    # Text rendering (vision-unified pipeline)
+    render_text_to_image: bool = True  # Enable text → image conversion
+    text_image_width: int = 512
+    text_image_height: int = 384
+    
     # Grid processing
     max_grid_size: int = 30
     
@@ -98,6 +110,15 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
     def __init__(self, config: MultimodalDatasetConfig):
         super().__init__(config)
         self.config: MultimodalDatasetConfig = config
+        
+        # Initialize text renderer for vision-unified pipeline
+        self.text_renderer = None
+        if self.config.render_text_to_image and TEXT_RENDERER_AVAILABLE:
+            self.text_renderer = TextRenderer(
+                width=self.config.text_image_width,
+                height=self.config.text_image_height
+            )
+            print(f"✓ TextRenderer initialized: {self.config.text_image_width}×{self.config.text_image_height}")
     
     def load_raw_data(self) -> List[DataSample]:
         """Load data from multiple sources with auto-detection."""
@@ -229,8 +250,16 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         return None
     
     def _load_arc_json(self, json_path: str) -> List[DataSample]:
-        """Load ARC JSON - unified parser with auto-detection."""
-        import glob
+        """Load ARC dataset (challenge + solution files)."""
+        # Use orjson for 2-3x faster JSON parsing (C++ backend)
+        try:
+            import orjson as json
+            def json_load(f):
+                return json.loads(f.read())
+        except ImportError:
+            import json
+            def json_load(f):
+                return json.load(f)
         
         # If exact path exists, use it
         if Path(json_path).exists():
@@ -302,13 +331,21 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
     
     def _parse_arc_files(self, challenges_file: str, solutions_file: str) -> List[DataSample]:
         """Parse ARC challenge and solution files together."""
-        import json
+        # Use orjson for faster parsing (C++ backend)
+        try:
+            import orjson as json
+            def json_load(f):
+                return json.loads(f.read())
+        except ImportError:
+            import json
+            def json_load(f):
+                return json.load(f)
         
         try:
-            with open(challenges_file, 'r') as f:
-                challenges = json.load(f)
-            with open(solutions_file, 'r') as f:
-                solutions = json.load(f)
+            with open(challenges_file, 'rb') as f:  # orjson needs binary
+                challenges = json_load(f)
+            with open(solutions_file, 'rb') as f:
+                solutions = json_load(f)
             
             samples = []
             for task_id in challenges:
@@ -344,12 +381,21 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
     
     def _parse_json_format(self, json_path: str, format_type: str) -> List[DataSample]:
         """Unified JSON parser (ARC, custom formats)."""
-        import json
+        # Use orjson for faster parsing (C++ backend)
+        try:
+            import orjson as json
+            def json_load(f):
+                return json.loads(f.read())
+        except ImportError:
+            import json
+            def json_load(f):
+                return json.load(f)
+        
         print(f"📄 Parsing {format_type.upper()}: {json_path}")
         
         try:
-            with open(json_path, 'r') as f:
-                data = json.load(f)
+            with open(json_path, 'rb') as f:  # orjson needs binary
+                data = json_load(f)
             
             samples = []
             for puzzle_id, puzzle_data in data.items():
@@ -411,11 +457,40 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
     
     def preprocess_sample(self, sample: DataSample) -> DataSample:
         """Unified preprocessing: normalize sizes, combine modalities."""
-        # Image: resize
+        
+        # Text → Image rendering (vision-unified pipeline)
+        if sample.text and self.text_renderer is not None and sample.image is None:
+            # Render text to image for unified vision processing
+            try:
+                rendered_image = self.text_renderer.render_text(sample.text)
+                sample.image = rendered_image  # PIL Image
+                sample.metadata['text_rendered'] = True
+                sample.metadata['original_text'] = sample.text[:200]  # Keep snippet for debugging
+            except Exception as e:
+                print(f"⚠️  Failed to render text for {sample.sample_id}: {e}")
+                # Continue with text as-is
+        
+        # Image: resize and compress to uint8 (4x memory reduction)
         if sample.image and PIL_AVAILABLE and isinstance(sample.image, Image.Image):
-            sample.image = np.array(sample.image.resize(
-                (self.config.image_size, self.config.image_size), Image.Resampling.LANCZOS
-            ))
+            # Use OpenCV for 5-10x faster resizing (C++ backend)
+            try:
+                import cv2
+                # Convert PIL to numpy, resize with OpenCV (INTER_LANCZOS4 = LANCZOS)
+                img_array = np.array(sample.image)
+                sample.image = cv2.resize(
+                    img_array, 
+                    (self.config.image_size, self.config.image_size),
+                    interpolation=cv2.INTER_LANCZOS4
+                ).astype(np.uint8)
+            except ImportError:
+                # Fallback to PIL if OpenCV not available
+                sample.image = np.array(
+                    sample.image.resize(
+                        (self.config.image_size, self.config.image_size), 
+                        Image.Resampling.LANCZOS
+                    ),
+                    dtype=np.uint8
+                )
         
         # Grid: crop to max size
         if sample.grid is not None and sample.grid.shape[0] > self.config.max_grid_size:
@@ -438,11 +513,16 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         """Unified augmentation: images (flip), grids (rotations)."""
         augmented = [sample]
         
-        # Image flip
+        # Image flip (optimized to share memory where possible)
         if sample.image is not None and isinstance(sample.image, np.ndarray):
-            aug = DataSample(**sample.model_dump())
-            aug.image = np.fliplr(sample.image)
-            aug.sample_id = f"{sample.sample_id}_flip"
+            aug = DataSample(
+                sample_id=f"{sample.sample_id}_flip",
+                modality=sample.modality,
+                text=sample.text,
+                image=np.fliplr(sample.image).copy(),  # Explicit copy needed for flip
+                label=sample.label,
+                metadata=sample.metadata
+            )
             augmented.append(aug)
         
         # Grid rotations (dihedral group)
@@ -489,20 +569,27 @@ def _post_process(config: MultimodalDatasetConfig, dataset: Dict):
     import os
     os.makedirs(config.output_dir, exist_ok=True)
     
-    # Concept expansion (for text/generation)
+    # Concept expansion (for text/generation) - use in-memory dataset
     if config.use_capsules and config.include_text:
         print(f"\n📚 Building concept expansion table...")
         try:
             from models.concept_decoder import ConceptDecoder
             from transformers import AutoTokenizer
             
-            # Path already saved by builder.save(), just reference it
-            train_path = f"{config.output_dir}/capsule_dataset.pt"
-            
+            # Use dataset already in memory (no reload)
             decoder = ConceptDecoder(num_concepts=config.num_concepts)
-            decoder.build_expansion_table_from_data(train_path, AutoTokenizer.from_pretrained("gpt2"), config.num_concepts)
-            decoder.expansion_table.save(f"{config.output_dir}/concept_expansions.json")
-            print(f"   ✓ Saved")
+            
+            # Pass in-memory data directly
+            if 'train' in dataset and 'sketches' in dataset['train']:
+                decoder.build_expansion_table_from_memory(
+                    dataset['train']['sketches'],
+                    AutoTokenizer.from_pretrained("gpt2"),
+                    config.num_concepts
+                )
+                decoder.expansion_table.save(f"{config.output_dir}/concept_expansions.json")
+                print(f"   ✓ Saved")
+            else:
+                print(f"   ⚠️  No training data to process")
         except Exception as e:
             print(f"   ⚠️  {e}")
     
