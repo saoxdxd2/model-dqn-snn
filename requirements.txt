@@ -15,7 +15,6 @@ torchaudio
 flash-attn
 
 # Numerical and scientific stack
-numpy>=2.1,<2.3
 numba
 scikit-learn
 joblib
