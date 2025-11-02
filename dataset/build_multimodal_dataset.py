@@ -84,8 +84,8 @@ class MultimodalDatasetConfig(BaseModel):
     
     # Text rendering (vision-unified pipeline)
     render_text_to_image: bool = True  # Enable text → image conversion
-    text_image_width: int = 512
-    text_image_height: int = 384
+    text_image_width: int = 224  # Must match TRM vision encoder image_size
+    text_image_height: int = 224  # Must match TRM vision encoder image_size
     
     # Grid processing
     max_grid_size: int = 30
