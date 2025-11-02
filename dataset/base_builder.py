@@ -103,7 +103,7 @@ class BaseDatasetBuilder(ABC):
             # Parallel processing with joblib (faster than multiprocessing)
             try:
                 from joblib import Parallel, delayed
-                processed = Parallel(n_jobs=num_workers, backend='loky', verbose=0)(
+                processed = Parallel(n_jobs=num_workers, backend='threading', verbose=0)(
                     delayed(self.preprocess_sample)(s) for s in raw_samples
                 )
             except ImportError:
