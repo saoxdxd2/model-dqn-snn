@@ -187,13 +187,14 @@ class BaseDatasetBuilder(ABC):
             self.encoder.eval()
             self.encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
     
-    def _stream_encode_capsules(self, samples: List[DataSample]) -> Dict[str, torch.Tensor]:
-        """High-performance encoding with 10GB RAM budget using PyTorch DataLoader."""
+    def _stream_encode_capsules(self, samples: List[DataSample]):
+        """Hybrid CPU/GPU encoding: parallel text rendering + large GPU batches."""
         if len(samples) == 0:
             return {'sketches': torch.empty(0, getattr(self.config, 'target_capsules', 12), getattr(self.config, 'hidden_size', 768))}
         
         # Initialize encoder once
         self._init_encoder()
+        device = next(self.encoder.parameters()).device
         
         from torch.utils.data import Dataset, DataLoader
         from tqdm import tqdm
@@ -201,10 +202,7 @@ class BaseDatasetBuilder(ABC):
         # Custom collate function to handle numpy arrays -> PyTorch tensors (CHW format)
         def collate_images(batch):
             """Convert batch of numpy images [H,W,C] to tensor [B,C,H,W]."""
-            import torch
-            # Stack numpy arrays and convert to tensor
             batch_array = np.stack(batch, axis=0)  # [B, H, W, C]
-            # Convert to tensor and transpose to CHW format
             batch_tensor = torch.from_numpy(batch_array).permute(0, 3, 1, 2)  # [B, C, H, W]
             return batch_tensor.float() / 255.0  # Normalize to [0, 1]
         
@@ -220,100 +218,107 @@ class BaseDatasetBuilder(ABC):
             def __getitem__(self, idx):
                 return self.image_converter(self.samples[idx])
         
-        # Create dataset and dataloader with optimized settings
+        # Create dataset and dataloader
         dataset = SampleDataset(samples, self._sample_to_image)
         
-        # Large batch size for GPU efficiency (10GB RAM budget)
-        batch_size = 48  # Increased from 32 (use more VRAM: 10.5GB / 15GB)
-        num_workers = 2  # Reduced from 4 to save 1-2GB RAM
+        # Hybrid CPU/GPU settings:
+        # - 3 workers render text in parallel on CPU (overlaps with GPU encoding)
+        # - Large batch (96) keeps GPU saturated
+        # - Prefetch hides CPU rendering latency
+        batch_size = 96  # Max out GPU (15GB VRAM, model ~5GB, batch ~8GB)
+        num_workers = 3  # Parallel CPU rendering (3×4GB = 12GB peak, safe with prefetch)
         
         dataloader = DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
-            collate_fn=collate_images,  # Custom collate for numpy -> tensor conversion
-            pin_memory=torch.cuda.is_available(),  # Faster GPU transfer
-            prefetch_factor=2,  # Prefetch batches
-            persistent_workers=True  # Keep workers alive
+            collate_fn=collate_images,
+            pin_memory=True,  # Fast CPU->GPU transfer
+            prefetch_factor=2,  # Pre-render 2 batches ahead per worker
+            persistent_workers=True  # Keep workers alive (avoid respawn overhead)
         )
         
-        # Storage for results (on GPU to prevent CPU RAM explosion)
+        print(f"🚀 Hybrid CPU/GPU pipeline:")
+        print(f"   Batch size: {batch_size} | Workers: {num_workers} | Prefetch: 2")
+        print(f"   CPU: {num_workers} parallel text renderers")
+        print(f"   GPU: Encoding {batch_size} images/batch")
+        
+        # Storage for results
         result_chunks = {'sketches': [], 'checksums': [], 'children': []}
         temp_gpu_list = {'sketches': [], 'checksums': [], 'children': []}
-        device = next(self.encoder.parameters()).device
         
-        consolidate_every = 800  # Consolidate every 800 batches (reduced overhead)
-        checkpoint_every = 2000  # Save checkpoint every 2000 batches (~100k samples)
+        consolidate_every = 500  # Consolidate every 500 batches (GPU->CPU offload)
+        checkpoint_every = 1500  # Checkpoint every 1500 batches (~45min at 96/batch)
         batch_count = 0
         
         # Check for existing checkpoint to resume
-        checkpoint_path = self.config.output_dir / "encoding_checkpoint.pt"
+        from pathlib import Path
+        checkpoint_path = Path(self.config.output_dir) / "encoding_checkpoint.pt"
         start_batch = 0
+        
         if checkpoint_path.exists():
             print(f"📂 Found checkpoint, attempting resume...")
             try:
                 checkpoint = torch.load(checkpoint_path, map_location='cpu')
                 result_chunks = checkpoint['result_chunks']
                 start_batch = checkpoint['batch_count']
-                print(f"✅ Resumed from batch {start_batch}/{len(dataloader)}")
+                total_batches = len(dataloader)
+                print(f"✅ Resumed from batch {start_batch}/{total_batches} ({start_batch*batch_size}/{len(samples)} samples)")
             except Exception as e:
                 print(f"⚠️  Checkpoint load failed: {e}, starting fresh")
         
-        # Process with DataLoader (automatic batching + parallel preprocessing)
+        # Hybrid CPU/GPU processing
         with torch.no_grad():
             for batch_idx, batch_images in enumerate(tqdm(dataloader, desc="Encoding", initial=start_batch)):
                 # Skip already processed batches
                 if batch_idx < start_batch:
                     continue
                 
-                # Move batch to GPU device
-                batch_images = batch_images.to(device)
+                # Move batch to GPU (workers already rendered on CPU)
+                batch_images = batch_images.to(device, non_blocking=True)
                 
-                # Encode batch (stays on GPU) - pass as keyword argument
+                # Encode on GPU
                 batch_result = self.encoder(images=batch_images, return_children=True)
                 
-                # Keep on GPU and accumulate (uses VRAM, not CPU RAM)
+                # Accumulate on GPU
                 for key in temp_gpu_list:
                     if key in batch_result and batch_result[key] is not None:
-                        temp_gpu_list[key].append(batch_result[key])  # Stay on GPU
+                        temp_gpu_list[key].append(batch_result[key])
                 
-                del batch_result
+                del batch_images, batch_result
                 batch_count += 1
                 
-                # Periodic consolidation to prevent VRAM overflow
+                # Periodic consolidation (GPU -> CPU to free VRAM)
                 if batch_count >= consolidate_every:
-                    # Consolidate GPU tensors
                     for key in temp_gpu_list:
                         if temp_gpu_list[key]:
                             consolidated = torch.cat(temp_gpu_list[key], dim=0)
-                            # Convert to fp16 immediately (2x memory reduction)
                             result_chunks[key].append(consolidated.half().cpu())
                             temp_gpu_list[key].clear()
                     
                     batch_count = 0
                     torch.cuda.empty_cache()
                     
-                    # Save checkpoint periodically (every 2000 batches)
+                    # Save checkpoint
                     if batch_idx > 0 and batch_idx % checkpoint_every == 0:
-                        print(f"\n💾 Saving checkpoint at batch {batch_idx}...")
+                        print(f"\n💾 Checkpoint at batch {batch_idx}/{len(dataloader)}...")
                         torch.save({
                             'result_chunks': result_chunks,
                             'batch_count': batch_idx,
                             'total_batches': len(dataloader)
                         }, checkpoint_path)
-                        print(f"✅ Checkpoint saved to {checkpoint_path}")
+                        print(f"✅ Saved")
                         
-                        # Auto-sync to Google Drive if in Colab
+                        # Sync to Drive
                         try:
                             import sys
                             if 'google.colab' in sys.modules:
-                                from pathlib import Path
                                 drive_dir = Path("/content/drive/MyDrive/model-dqn-snn")
                                 if drive_dir.exists():
                                     import shutil
                                     shutil.copy2(checkpoint_path, drive_dir / checkpoint_path.name)
-                                    print(f"☁️  Synced to Google Drive")
+                                    print(f"☁️  Synced to Drive")
                         except:
                             pass
                         
