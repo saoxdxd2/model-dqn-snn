@@ -200,18 +200,18 @@ class BaseDatasetBuilder(ABC):
         
         # Custom Dataset for efficient batching
         class SampleDataset(Dataset):
-            def __init__(self, samples, text_converter):
+            def __init__(self, samples, image_converter):
                 self.samples = samples
-                self.text_converter = text_converter
+                self.image_converter = image_converter
             
             def __len__(self):
                 return len(self.samples)
             
             def __getitem__(self, idx):
-                return self.text_converter(self.samples[idx])
+                return self.image_converter(self.samples[idx])
         
         # Create dataset and dataloader with optimized settings
-        dataset = SampleDataset(samples, self._sample_to_text)
+        dataset = SampleDataset(samples, self._sample_to_image)
         
         # Large batch size for GPU efficiency (10GB RAM budget)
         batch_size = 48  # Increased from 32 (use more VRAM: 10.5GB / 15GB)
@@ -237,9 +237,9 @@ class BaseDatasetBuilder(ABC):
         
         # Process with DataLoader (automatic batching + parallel preprocessing)
         with torch.no_grad():
-            for batch_texts in tqdm(dataloader, desc="Encoding"):
+            for batch_images in tqdm(dataloader, desc="Encoding"):
                 # Encode batch (stays on GPU)
-                batch_result = self.encoder(batch_texts, return_children=True)
+                batch_result = self.encoder(batch_images, return_children=True)
                 
                 # Keep on GPU and accumulate (uses VRAM, not CPU RAM)
                 for key in temp_gpu_list:
@@ -306,14 +306,14 @@ class BaseDatasetBuilder(ABC):
         # Process samples without creating full text list (prevents RAM leak)
         total_samples = len(samples)
         for i in tqdm(range(0, total_samples, batch_size), desc="Encoding capsules"):
-            # Convert only current batch to text (critical for RAM)
-            batch_texts = [self._sample_to_text(s) for s in samples[i:i+batch_size]]
+            # Convert only current batch to images (critical for RAM)
+            batch_images = [self._sample_to_image(s) for s in samples[i:i+batch_size]]
             
             with torch.no_grad():
-                batch_result = self.encoder(batch_texts, return_children=True)
+                batch_result = self.encoder(batch_images, return_children=True)
             
-            # Clear batch texts immediately
-            del batch_texts
+            # Clear batch images immediately
+            del batch_images
             
             # Move to CPU immediately and append
             for key in temp_data:
@@ -351,15 +351,36 @@ class BaseDatasetBuilder(ABC):
         
         return result
     
-    def _sample_to_text(self, sample: DataSample) -> str:
-        """Convert any sample type to text representation."""
+    def _sample_to_image(self, sample: DataSample):
+        """Convert any sample type to image for vision-unified encoder."""
+        # Import TextRenderer lazily
+        if not hasattr(self, 'text_renderer'):
+            from models.text_renderer import TextRenderer
+            self.text_renderer = TextRenderer(
+                width=getattr(self.config, 'text_image_width', 224),
+                height=getattr(self.config, 'text_image_height', 224)
+            )
+        
+        # Text → render to image
         if sample.text:
-            return sample.text
+            return self.text_renderer.render_plain_text(sample.text)
+        
+        # Grid → render to image (convert to text first)
         elif sample.grid is not None:
-            return self._grid_to_text(sample.grid)
+            grid_text = self._grid_to_text(sample.grid)
+            return self.text_renderer.render_plain_text(grid_text)
+        
+        # Image → return directly (already an image)
         elif sample.image is not None:
-            return f"Image: {type(sample.image).__name__}"  # Placeholder
-        return ""
+            from PIL import Image
+            # Convert numpy array to PIL Image if needed
+            if isinstance(sample.image, np.ndarray):
+                return Image.fromarray(sample.image.astype(np.uint8))
+            return sample.image
+        
+        # Fallback: blank image
+        from PIL import Image
+        return Image.new('RGB', (224, 224), color='white')
     
     # Legacy token encoding removed - vision-unified only uses capsules
     

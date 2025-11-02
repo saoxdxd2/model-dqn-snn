@@ -128,7 +128,15 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         for source_path in self.config.source_paths:
             detected_type = self._detect_source_type(source_path)
             
-            if detected_type == "arc_json":
+            # Tier 1 datasets
+            if detected_type == "puzzlevqa":
+                samples.extend(self._load_puzzlevqa(source_path))
+            elif detected_type == "mathv":
+                samples.extend(self._load_mathv(source_path))
+            elif detected_type == "raven":
+                samples.extend(self._load_raven(source_path))
+            # Standard datasets
+            elif detected_type == "arc_json":
                 samples.extend(self._load_arc_json(source_path))
             elif detected_type == "maze_csv":
                 samples.extend(self._load_maze_csv(source_path))
@@ -148,6 +156,16 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
     def _detect_source_type(self, path: str) -> str:
         """Auto-detect source type from path/name."""
         path_lower = path.lower()
+        
+        # Tier 1 Datasets (Research-grade reasoning)
+        if "puzzlevqa" in path_lower or "puzzle_vqa" in path_lower:
+            return "puzzlevqa"
+        
+        if "math-v" in path_lower or "mathv" in path_lower or "math_vision" in path_lower:
+            return "mathv"
+        
+        if "raven" in path_lower and not "craven" in path_lower:
+            return "raven"
         
         # ARC JSON format
         if "arc" in path_lower and path_lower.endswith(".json"):
@@ -456,35 +474,165 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
             metadata={'type': 'text', 'source': path}
         ) for idx, chunk in enumerate(chunks)]
     
-    def preprocess_sample(self, sample: DataSample) -> DataSample:
-        """Unified preprocessing: normalize sizes, combine modalities."""
+    def _load_puzzlevqa(self, path: str) -> List[DataSample]:
+        """Load PuzzleVQA dataset (2K abstract visual reasoning puzzles)."""
+        print(f"🧩 Loading PuzzleVQA: {path}")
+        import json
+        from PIL import Image
         
-        # Text → Image rendering (DISABLED during dataset building - too slow)
-        # This should happen during training on-the-fly instead
-        # if sample.text and self.text_renderer is not None and sample.image is None:
-        #     try:
-        #         rendered_image = self.text_renderer.render_code(sample.text)
-        #         sample.image = rendered_image
-        #         sample.metadata['text_rendered'] = True
-        #     except Exception as e:
-        #         pass# Continue with text as-is
+        samples = []
+        data_path = Path(path)
+        
+        # PuzzleVQA structure: images/ + annotations.json
+        if data_path.is_dir():
+            annot_file = data_path / "annotations.json"
+            img_dir = data_path / "images"
+        else:
+            annot_file = Path(path)
+            img_dir = annot_file.parent / "images"
+        
+        if not annot_file.exists():
+            print(f"⚠️  PuzzleVQA annotations not found: {annot_file}")
+            return []
+        
+        with open(annot_file) as f:
+            data = json.load(f)
+        
+        for item in data:
+            img_path = img_dir / item.get('image', '')
+            if img_path.exists():
+                samples.append(DataSample(
+                    sample_id=f"puzzlevqa_{item['id']}",
+                    modality=ModalityType.IMAGE,
+                    image=np.array(Image.open(img_path).convert('RGB')),
+                    text=item.get('question', ''),
+                    label=item.get('answer'),
+                    metadata={'concept': item.get('concept'), 'source': 'puzzlevqa'}
+                ))
+        
+        print(f"   Loaded {len(samples)} PuzzleVQA puzzles")
+        return samples
+    
+    def _load_mathv(self, path: str) -> List[DataSample]:
+        """Load MATH-V dataset (3K mathematical reasoning with visual context)."""
+        print(f"📐 Loading MATH-V: {path}")
+        import json
+        from PIL import Image
+        import io
+        
+        samples = []
+        data_path = Path(path)
+        
+        # MATH-V structure: testmini.json or test.json
+        json_files = list(data_path.glob("*.json")) if data_path.is_dir() else [Path(path)]
+        
+        for json_file in json_files:
+            with open(json_file) as f:
+                data = json.load(f)
+            
+            for item in data:
+                # MATH-V has base64 encoded images or image paths
+                img = None
+                if 'image' in item:
+                    if isinstance(item['image'], str) and item['image'].startswith('data:image'):
+                        # Base64 encoded
+                        import base64
+                        img_data = base64.b64decode(item['image'].split(',')[1])
+                        img = np.array(Image.open(io.BytesIO(img_data)).convert('RGB'))
+                    else:
+                        # File path
+                        img_path = data_path / item['image']
+                        if img_path.exists():
+                            img = np.array(Image.open(img_path).convert('RGB'))
+                
+                samples.append(DataSample(
+                    sample_id=f"mathv_{item['pid']}",
+                    modality=ModalityType.MULTIMODAL if img is not None else ModalityType.TEXT,
+                    image=img,
+                    text=item.get('question', ''),
+                    label=item.get('answer'),
+                    metadata={
+                        'subject': item.get('subject'),
+                        'level': item.get('level'),
+                        'source': 'math-v'
+                    }
+                ))
+        
+        print(f"   Loaded {len(samples)} MATH-V problems")
+        return samples
+    
+    def _load_raven(self, path: str) -> List[DataSample]:
+        """Load RAVEN dataset (70K RPM-style relational reasoning puzzles)."""
+        print(f"🧠 Loading RAVEN: {path}")
+        import numpy as np
+        from PIL import Image
+        
+        samples = []
+        data_path = Path(path)
+        
+        # RAVEN structure: center_single/, distribute_four/, etc.
+        # Each config has images as .npz files
+        config_dirs = [d for d in data_path.iterdir() if d.is_dir()]
+        
+        for config_dir in config_dirs:
+            config_name = config_dir.name
+            npz_files = list(config_dir.glob("*.npz"))
+            
+            for npz_file in npz_files[:1000]:  # Limit per config to prevent overload
+                data = np.load(npz_file)
+                
+                # RAVEN images are 160x160 grayscale, 8 context + 1 target
+                # Combine into single 3x3 grid visualization
+                context = data['image'].reshape(8, 160, 160)  # 8 context panels
+                target = data['target']  # Answer index (0-7)
+                
+                # Create 3x3 grid image (480x480)
+                grid_img = np.ones((480, 480), dtype=np.uint8) * 255
+                for i in range(8):
+                    row, col = i // 3, i % 3
+                    grid_img[row*160:(row+1)*160, col*160:(col+1)*160] = context[i]
+                
+                # Convert to RGB PIL Image then numpy
+                grid_pil = Image.fromarray(grid_img).convert('RGB')
+                
+                samples.append(DataSample(
+                    sample_id=f"raven_{config_name}_{npz_file.stem}",
+                    modality=ModalityType.IMAGE,
+                    image=np.array(grid_pil),
+                    label=int(target),
+                    metadata={'config': config_name, 'source': 'raven'}
+                ))
+        
+        print(f"   Loaded {len(samples)} RAVEN puzzles")
+        return samples
+    
+    def preprocess_sample(self, sample: DataSample) -> DataSample:
+        """Unified preprocessing: clean text, normalize images, validate grids."""
+        # Text cleaning
+        if sample.text:
+            # Remove excessive whitespace
+            sample.text = ' '.join(sample.text.split())
+            # Truncate very long text (prevent memory issues)
+            max_text_len = 10000
+            if len(sample.text) > max_text_len:
+                sample.text = sample.text[:max_text_len] + "..."
         
         # Image: resize and compress to uint8 (4x memory reduction)
-        if sample.image and PIL_AVAILABLE and isinstance(sample.image, Image.Image):
+        if sample.image is not None and isinstance(sample.image, np.ndarray):
             # Use OpenCV for 5-10x faster resizing (C++ backend)
             try:
                 import cv2
-                # Convert PIL to numpy, resize with OpenCV (INTER_LANCZOS4 = LANCZOS)
-                img_array = np.array(sample.image)
+                # Resize with OpenCV (INTER_LANCZOS4 = LANCZOS)
                 sample.image = cv2.resize(
-                    img_array, 
+                    sample.image, 
                     (self.config.image_size, self.config.image_size),
                     interpolation=cv2.INTER_LANCZOS4
                 ).astype(np.uint8)
             except ImportError:
                 # Fallback to PIL if OpenCV not available
+                from PIL import Image
                 sample.image = np.array(
-                    sample.image.resize(
+                    Image.fromarray(sample.image).resize(
                         (self.config.image_size, self.config.image_size), 
                         Image.Resampling.LANCZOS
                     ),
@@ -495,8 +643,19 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         if sample.grid is not None and sample.grid.shape[0] > self.config.max_grid_size:
             sample.grid = sample.grid[:self.config.max_grid_size, :self.config.max_grid_size]
         
-        # Unified text representation
-        return self._to_unified_text(sample)
+        # Combine metadata fields into text for multimodal context
+        parts = []
+        if sample.text:
+            parts.append(sample.text)
+        if sample.metadata:
+            # Add structured metadata as text context
+            if 'category' in sample.metadata:
+                parts.append(f"Category: {sample.metadata['category']}")
+            if 'difficulty' in sample.metadata:
+                parts.append(f"Difficulty: {sample.metadata['difficulty']}")
+        
+        sample.text = " | ".join(p for p in parts if p)
+        return sample
     
     def _to_unified_text(self, sample: DataSample) -> DataSample:
         """Convert all modalities to unified text for encoding."""
