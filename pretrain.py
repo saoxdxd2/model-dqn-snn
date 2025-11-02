@@ -336,10 +336,9 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
         
         # Wrap dataloader to match expected format: (set_name, batch, global_batch_size)
         class CapsuleDataLoaderWrapper:
-            def __init__(self, raw_loader, global_batch_size, projection_layer):
+            def __init__(self, raw_loader, global_batch_size):
                 self.raw_loader = raw_loader
                 self.global_batch_size = global_batch_size
-                self.projection = projection_layer
             
             def __iter__(self):
                 for batch_data in self.raw_loader:
