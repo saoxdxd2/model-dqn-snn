@@ -32,6 +32,8 @@ class DQNReplayBuffer:
         alpha: float = 0.6,  # Priority exponent
         beta: float = 0.4,   # Importance sampling exponent
         td_threshold: float = 0.0,  # TD-error threshold for selective storage (0.0 = disabled)
+        recent_fraction: float = 0.25,  # Fraction of samples from recent transitions
+        max_age: int = 100000,  # Discard transitions older than this
     ):
         """
         Initialize replay buffer.

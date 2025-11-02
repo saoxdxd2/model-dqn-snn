@@ -99,6 +99,8 @@ class ACTLossHead(nn.Module):
                 alpha=getattr(config, 'per_alpha', 0.6),
                 beta=getattr(config, 'per_beta', 0.4),
                 td_threshold=getattr(config, 'dqn_td_threshold', 0.0),  # Selective storage
+                recent_fraction=getattr(config, 'replay_recent_fraction', 0.25),
+                max_age=getattr(config, 'replay_max_age', 100000),
             )
             self.reward_stats = RunningStats()
             self.dqn_step_counter = 0
@@ -298,7 +300,8 @@ class ACTLossHead(nn.Module):
                     
             except Exception as e:
                 # Log warning but continue training
-                if rank == 0 and hasattr(metrics, '__setitem__'):
+                # Note: rank is not available in this context, skip rank check
+                if hasattr(metrics, '__setitem__'):
                     metrics['reconstruction_error'] = 1.0
                 reconstruction_loss = 0
         

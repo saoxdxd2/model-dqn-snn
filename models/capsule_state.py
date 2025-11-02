@@ -34,16 +34,19 @@ class CapsuleState:
             self.expanded_mask = torch.zeros(B, k, dtype=torch.bool, device=device)
             self.num_expansions = torch.zeros(B, dtype=torch.long, device=device)
     
-    def expand_capsule(self, batch_idx: int, capsule_idx: int):
+    def expand_capsule(self, batch_idx: int, capsule_idx: int) -> bool:
         """
         Replace capsule sketch with its children embeddings.
         
         Args:
             batch_idx: Batch index
             capsule_idx: Capsule to expand
+            
+        Returns:
+            True if expansion succeeded, False otherwise
         """
         if self.children is None:
-            raise ValueError("No children embeddings available")
+            return False
         
         # Mark as expanded
         self.expanded_mask[batch_idx, capsule_idx] = True
@@ -72,6 +75,7 @@ class CapsuleState:
             new_seq = torch.cat([new_seq, pad], dim=0)
         
         self.sketches[batch_idx] = new_seq
+        return True
     
     def get_expansion_cost(self, children_per_capsule: int = 4):
         """Compute total expansion cost for batch."""
