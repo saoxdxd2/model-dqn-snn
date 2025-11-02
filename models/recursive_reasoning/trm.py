@@ -720,7 +720,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             steps=torch.zeros((batch_size, ), dtype=torch.int32, device=device),
             halted=torch.ones((batch_size, ), dtype=torch.bool, device=device),  # Default to halted
             
-            current_data={k: torch.empty_like(v) for k, v in batch.items()},
+            current_data={k: torch.empty_like(v) for k, v in batch.items() if v is not None},
             
             # DQN tracking
             prev_accuracy=torch.zeros((batch_size, ), dtype=torch.float32, device=device) if self.config.enable_dqn else None,
