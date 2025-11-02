@@ -325,15 +325,40 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
         else:
             dataset = TensorDataset(sketches)
         
-        dataloader = DataLoader(
+        local_batch_size = config.global_batch_size // world_size
+        raw_dataloader = DataLoader(
             dataset,
-            batch_size=config.global_batch_size // world_size,
+            batch_size=local_batch_size,
             shuffle=(split == 'train'),
             num_workers=0,
             pin_memory=True
         )
         
-        return dataloader, metadata
+        # Wrap dataloader to match expected format: (set_name, batch, global_batch_size)
+        class CapsuleDataLoaderWrapper:
+            def __init__(self, raw_loader, global_batch_size):
+                self.raw_loader = raw_loader
+                self.global_batch_size = global_batch_size
+            
+            def __iter__(self):
+                for batch_data in self.raw_loader:
+                    # batch_data is tuple of (sketches,) or (sketches, checksums) or (sketches, checksums, children)
+                    # Format as dict for consistency
+                    if len(batch_data) == 3:
+                        batch = {'sketches': batch_data[0], 'checksums': batch_data[1], 'children': batch_data[2]}
+                    elif len(batch_data) == 2:
+                        batch = {'sketches': batch_data[0], 'checksums': batch_data[1], 'children': None}
+                    else:
+                        batch = {'sketches': batch_data[0], 'checksums': None, 'children': None}
+                    
+                    # Yield in expected format: (set_name, batch, global_batch_size)
+                    yield 'capsule', batch, self.global_batch_size
+            
+            def __len__(self):
+                return len(self.raw_loader)
+        
+        wrapped_dataloader = CapsuleDataLoaderWrapper(raw_dataloader, config.global_batch_size)
+        return wrapped_dataloader, metadata
     
     # Token-based mode (original logic)
     dataset_paths = config.data_paths if split == 'train' else config.data_paths_test
