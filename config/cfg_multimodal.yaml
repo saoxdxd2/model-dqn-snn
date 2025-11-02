@@ -64,7 +64,6 @@ puzzle_emb_weight_decay: 0.1
 
 seed: 42
 min_eval_interval: 0
-encoder_model: openai/clip-vit-base-patch32
 
 checkpoint_path: "checkpoints/multimodal-hesc"
 

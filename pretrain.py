@@ -343,23 +343,17 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             def __iter__(self):
                 for batch_data in self.raw_loader:
                     # batch_data is tuple of (sketches,) or (sketches, checksums) or (sketches, checksums, children)
-                    # Format as dict - use 'inputs' key for compatibility with model
+                    # Sketches are already [B, 12, 512] from encoder.sketch_projection
                     if len(batch_data) == 3:
-                        sketches = batch_data[0]  # [B, 12, 768]
-                        # Project from CLIP dimension (768) to model hidden_size (512)
-                        # Simple linear projection: [B, 12, 768] -> [B, 12, 512]
-                        if sketches.shape[-1] == 768:
-                            sketches = sketches[..., :512]  # Truncate for now (TODO: add learned projection)
+                        sketches = batch_data[0]  # [B, 12, 512]
                         batch = {
                             'inputs': sketches,
                             'checksums': batch_data[1],
                             'children': batch_data[2],
-                            'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long)  # Dummy IDs for capsule mode
+                            'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long)
                         }
                     elif len(batch_data) == 2:
-                        sketches = batch_data[0]
-                        if sketches.shape[-1] == 768:
-                            sketches = sketches[..., :512]
+                        sketches = batch_data[0]  # [B, 12, 512]
                         batch = {
                             'inputs': sketches,
                             'checksums': batch_data[1],
@@ -367,9 +361,7 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
                             'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long)
                         }
                     else:
-                        sketches = batch_data[0]
-                        if sketches.shape[-1] == 768:
-                            sketches = sketches[..., :512]
+                        sketches = batch_data[0]  # [B, 12, 512]
                         batch = {
                             'inputs': sketches,
                             'checksums': None,

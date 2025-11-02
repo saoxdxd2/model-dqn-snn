@@ -267,18 +267,15 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             from models.capsule_encoder import CapsuleEncoder
             target_capsules = getattr(self.config, 'target_capsules', 12)
             children_per_capsule = getattr(self.config, 'children_per_capsule', 4)
-            encoder_model = getattr(self.config, 'encoder_model', 'openai/clip-vit-large-patch14')
             
-            # NEW: Enhanced encoder options from merged cnn_tokenizer
-            use_dinov2 = getattr(self.config, 'use_dinov2', False)
-            use_hybrid = getattr(self.config, 'use_hybrid_encoder', False)
-            output_mode = getattr(self.config, 'encoder_output_mode', 'capsules')
+            # TRM encoder parameters
+            num_layers = getattr(self.config, 'encoder_num_layers', 2)
+            H_cycles = getattr(self.config, 'encoder_H_cycles', 2)
+            L_cycles = getattr(self.config, 'encoder_L_cycles', 3)
             
-            print(f"\n🔧 Vision-Unified Encoder Configuration:")
-            print(f"   Encoder model: {encoder_model}")
-            print(f"   DINOv2: {use_dinov2}")
-            print(f"   Hybrid mode: {use_hybrid}")
-            print(f"   Output mode: {output_mode}")
+            print(f"\n🔧 Vision-Unified Encoder Configuration (TRM):")
+            print(f"   Encoder: TRM (recursive reasoning)")
+            print(f"   Layers: {num_layers}, H_cycles: {H_cycles}, L_cycles: {L_cycles}")
             print(f"   Compression: {target_capsules} capsules × {children_per_capsule} children")
             
             self.capsule_encoder = CapsuleEncoder(
@@ -286,11 +283,9 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 target_capsules=target_capsules,
                 children_per_capsule=children_per_capsule,
                 checksum_dim=getattr(self.config, 'checksum_dim', 32),
-                freeze_encoder=getattr(self.config, 'freeze_capsule_encoder', True),
-                encoder_model=encoder_model,
-                use_dinov2=use_dinov2,
-                use_hybrid=use_hybrid,
-                output_mode=output_mode
+                num_layers=num_layers,
+                H_cycles=H_cycles,
+                L_cycles=L_cycles,
             )
             self.embed_tokens = None
         else:
@@ -441,8 +436,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             # Legacy token mode: standard token embedding
             embedding = self.embed_tokens(input.to(torch.int32))
 
-        # Puzzle embeddings
-        if self.config.puzzle_emb_ndim > 0:
+        # Puzzle embeddings (skip for capsule mode - not needed for multimodal inputs)
+        if self.config.puzzle_emb_ndim > 0 and self.capsule_encoder is None and self.config.num_puzzle_identifiers > 0:
             puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
             
             pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]

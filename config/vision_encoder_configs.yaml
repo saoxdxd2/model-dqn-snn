@@ -1,54 +1,52 @@
-# Vision Encoder Configurations for Multimodal Generalist Models
+# TRM Vision Encoder Configurations
+# Unified recursive reasoning architecture for vision encoding
 
-# CLIP Vision Encoder (Best for multimodal alignment)
-clip_config:
-  encoder_type: 'clip'
-  clip_model: 'openai/clip-vit-base-patch16'  # 86M params, 768 dim
-  # Alternatives:
-  # - 'openai/clip-vit-large-patch14': 304M params, 1024 dim (higher quality)
-  # - 'laion/CLIP-ViT-H-14-laion2B-s32B-b79K': 632M params, 1024 dim (best)
+# Lightweight TRM Encoder (Fast inference)
+lightweight_trm:
+  encoder_type: 'trm'
+  encoder_num_layers: 1
+  encoder_H_cycles: 1
+  encoder_L_cycles: 2
+  hidden_size: 512
+  target_capsules: 12
+  children_per_capsule: 4
+  # Total: 1×2 = 2 recursive passes
+  # Params: ~2M
+  # Use case: Fast inference, mobile deployment
+
+# Standard TRM Encoder (Balanced)
+standard_trm:
+  encoder_type: 'trm'
+  encoder_num_layers: 2
+  encoder_H_cycles: 2
+  encoder_L_cycles: 3
+  hidden_size: 512
+  target_capsules: 12
+  children_per_capsule: 4
+  # Total: 2×3 = 6 recursive passes
+  # Params: ~5M
+  # Use case: Default for most tasks
+
+# Deep TRM Encoder (Maximum capability)
+deep_trm:
+  encoder_type: 'trm'
+  encoder_num_layers: 3
+  encoder_H_cycles: 3
+  encoder_L_cycles: 4
+  hidden_size: 512
+  target_capsules: 12
+  children_per_capsule: 4
+  # Total: 3×4 = 12 recursive passes
+  # Params: ~8M
+  # Use case: Complex visual reasoning (ARC, spatial puzzles)
+
+# Large TRM Encoder (Research scale)
+large_trm:
+  encoder_type: 'trm'
+  encoder_num_layers: 4
+  encoder_H_cycles: 4
+  encoder_L_cycles: 5
   hidden_size: 768
-  freeze_encoder: true
-  use_hybrid: false
-
-# DINOv2 (Best for complex visual reasoning)
-dinov2_config:
-  encoder_type: 'dinov2'
-  dinov2_model: 'facebook/dinov2-base'  # 86M params, 768 dim
-  # Alternatives:
-  # - 'facebook/dinov2-large': 304M params, 1024 dim
-  # - 'facebook/dinov2-giant': 1.1B params, 1536 dim (best for complex tasks)
-  hidden_size: 768
-  freeze_encoder: true
-  use_hybrid: false
-
-# Hybrid (CLIP + DINOv2 for maximum capability)
-hybrid_config:
-  encoder_type: 'hybrid'
-  clip_model: 'openai/clip-vit-base-patch16'
-  dinov2_model: 'facebook/dinov2-base'
-  hidden_size: 768  # Will project from 1536 (768+768) to 768
-  freeze_encoder: true
-  use_hybrid: true
-
-# Legacy CNN (for backward compatibility only)
-cnn_legacy_config:
-  encoder_type: 'cnn'
-  use_legacy_cnn: true
-  hidden_size: 256
-  num_conv_layers: 3
-  conv_channels: [64, 128, 256]
-
-# Recommendations based on use case:
-#
-# 1. General multimodal (text + vision):
-#    Use CLIP - maintains alignment between modalities
-#
-# 2. Complex visual reasoning (ARC, puzzles):
-#    Use DINOv2 - best spatial understanding
-#
-# 3. Maximum capability (if you have compute):
-#    Use Hybrid - combines multimodal + complex reasoning
-#
-# 4. Fast inference / low memory:
-#    Use CLIP-base (smallest pretrained option)
+  target_capsules: 16
+  children_per_capsule: 4
+ 

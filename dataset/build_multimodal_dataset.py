@@ -78,7 +78,6 @@ class MultimodalDatasetConfig(BaseModel):
     target_capsules: int = 12
     children_per_capsule: int = 4  # Fine-grained tokens per capsule
     num_concepts: int = 2048
-    encoder_model: str = "openai/clip-vit-large-patch14"
     
     # Image processing
     image_size: int = 224
@@ -563,9 +562,9 @@ def build(config: MultimodalDatasetConfig):
         hidden_size=config.hidden_size,
         target_capsules=config.target_capsules,
         children_per_capsule=config.children_per_capsule,
-        encoder_model=config.encoder_model or "openai/clip-vit-large-patch14",
-        freeze_encoder=True,
-        use_spatial=True
+        num_layers=2,
+        H_cycles=2,
+        L_cycles=3,
     )
     encoder.eval()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -601,32 +600,31 @@ def build(config: MultimodalDatasetConfig):
             
             # Encode batch
             with torch.no_grad():
+                # Define image transform once (no duplicate)
+                from torchvision import transforms
+                transform = transforms.Compose([
+                    transforms.Resize((224, 224)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                ])
+                
                 if batch_images:
                     # Convert PIL images to tensors
-                    from torchvision import transforms
-                    transform = transforms.Compose([
-                        transforms.Resize((224, 224)),
-                        transforms.ToTensor(),
-                        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                    ])
                     image_tensors = torch.stack([transform(img) for img in batch_images]).to(device)
                     result = encoder(images=image_tensors, return_children=True)
                 elif batch_texts:
-                    # OPTIMIZED: Direct CLIP encoding without expensive chunking
-                    # Tokenize all texts at once
-                    inputs = encoder.tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=77).to(device)
-                    text_features = encoder.encoder.get_text_features(**inputs)  # [B, 768]
+                    # Render text to images, then encode with TRM
+                    from models.text_renderer import TextRenderer
+                    renderer = TextRenderer(width=224, height=224, font_size=12)
                     
-                    # Create capsules by replicating the embedding
-                    B = text_features.shape[0]
-                    sketches = text_features.unsqueeze(1).repeat(1, config.target_capsules, 1)  # [B, 12, 768]
-                    sketches = encoder.sketch_projection(sketches)  # [B, 12, hidden_size]
+                    # Render texts to images
+                    text_images = [renderer.render_plain_text(text[:500]) for text in batch_texts]
                     
-                    # Simple checksums (hash of features)
-                    checksums = torch.randn(B, config.target_capsules, 32, device=device) * 0.1
+                    # Convert PIL images to tensors (same transform)
+                    image_tensors = torch.stack([transform(img) for img in text_images]).to(device)
                     
-                    # No children for text mode (too slow)
-                    result = {'sketches': sketches, 'checksums': checksums, 'children': None}
+                    # Encode through TRM
+                    result = encoder(images=image_tensors, return_children=True)
                 else:
                     continue
                 

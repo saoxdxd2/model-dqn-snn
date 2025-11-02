@@ -164,12 +164,8 @@ class BaseDatasetBuilder(ABC):
             'metadata': self.create_metadata(train_encoded)
         }
     
-    def _stream_encode_capsules(self, samples: List[DataSample]) -> Dict[str, torch.Tensor]:
-        """High-performance encoding with 10GB RAM budget using PyTorch DataLoader."""
-        if len(samples) == 0:
-            return {'sketches': torch.empty(0, getattr(self.config, 'target_capsules', 12), getattr(self.config, 'hidden_size', 768))}
-        
-        # Initialize encoder once
+    def _init_encoder(self):
+        """Initialize CapsuleEncoder (shared by all encoding methods)."""
         if self.encoder is None:
             from models.capsule_encoder import CapsuleEncoder
             self.encoder = CapsuleEncoder(
@@ -177,13 +173,21 @@ class BaseDatasetBuilder(ABC):
                 target_capsules=getattr(self.config, 'target_capsules', 12),
                 children_per_capsule=4,
                 checksum_dim=32,
-                freeze_encoder=True,
-                encoder_model=getattr(self.config, 'encoder_model', 'openai/clip-vit-large-patch14'),
-                use_spatial=getattr(self.config, 'use_spatial_capsules', True),
+                num_layers=getattr(self.config, 'encoder_num_layers', 2),
+                H_cycles=getattr(self.config, 'encoder_H_cycles', 2),
+                L_cycles=getattr(self.config, 'encoder_L_cycles', 3),
                 capsule_grid_shape=getattr(self.config, 'capsule_grid_shape', (3, 4))
             )
             self.encoder.eval()
             self.encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    def _stream_encode_capsules(self, samples: List[DataSample]) -> Dict[str, torch.Tensor]:
+        """High-performance encoding with 10GB RAM budget using PyTorch DataLoader."""
+        if len(samples) == 0:
+            return {'sketches': torch.empty(0, getattr(self.config, 'target_capsules', 12), getattr(self.config, 'hidden_size', 768))}
+        
+        # Initialize encoder once
+        self._init_encoder()
         
         from torch.utils.data import Dataset, DataLoader
         from tqdm import tqdm
@@ -279,21 +283,8 @@ class BaseDatasetBuilder(ABC):
         Unified encoding: text/image/grid → capsules.
         Single pass through CapsuleEncoder.
         """
-        if self.encoder is None:
-            from models.capsule_encoder import CapsuleEncoder
-            
-            self.encoder = CapsuleEncoder(
-                hidden_size=getattr(self.config, 'hidden_size', 768),
-                target_capsules=getattr(self.config, 'target_capsules', 12),
-                children_per_capsule=4,
-                checksum_dim=32,
-                freeze_encoder=True,
-                encoder_model=getattr(self.config, 'encoder_model', 'openai/clip-vit-large-patch14'),
-                use_spatial=getattr(self.config, 'use_spatial_capsules', True),
-                capsule_grid_shape=getattr(self.config, 'capsule_grid_shape', (3, 4))
-            )
-            self.encoder.eval()
-            self.encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
+        # Initialize encoder once (shared method)
+        self._init_encoder()
         
         # Process in chunks to prevent RAM accumulation from text list
         batch_size = 4
