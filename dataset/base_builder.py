@@ -52,14 +52,16 @@ class DataSample(BaseModel):
 
 class BaseDatasetBuilder(ABC):
     """
-    Abstract base class for all dataset builders.
+    Abstract base class for vision-unified dataset builders.
     
-    Implements common functionality:
-    - Capsule encoding (HESC)
-    - Metadata generation
-    - Train/test splitting
-    - Augmentation
-    - Saving to disk
+    Pipeline:
+    1. Load raw data (text/images/grids)
+    2. Preprocess (render text to images if needed)
+    3. Augment (rotations, flips, etc.)
+    4. Encode via TRM vision encoder → capsules
+    5. Save capsule dataset
+    
+    All data goes through TRM encoder - no separate text/vision paths.
     """
     
     def __init__(self, config: BaseModel):
@@ -136,27 +138,19 @@ class BaseDatasetBuilder(ABC):
         del augmented  # Free original list
         print(f"   Train: {len(train_data)}, Test: {len(test_data)}")
         
-        # Encode with direct streaming to prevent RAM leak
-        use_capsules = getattr(self.config, 'use_capsules', True)
-        if use_capsules:
-            print("🧶 Encoding to HESC capsules...")
-            
-            # CRITICAL: Encode directly without wrapper function to allow immediate cleanup
-            import gc
-            
-            # Train encoding (batch processing with DataLoader)
-            print(f"   Encoding {len(train_data)} train samples...")
-            train_encoded = self._stream_encode_capsules(train_data)
-            del train_data  # Free after encoding
-            
-            # Test encoding (batch processing with DataLoader)
-            print(f"   Encoding {len(test_data)} test samples...")
-            test_encoded = self._stream_encode_capsules(test_data)
-            del test_data  # Free after encoding
-        else:
-            # Non-capsule mode: keep raw samples
-            train_encoded = train_data
-            test_encoded = test_data
+        # Encode to capsules (vision-unified pipeline - always uses TRM encoder)
+        print("🧶 Encoding to HESC capsules (TRM vision encoder)...")
+        import gc
+        
+        # Train encoding (batch processing with DataLoader)
+        print(f"   Encoding {len(train_data)} train samples...")
+        train_encoded = self._stream_encode_capsules(train_data)
+        del train_data  # Free after encoding
+        
+        # Test encoding (batch processing with DataLoader)
+        print(f"   Encoding {len(test_data)} test samples...")
+        test_encoded = self._stream_encode_capsules(test_data)
+        del test_data  # Free after encoding
         
         return {
             'train': train_encoded,
@@ -355,10 +349,7 @@ class BaseDatasetBuilder(ABC):
             return f"Image: {type(sample.image).__name__}"  # Placeholder
         return ""
     
-    def encode_to_tokens(self, samples: List[DataSample]) -> Dict[str, np.ndarray]:
-        """Fallback: encode to discrete tokens (legacy mode)."""
-        # Implement token-based encoding if needed
-        raise NotImplementedError("Token encoding not implemented in base class")
+    # Legacy token encoding removed - vision-unified only uses capsules
     
     def _grid_to_text(self, grid: np.ndarray) -> str:
         """Convert 2D grid to text representation."""

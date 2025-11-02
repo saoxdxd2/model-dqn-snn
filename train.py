@@ -62,25 +62,30 @@ COMMUNICATION_ROADMAP = [
     }
 ]
 
+# Vision-Unified: Single model for all modalities
+# Text → rendered to images → TRM encoder → capsules
+# Images → TRM encoder → capsules
+# Grids → rendered to images → TRM encoder → capsules
 MODELS = {
     "vision-unified": {
-        "name": "Vision-Unified Model (Text + Images + Puzzles)",
+        "name": "TRM Vision-Unified (All Modalities)",
         "config": "cfg_multimodal",
         "dataset_builder": "dataset/build_multimodal_dataset.py",
         "dataset_command": "build-composite",
         "dataset_args": [
             "--sources", "wikitext2", "cifar10", "kaggle/combined/arc-agi",
             "--output-dir", "datasets/vision_unified",
-            "--augment"  # Enable augmentation
+            "--augment"
         ],
         "description": (
-            "Single vision model handles ALL modalities:\n"
-            "  • Text → rendered to images with syntax highlighting\n"
-            "  • Images → DINOv2/CLIP hybrid encoder with patch attention\n"
-            "  • Puzzles → 30×30 grids compressed to 12 capsules\n"
-            "  • Architecture: H=3, L=2 (9 recursions optimal for 12 capsules)\n"
-            "  • Features: DQN halting, Memory Bank, MTP, Curiosity rewards\n"
-            "  • Everything runs through unified vision pipeline"
+            "TRM Vision-Unified Pipeline (5M encoder + 5M reasoner):\n"
+            "  • Text → rendered to 224×224 images → TRM encoder\n"
+            "  • Images → TRM encoder (no CLIP)\n"
+            "  • Grids → rendered to images → TRM encoder\n"
+            "  • All data → 12 capsules × 512D\n"
+            "  • Architecture: Encoder(2L, H=2, L=3), Reasoner(H=3, L=2)\n"
+            "  • Features: DQN, Memory Bank, MTP\n"
+            "  • 30× smaller than CLIP, 17× faster"
         )
     }
 }
@@ -559,24 +564,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python train.py                    # Interactive mode (auto-resumes if checkpoint exists)
-  python train.py --model text       # Train text model (auto-resumes from epoch 100 -> 500)
-  python train.py --model arc        # Train ARC visual model
-  python train.py --model code       # Train code model
-  python train.py --rebuild-dataset  # Force rebuild dataset
+  python train.py                  Usage:
+  python train.py                   # Train vision-unified model (default)
+  python train.py --rebuild-dataset # Force rebuild dataset
+  python train.py --dataset-only    # Only build dataset, don't train
 
 Auto-Resume:
-  Training automatically resumes from checkpoints/MODEL/latest.pt if it exists.
+  Training automatically resumes from checkpoints/vision-unified/latest.pt if it exists.
   No need to manually specify --load-checkpoint!
         """
     )
     
-    parser.add_argument(
-        "--model",
-        type=str,
-        choices=list(MODELS.keys()),
-        help="Model type to train"
-    )
     parser.add_argument(
         "--rebuild-dataset",
         action="store_true",

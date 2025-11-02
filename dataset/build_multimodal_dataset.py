@@ -734,51 +734,11 @@ def _post_process(config: MultimodalDatasetConfig, dataset: Dict):
             print(f"   ⚠️  {e}")
 
 
-# Preset commands (shortcuts for common use cases)
-PRESETS = {
-    'arc': {'include_text': False, 'include_images': False, 'include_grids': True, 'enable_quality_scoring': True},
-    'text': {'include_text': True, 'include_images': False, 'include_grids': False},
-    'image': {'include_text': False, 'include_images': True, 'include_grids': False},
-    'maze': {'include_text': False, 'include_images': False, 'include_grids': True},
-    'composite': {'include_text': True, 'include_images': True, 'include_grids': True}
-}
-
-@cli.command()
-def quick_build(preset: str, sources: List[str], output_dir: str):
-    """Quick build with preset config (arc, text, image, maze, composite)."""
-    if preset not in PRESETS:
-        print(f"❌ Unknown preset: {preset}. Available: {list(PRESETS.keys())}")
-        return
-    
-    config = MultimodalDatasetConfig(
-        source_paths=sources,
-        output_dir=output_dir,
-        **PRESETS[preset]
-    )
-    build(config)
-
-# Legacy command aliases
-@cli.command()
-def build_arc(input_file_prefix: str = "kaggle/combined/arc-agi", output_dir: str = "data/arc-capsules"):
-    import glob
-    quick_build('arc', glob.glob(f"{input_file_prefix}*.json"), output_dir)
-
-@cli.command()
-def build_text(input_file: str = "wikitext2", output_dir: str = "datasets/wikitext2"):
-    quick_build('text', [input_file], output_dir)
-
-@cli.command()
-def build_image(dataset_name: str = "cifar10", output_dir: str = "datasets/cifar10"):
-    quick_build('image', [dataset_name], output_dir)
-
-@cli.command()
-def build_maze(source_repo: str = "sapientinc/maze-30x30-hard-1k", output_dir: str = "data/maze"):
-    try:
-        from huggingface_hub import hf_hub_download
-        sources = [hf_hub_download(source_repo, f"{s}.csv", repo_type="dataset") for s in ['train', 'test']]
-    except:
-        sources = [f"{output_dir}/{s}.csv" for s in ['train', 'test']]
-    quick_build('maze', sources, output_dir)
+# ===== Vision-Unified Pipeline Only =====
+# All data (text, images, grids) goes through TRM vision encoder
+# Text → rendered to images → TRM encoder → capsules
+# Images → TRM encoder → capsules
+# Grids → rendered to images → TRM encoder → capsules
 
 @cli.command()
 def build_composite(
