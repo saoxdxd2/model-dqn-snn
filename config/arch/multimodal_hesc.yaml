@@ -7,29 +7,29 @@ loss:
   name: losses@ACTLossHead
   loss_type: stablemax_cross_entropy
 
-# ===== HESC-Optimized Recursion =====
-# Derived for seq_len=12 (capsules), not 900 (pixels)
-# Total recursions: 3 × (2+1) = 9 forward passes
-H_cycles: 3  # High-level reasoning iterations
-L_cycles: 2  # Low-level processing per H-cycle
+# ===== HESC-Optimized Recursion (T4 GPU Training) =====
+# Derived for seq_len=24 (capsules), not 900 (pixels)
+# Total recursions: 5 × (5+1) = 30 forward passes
+H_cycles: 5  # High-level reasoning iterations (max quality)
+L_cycles: 5  # Low-level processing per H-cycle (max quality)
 
 halt_exploration_prob: 0.1
-halt_max_steps: 16
+halt_max_steps: 64  # Maximum adaptive steps for training
 
-# ===== Model Architecture =====
+# ===== Model Architecture (T4 GPU Training) =====
 H_layers: 0
-L_layers: 2  # 2-layer transformer (TRM paper optimal)
+L_layers: 4  # 4-layer transformer for maximum quality
 
-hidden_size: 512  # Capsule embedding dimension
-num_heads: 8      # Attention heads
-num_key_value_heads: 2  # GQA: 4:1 ratio (58% memory reduction)
-expansion: 4      # FFN expansion
+hidden_size: 1024  # Maximum capsule embedding for training
+num_heads: 16      # Maximum attention heads for T4 GPU
+num_key_value_heads: 16  # Full MHA for training (compress to 12 for deployment)
+expansion: 4       # FFN expansion
 
-# ===== TRM Vision Encoder =====
-encoder_num_layers: 2
-encoder_H_cycles: 2
-encoder_L_cycles: 3
-# Total encoder passes: 2×3 = 6
+# ===== TRM Vision Encoder (T4 GPU Training) =====
+encoder_num_layers: 4  # Maximum depth for training
+encoder_H_cycles: 4    # Maximum high-level reasoning
+encoder_L_cycles: 5    # Maximum low-level refinement
+# Total encoder passes: 4×5 = 20
 
 puzzle_emb_ndim: ${.hidden_size}
 puzzle_emb_len: 16
@@ -71,10 +71,10 @@ q_head_type: mlp
 q_head_hidden_size: 128
 q_head_num_layers: 1
 
-# ===== Memory Bank (Re-enabled - compatible with vision-unified) =====
+# ===== Memory Bank (T4 GPU Training) =====
 enable_memory: True
-memory_capacity: 4096
-memory_num_heads: 8
+memory_capacity: 16384  # Maximum capacity for training
+memory_num_heads: 16    # Maximum heads for T4 GPU
 memory_dropout: 0.1
 memory_reward_bonus: 0.5
 memory_reward_threshold: 0.05

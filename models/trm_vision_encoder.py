@@ -13,7 +13,75 @@ from models.recursive_reasoning.trm import (
     TinyRecursiveReasoningModel_ACTV1ReasoningModule,
     TinyRecursiveReasoningModel_ACTV1Config,
 )
-from models.layers import RotaryEmbedding
+from models.layers import RotaryEmbedding, LearnedPositionalEmbedding2D
+
+
+class CapsuleAttentionPool(nn.Module):
+    """
+    Learned attention-weighted pooling for capsule assignment.
+    
+    Replaces AdaptiveAvgPool2d with learned attention maps that determine
+    which spatial regions contribute to each capsule.
+    
+    Benefits:
+    - Preserves spatial information (vs uniform averaging)
+    - Learns semantic importance of regions
+    - Compatible with existing DQN (fixed capsule count)
+    """
+    
+    def __init__(self, in_channels: int, num_capsules: int):
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_capsules = num_capsules
+        
+        # 1x1 conv to produce attention logits per capsule
+        self.attn_conv = nn.Conv2d(in_channels, num_capsules, kernel_size=1)
+    
+    def forward(self, feat_map):
+        """
+        Args:
+            feat_map: [B, C, H, W] spatial features
+        
+        Returns:
+            capsules: [B, K, C] weighted pooled features
+            attention_maps: [B, K, H, W] attention weights (for children extraction)
+        """
+        B, C, H, W = feat_map.shape
+        
+        # Generate attention logits per capsule
+        attn_logits = self.attn_conv(feat_map)  # [B, K, H, W]
+        
+        # Softmax over spatial dimension (each capsule attends to all locations)
+        attn = F.softmax(attn_logits.view(B, self.num_capsules, -1), dim=-1)
+        attn = attn.view(B, self.num_capsules, H, W)  # [B, K, H, W]
+        
+        # Weighted pooling: each capsule = weighted sum of spatial features
+        # feat_map: [B, C, H, W] -> [B, 1, C, H, W]
+        # attn: [B, K, H, W] -> [B, K, 1, H, W]
+        feat_expanded = feat_map.unsqueeze(1)  # [B, 1, C, H, W]
+        attn_expanded = attn.unsqueeze(2)  # [B, K, 1, H, W]
+        
+        # Weighted sum over spatial dims
+        capsules = (feat_expanded * attn_expanded).sum(dim=(-2, -1))  # [B, K, C]
+        
+        return capsules, attn
+    
+    def get_attention_entropy(self, attn_maps):
+        """
+        Compute attention concentration metric (lower entropy = more focused).
+        
+        Args:
+            attn_maps: [B, K, H, W] attention weights
+        
+        Returns:
+            entropy: [B, K] entropy per capsule
+        """
+        B, K, H, W = attn_maps.shape
+        attn_flat = attn_maps.view(B, K, -1)  # [B, K, H*W]
+        
+        # Entropy: -sum(p * log(p))
+        entropy = -(attn_flat * torch.log(attn_flat + 1e-8)).sum(dim=-1)
+        return entropy
 
 
 class TRMVisionEncoder(nn.Module):
@@ -45,6 +113,8 @@ class TRMVisionEncoder(nn.Module):
         capsule_grid_shape: tuple = (3, 4),
         expansion: int = 4,
         dropout: float = 0.0,
+        pooling_method: str = "attention",  # "avg" | "attention"
+        real_children: bool = True,
     ):
         super().__init__()
         
@@ -56,6 +126,8 @@ class TRMVisionEncoder(nn.Module):
         self.L_cycles = L_cycles
         self.target_capsules = target_capsules
         self.capsule_grid_shape = capsule_grid_shape
+        self.pooling_method = pooling_method
+        self.real_children = real_children
         
         # Patch embedding: [B, 3, H, W] -> [B, num_patches, hidden_size]
         self.patch_embed = nn.Conv2d(
@@ -64,8 +136,12 @@ class TRMVisionEncoder(nn.Module):
             stride=patch_size
         )
         
-        # Positional embeddings (RoPE)
-        self.rotary_emb = RotaryEmbedding(hidden_size // num_heads)
+        # Positional embeddings (Learned 2D - ViT/CLIP standard)
+        # RoPE is for 1D sequences (text), not suitable for 2D vision patches
+        self.pos_embed = LearnedPositionalEmbedding2D(
+            num_patches=self.num_patches,
+            embedding_dim=hidden_size
+        )
         
         # Create TRM config for encoder
         encoder_config = TinyRecursiveReasoningModel_ACTV1Config(
@@ -73,16 +149,21 @@ class TRMVisionEncoder(nn.Module):
             seq_len=self.num_patches,
             hidden_size=hidden_size,
             num_heads=num_heads,
-            num_key_value_heads=num_heads // 4,  # GQA
+            num_key_value_heads=num_heads,  # Full MHA (ViT/CLIP standard, not GQA)
             expansion=expansion,
             H_layers=0,  # Not used (manual cycles)
             L_layers=num_layers,
+            H_cycles=H_cycles,  # High-level cycles
+            L_cycles=L_cycles,  # Low-level cycles
             vocab_size=2052,  # Dummy
             num_puzzle_identifiers=0,
             puzzle_emb_ndim=0,
             causal=False,  # Non-causal for vision
             rms_norm_eps=1e-6,
             mlp_t=False,
+            pos_encodings="none",  # Using learned 2D pos embeddings instead
+            halt_max_steps=100,  # Not used in encoder
+            halt_exploration_prob=0.0,  # Not used in encoder
         )
         
         # TRM L-level blocks (reuse existing architecture!)
@@ -91,8 +172,16 @@ class TRMVisionEncoder(nn.Module):
             for _ in range(num_layers)
         ])
         
+        # Layer normalization before pooling (ViT/CLIP standard)
+        self.pre_pool_norm = nn.LayerNorm(hidden_size, eps=1e-6)
+        
         # Spatial pooling to capsule grid
-        self.spatial_pool = nn.AdaptiveAvgPool2d(capsule_grid_shape)
+        if pooling_method == "attention":
+            self.spatial_pool = CapsuleAttentionPool(hidden_size, target_capsules)
+            print(f"   Pooling: Learned attention ({target_capsules} attention maps)")
+        else:
+            self.spatial_pool = nn.AdaptiveAvgPool2d(capsule_grid_shape)
+            print(f"   Pooling: Adaptive average (grid {capsule_grid_shape})")
         
         print(f"\n🔧 TRM Vision Encoder Initialized:")
         print(f"   Patches: {self.num_patches} ({image_size//patch_size}×{image_size//patch_size})")
@@ -125,30 +214,42 @@ class TRMVisionEncoder(nn.Module):
         H_patches = W_patches = self.image_size // self.patch_size
         tokens = patch_embeddings.flatten(2).transpose(1, 2)
         
-        # Compute RoPE embeddings
-        cos_sin = self.rotary_emb(tokens)
+        # Add learned 2D positional embeddings (ViT/CLIP standard)
+        tokens = self.pos_embed(tokens)  # [B, 196, 512]
         
         # TRM Recursive Reasoning (H_cycles × L_cycles)
+        # No cos_sin needed - using learned positional embeddings
         for h_cycle in range(self.H_cycles):
             for l_cycle in range(self.L_cycles):
                 # Apply L-level blocks
                 for block in self.L_blocks:
                     tokens = block(
-                        cos_sin=cos_sin,
-                        hidden_states=tokens,
-                        spatial_bias=None
+                        cos_sin=None,  # No RoPE for vision
+                        hidden_states=tokens
                     )
+        
+        # Apply layer normalization before pooling (ViT/CLIP standard)
+        tokens = self.pre_pool_norm(tokens)  # [B, 196, 512]
         
         # Reshape to spatial grid: [B, 196, 512] -> [B, 512, 14, 14]
         tokens_spatial = tokens.transpose(1, 2).view(
             B, self.hidden_size, H_patches, W_patches
         )
         
-        # Spatial pooling to capsule grid: [B, 512, 14, 14] -> [B, 512, 3, 4]
-        capsules_spatial = self.spatial_pool(tokens_spatial)
-        
-        # Flatten to capsules: [B, 512, 3, 4] -> [B, 12, 512]
-        capsules = capsules_spatial.flatten(2).transpose(1, 2)
+        # Spatial pooling to capsules
+        if self.pooling_method == "attention":
+            # Attention-weighted pooling: [B, 512, 14, 14] -> [B, 12, 512]
+            capsules, attention_maps = self.spatial_pool(tokens_spatial)
+            # Store attention maps for children extraction
+            self._last_attention_maps = attention_maps  # [B, 12, 14, 14]
+            self._last_spatial_tokens = tokens  # [B, 196, 512]
+        else:
+            # Adaptive avg pooling: [B, 512, 14, 14] -> [B, 512, 3, 4]
+            capsules_spatial = self.spatial_pool(tokens_spatial)
+            # Flatten: [B, 512, 3, 4] -> [B, 12, 512]
+            capsules = capsules_spatial.flatten(2).transpose(1, 2)
+            self._last_attention_maps = None
+            self._last_spatial_tokens = tokens
         
         return capsules
 
@@ -192,6 +293,37 @@ class TRMVisionEncoderWithChecksums(nn.Module):
         # Children projection (for hierarchical expansion)
         self.children_projection = nn.Linear(hidden_size, hidden_size)
     
+    def _extract_topk_children(self, spatial_tokens, attention_maps, m: int = 4):
+        """
+        Extract top-m spatial patches per capsule based on attention weights.
+        
+        Args:
+            spatial_tokens: [B, H*W, C] flattened patch embeddings
+            attention_maps: [B, K, H, W] attention weights per capsule
+            m: number of children per capsule
+        
+        Returns:
+            children: [B, K, m, C] top-m patches for each capsule
+        """
+        B, K, H, W = attention_maps.shape
+        _, num_patches, C = spatial_tokens.shape
+        
+        # Flatten attention maps: [B, K, H*W]
+        attn_flat = attention_maps.view(B, K, -1)
+        
+        # Select top-m patches per capsule
+        topk_vals, topk_idx = torch.topk(attn_flat, k=m, dim=-1)  # [B, K, m]
+        
+        # Gather children embeddings
+        # Expand indices for batch gathering
+        batch_idx = torch.arange(B, device=spatial_tokens.device)[:, None, None]
+        batch_idx = batch_idx.expand(B, K, m)
+        
+        # Gather: spatial_tokens[batch_idx, topk_idx]
+        children = spatial_tokens[batch_idx, topk_idx]  # [B, K, m, C]
+        
+        return children
+    
     def forward(self, images, return_children: bool = True):
         """
         Encode images to HESC capsules.
@@ -214,12 +346,21 @@ class TRMVisionEncoderWithChecksums(nn.Module):
             'checksums': checksums
         }
         
-        # Children: duplicate sketches for now
-        # TODO: Use spatial patches as real children
+        # Children: extract top-m spatial patches per capsule via attention
         if return_children:
-            children = sketches.unsqueeze(2).repeat(
-                1, 1, self.children_per_capsule, 1
-            )  # [B, 12, 4, 512]
+            if self.encoder.real_children and self.encoder._last_attention_maps is not None:
+                # Real children: top-m patches by attention weight
+                children = self._extract_topk_children(
+                    self.encoder._last_spatial_tokens,
+                    self.encoder._last_attention_maps,
+                    m=self.children_per_capsule
+                )
+            else:
+                # Fallback: duplicate sketches (legacy behavior)
+                children = sketches.unsqueeze(2).repeat(
+                    1, 1, self.children_per_capsule, 1
+                )  # [B, 12, 4, 512]
+            
             children = self.children_projection(children)
             result['children'] = children
         

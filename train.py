@@ -35,7 +35,6 @@ MODELS = {
         "name": "TRM Vision-Unified (All Modalities)",
         "config": "cfg_multimodal",
         "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_command": "build-composite",
         "dataset_args": [
             "--sources", "kaggle/combined", "tinystories",
             "--output-dir", "datasets/vision_unified",

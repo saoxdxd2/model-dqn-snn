@@ -509,28 +509,56 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         return sample
     
     def augment_sample(self, sample: DataSample) -> List[DataSample]:
-        """Unified augmentation: images (flip), grids (rotations)."""
+        """Unified augmentation: full dihedral group (8 transformations) for both images and grids.
+        
+        This enables TRM to learn rotation-invariant features by seeing each sample from
+        all 8 perspectives: 4 rotations + 4 reflections.
+        """
         augmented = [sample]
         
-        # Image flip (optimized to share memory where possible)
+        # Images: Full dihedral group (8 transformations) - same as grids
+        # This is crucial for TRM's spatial reasoning capabilities
         if sample.image is not None and isinstance(sample.image, np.ndarray):
-            aug = DataSample(
-                sample_id=f"{sample.sample_id}_flip",
-                modality=sample.modality,
-                text=sample.text,
-                image=np.fliplr(sample.image).copy(),  # Explicit copy needed for flip
-                label=sample.label,
-                metadata=sample.metadata
-            )
-            augmented.append(aug)
+            # Apply all 8 dihedral transformations
+            # tid 0 = identity (original, already in list)
+            # tid 1-3 = rotations (90°, 180°, 270°)
+            # tid 4-7 = reflections (flip_lr, flip_ud, transpose, anti-diagonal)
+            for tid in [1, 2, 3, 4, 5, 6, 7]:
+                # Use PIL for image rotations (handles RGB channels correctly)
+                aug_image = sample.image.copy()
+                
+                if tid == 1:
+                    aug_image = np.rot90(aug_image, k=1)  # 90° CCW
+                elif tid == 2:
+                    aug_image = np.rot90(aug_image, k=2)  # 180°
+                elif tid == 3:
+                    aug_image = np.rot90(aug_image, k=3)  # 270° CCW
+                elif tid == 4:
+                    aug_image = np.fliplr(aug_image)  # Horizontal flip
+                elif tid == 5:
+                    aug_image = np.flipud(aug_image)  # Vertical flip
+                elif tid == 6:
+                    aug_image = np.transpose(aug_image, (1, 0, 2))  # Transpose (swap H,W, keep C)
+                elif tid == 7:
+                    aug_image = np.fliplr(np.rot90(aug_image, k=1))  # Anti-diagonal
+                
+                aug = DataSample(
+                    sample_id=f"{sample.sample_id}_aug{tid}",
+                    modality=sample.modality,
+                    text=sample.text,
+                    image=aug_image,
+                    label=sample.label,
+                    metadata=sample.metadata
+                )
+                augmented.append(aug)
         
-        # Grid rotations (dihedral group)
+        # Grid rotations (dihedral group) - keep existing implementation
         if sample.grid is not None:
             from common import dihedral_transform
-            for tid in [1, 2, 3]:
+            for tid in [1, 2, 3, 4, 5, 6, 7]:  # All 7 non-identity transforms
                 aug = DataSample(**sample.model_dump())
                 aug.grid = dihedral_transform(sample.grid, tid)
-                aug.sample_id = f"{sample.sample_id}_rot{tid}"
+                aug.sample_id = f"{sample.sample_id}_aug{tid}"
                 augmented.append(aug)
         
         return augmented

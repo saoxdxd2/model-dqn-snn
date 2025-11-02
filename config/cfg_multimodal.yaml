@@ -27,10 +27,10 @@ enable_dqn: true
 enable_entropy_regularization: true  # Encourage Q-head to explore all 3 actions
 entropy_regularization_weight: 0.01  # Small bonus for action diversity
 
-# Memory Bank Configuration
+# Memory Bank Configuration (T4 GPU Training)
 enable_memory: true
-memory_capacity: 4096
-memory_num_heads: 8
+memory_capacity: 16384  # Large capacity for training
+memory_num_heads: 16  # Maximum heads for T4 GPU
 memory_dropout: 0.1
 
 # TRM Recursive Reasoning Features (NEW - ENABLED)
@@ -41,9 +41,33 @@ enable_capsule_expansion: true  # Capsule expansion via DQN (FULL SUPPORT with c
 q_head_num_actions: 3  # Q-head actions: [HALT, CONTINUE, EXPAND]
 q_head_type: "mlp"  # Options: mlp, rnn, mini_attention
 
-# Training hyperparameters (optimized for 12-capsule sequences)
-image_size: 128  # Reduced from 224 to fit 100k samples in 12GB RAM
-global_batch_size: 768  # High batch for capsule compression
+# ===== Vision Capsule Pooling Strategy (T4 GPU Training) =====
+vision:
+  capsule:
+    method: "attention"  # "avg" | "attention" | "yolo_mapping"
+    target_capsules: 24  # Maximum capsules for training (distill to 16 for deployment)
+    children_per_capsule: 6  # More children for training (distill to 4)
+    attention_channels: 1024  # Large channels for T4 GPU
+    real_children: true  # Use top-m patches as children (vs fake duplicates)
+    children_selection: "topk_attention"  # "topk_attention" | "weighted_avg"
+
+# ===== YOLO Zone Detection (Phase 2+) =====
+yolo:
+  enabled: false  # Set true to enable zone detection
+  proposals: 32  # Max proposals from detector
+  proposal_threshold: 0.3  # Objectness threshold
+  mapping_method: "topk"  # "topk" | "nms"
+  pretrain_synthetic: false  # Pretrain on synthetic zone labels
+
+# ===== DQN Action Space =====
+dqn:
+  num_actions_meta: 2  # HALT, CONTINUE
+  use_topk_mapping: false  # Map variable proposals to fixed slots (Phase 2)
+  slot_mask_empty: true  # Mask empty slots in Q-head
+
+# Training hyperparameters (T4 GPU - 16GB VRAM)
+image_size: 384  # High resolution for training (will resize to 256 for deployment)
+global_batch_size: 256  # T4 GPU batch size
 epochs: 50000
 eval_interval: 1000
 checkpoint_every_eval: True

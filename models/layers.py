@@ -93,6 +93,7 @@ class CastedEmbedding(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
+    """Rotary Positional Embeddings for 1D sequences (text)."""
     def __init__(self, dim, max_position_embeddings, base, device=None):
         super().__init__()
 
@@ -103,11 +104,42 @@ class RotaryEmbedding(nn.Module):
 
         # Different from paper, but it uses a different permutation in order to obtain the same calculation
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.cos_cached = nn.Buffer(emb.cos(), persistent=False)
-        self.sin_cached = nn.Buffer(emb.sin(), persistent=False)
+        # Register as buffers (non-trainable tensors)
+        self.register_buffer('cos_cached', emb.cos(), persistent=False)
+        self.register_buffer('sin_cached', emb.sin(), persistent=False)
 
     def forward(self):
         return self.cos_cached, self.sin_cached
+
+
+class LearnedPositionalEmbedding2D(nn.Module):
+    """Learned 2D Positional Embeddings for Vision (ViT/CLIP-style).
+    
+    Standard approach for vision transformers - additive learned embeddings
+    that preserve 2D spatial relationships, unlike RoPE which is 1D-only.
+    """
+    def __init__(self, num_patches: int, embedding_dim: int):
+        super().__init__()
+        self.num_patches = num_patches
+        self.embedding_dim = embedding_dim
+        
+        # Learned positional embeddings: [1, num_patches, embedding_dim]
+        # Initialized with truncated normal (ViT standard)
+        self.pos_embedding = nn.Parameter(
+            trunc_normal_init_(torch.zeros(1, num_patches, embedding_dim), std=0.02)
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Add positional embeddings to input tokens.
+        
+        Args:
+            x: [B, num_patches, embedding_dim] patch embeddings
+        
+        Returns:
+            [B, num_patches, embedding_dim] with positional info added
+        """
+        return x + self.pos_embedding
 
 
 class Attention(nn.Module):

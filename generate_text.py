@@ -9,6 +9,10 @@ from transformers import AutoTokenizer
 from pathlib import Path
 import argparse
 
+# CPU optimization: limit threads to avoid overload
+torch.set_num_threads(4)  # Use half of threads for Intel i5-1035G1
+torch.set_num_interop_threads(2)  # Reduce inter-op parallelism
+
 from models.recursive_reasoning.trm import TinyRecursiveReasoningModel_ACTV1
 
 
@@ -98,7 +102,8 @@ def generate_text(
     generated_tokens = input_ids.tolist()[0]
     act_steps = []  # Track ACT cycles per token
     
-    with torch.no_grad():
+    # Use inference_mode for better memory efficiency (vs no_grad)
+    with torch.inference_mode():
         for _ in range(max_new_tokens):
             # Update batch with current sequence
             current_ids = torch.tensor([generated_tokens], device=device)
@@ -153,10 +158,10 @@ def generate_text(
                 act_steps.append(steps)
             
             # Check for EOS
-            if next_token == tokenizer.eos_token_id:
+            if next_token.item() == tokenizer.eos_token_id:
                 break
             
-            generated_tokens.append(next_token)
+            # Update carry for next iteration
             carry = carry_out
     
     # Decode based on mode
