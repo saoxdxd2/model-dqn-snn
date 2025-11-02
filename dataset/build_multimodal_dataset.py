@@ -555,7 +555,45 @@ def build(config: MultimodalDatasetConfig):
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(test_dir, exist_ok=True)
     
-    # Convert DataSample objects to dicts for JSON serialization
+    # Create proper PuzzleDatasetMetadata for each split
+    train_samples = dataset['train']
+    test_samples = dataset['test']
+    
+    # Calculate metadata values (simplified for text-only datasets)
+    train_metadata = {
+        'pad_id': 0,
+        'ignore_label_id': -100,
+        'blank_identifier_id': 0,
+        'vocab_size': 50257,  # GPT-2 vocab size (standard for text)
+        'seq_len': 512,  # Standard sequence length
+        'num_puzzle_identifiers': len(train_samples),
+        'total_groups': 1,  # Single group for unified dataset
+        'mean_puzzle_examples': 1.0,
+        'total_puzzles': len(train_samples),
+        'sets': ['train']  # Dataset set name
+    }
+    
+    test_metadata = {
+        'pad_id': 0,
+        'ignore_label_id': -100,
+        'blank_identifier_id': 0,
+        'vocab_size': 50257,
+        'seq_len': 512,
+        'num_puzzle_identifiers': len(test_samples),
+        'total_groups': 1,
+        'mean_puzzle_examples': 1.0,
+        'total_puzzles': len(test_samples),
+        'sets': ['test']
+    }
+    
+    # Save metadata as dataset.json (not the samples themselves)
+    with open(os.path.join(train_dir, 'dataset.json'), 'w') as f:
+        json.dump(train_metadata, f, indent=2)
+    
+    with open(os.path.join(test_dir, 'dataset.json'), 'w') as f:
+        json.dump(test_metadata, f, indent=2)
+    
+    # Optionally save sample data separately for inspection
     def sample_to_dict(sample):
         return {
             'sample_id': sample.sample_id,
@@ -564,14 +602,11 @@ def build(config: MultimodalDatasetConfig):
             'metadata': sample.metadata
         }
     
-    train_data = [sample_to_dict(s) for s in dataset['train']]
-    test_data = [sample_to_dict(s) for s in dataset['test']]
+    with open(os.path.join(train_dir, 'samples.json'), 'w') as f:
+        json.dump([sample_to_dict(s) for s in train_samples], f)
     
-    with open(os.path.join(train_dir, 'dataset.json'), 'w') as f:
-        json.dump(train_data, f)
-    
-    with open(os.path.join(test_dir, 'dataset.json'), 'w') as f:
-        json.dump(test_data, f)
+    with open(os.path.join(test_dir, 'samples.json'), 'w') as f:
+        json.dump([sample_to_dict(s) for s in test_samples], f)
     
     # Post-processing pipeline (concept expansion, quality scoring)
     _post_process(config, dataset)
