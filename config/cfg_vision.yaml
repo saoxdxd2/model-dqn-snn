@@ -42,3 +42,13 @@ checkpoint_path: "checkpoints/vision-trm-20m"
 ema: True  # Important for vision
 ema_rate: 0.999
 freeze_weights: False
+
+# TRM Recursive Reasoning Features
+enable_dqn: false
+enable_memory: false
+enable_mtp: false
+enable_adaptive_hcycles: true
+hcycle_confidence_threshold: 2.0
+enable_hierarchical_attention: true  # Useful for spatial reasoning
+q_head_num_actions: 3
+q_head_type: "mlp"

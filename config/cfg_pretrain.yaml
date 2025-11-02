@@ -43,3 +43,15 @@ checkpoint_path: null # Set to save checkpoints, e.g., "checkpoints/run1"
 ema: False # use Exponential-Moving-Average
 ema_rate: 0.999 # EMA-rate
 freeze_weights: False # If True, freeze weights and only learn the embeddings
+
+# TRM Recursive Reasoning Features (NEW)
+enable_dqn: true
+enable_entropy_regularization: true
+entropy_regularization_weight: 0.01
+enable_memory: true
+enable_mtp: true
+enable_adaptive_hcycles: true
+hcycle_confidence_threshold: 2.0
+enable_hierarchical_attention: true
+q_head_num_actions: 3
+q_head_type: "mlp"

@@ -543,8 +543,34 @@ def build(config: MultimodalDatasetConfig):
     builder = MultimodalDatasetBuilder(config)
     dataset = builder.build_dataset()
     
-    # Save FIRST (so post-processing can read the files)
-    builder.save(dataset, config.output_dir)
+    # Save dataset (simplified for raw text mode)
+    import os
+    import json
+    os.makedirs(config.output_dir, exist_ok=True)
+    
+    # Save train/test splits as JSON
+    train_dir = os.path.join(config.output_dir, 'train')
+    test_dir = os.path.join(config.output_dir, 'test')
+    os.makedirs(train_dir, exist_ok=True)
+    os.makedirs(test_dir, exist_ok=True)
+    
+    # Convert DataSample objects to dicts for JSON serialization
+    def sample_to_dict(sample):
+        return {
+            'sample_id': sample.sample_id,
+            'modality': sample.modality.value if hasattr(sample.modality, 'value') else str(sample.modality),
+            'text': sample.text,
+            'metadata': sample.metadata
+        }
+    
+    train_data = [sample_to_dict(s) for s in dataset['train']]
+    test_data = [sample_to_dict(s) for s in dataset['test']]
+    
+    with open(os.path.join(train_dir, 'dataset.json'), 'w') as f:
+        json.dump(train_data, f)
+    
+    with open(os.path.join(test_dir, 'dataset.json'), 'w') as f:
+        json.dump(test_data, f)
     
     # Post-processing pipeline (concept expansion, quality scoring)
     _post_process(config, dataset)

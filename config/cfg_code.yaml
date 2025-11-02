@@ -41,3 +41,15 @@ checkpoint_path: "checkpoints/code-trm-13m"
 ema: False
 ema_rate: 0.999
 freeze_weights: False
+
+# TRM Recursive Reasoning Features (NEW)
+enable_dqn: true
+enable_entropy_regularization: true
+entropy_regularization_weight: 0.01
+enable_memory: true
+enable_mtp: true
+enable_adaptive_hcycles: true
+hcycle_confidence_threshold: 2.0
+enable_hierarchical_attention: true
+q_head_num_actions: 3
+q_head_type: "mlp"

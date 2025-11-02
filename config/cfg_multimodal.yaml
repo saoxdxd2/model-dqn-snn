@@ -19,6 +19,28 @@ semantic_mode: true
 semantic_dataset: "datasets/multimodal_unified/capsule_dataset.pt"
 semantic_eval_dataset: "datasets/multimodal_unified/capsule_dataset_test.pt"
 
+# Multi-Token Prediction (DeepSeek-V3 inspired)
+enable_mtp: true
+
+# DQN Enhancement Parameters
+enable_dqn: true
+enable_entropy_regularization: true  # Encourage Q-head to explore all 3 actions
+entropy_regularization_weight: 0.01  # Small bonus for action diversity
+
+# Memory Bank Configuration
+enable_memory: true
+memory_capacity: 4096
+memory_num_heads: 8
+memory_dropout: 0.1
+
+# TRM Recursive Reasoning Features (NEW - ENABLED)
+enable_adaptive_hcycles: true  # Early exit from H-cycles based on Q-value confidence
+hcycle_confidence_threshold: 2.0  # Threshold for early exit (2.0 = ~88% probability)
+enable_hierarchical_attention: true  # Parent-child attention bias for capsule structure
+enable_capsule_expansion: true  # Capsule expansion via DQN (FULL SUPPORT with children embeddings)
+q_head_num_actions: 3  # Q-head actions: [HALT, CONTINUE, EXPAND]
+q_head_type: "mlp"  # Options: mlp, rnn, mini_attention
+
 # Training hyperparameters (optimized for 12-capsule sequences)
 image_size: 128  # Reduced from 224 to fit 100k samples in 12GB RAM
 global_batch_size: 768  # High batch for capsule compression

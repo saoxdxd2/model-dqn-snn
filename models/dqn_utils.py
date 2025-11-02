@@ -113,6 +113,9 @@ def select_action_epsilon_greedy(
     training: bool = True,
 ) -> Tensor:
     """
+    DEPRECATED: Legacy 2-action epsilon-greedy.
+    Use select_action_epsilon_greedy_3way for 3-action Q-head.
+    
     Select action using epsilon-greedy strategy.
     
     Args:
@@ -138,6 +141,44 @@ def select_action_epsilon_greedy(
     
     # Greedy action: halt if Q(halt) > 0
     greedy_action = q_halt_logits > 0
+    
+    # Combine: use random action where mask is True, greedy otherwise
+    action = torch.where(random_mask, random_action, greedy_action)
+    
+    return action
+
+
+def select_action_epsilon_greedy_3way(
+    q_logits: Tensor,
+    epsilon: float,
+    training: bool = True,
+) -> Tensor:
+    """
+    Select action using epsilon-greedy strategy for 3-action Q-head.
+    
+    Args:
+        q_logits: Q-values [batch_size, 3] for [CONTINUE, HALT, EXPAND]
+        epsilon: Exploration rate (0 = greedy, 1 = random)
+        training: Whether in training mode
+    
+    Returns:
+        Integer tensor [batch_size] with action indices {0, 1, 2}
+    """
+    if not training:
+        # Evaluation: always greedy
+        return torch.argmax(q_logits, dim=-1)
+    
+    batch_size = q_logits.shape[0]
+    device = q_logits.device
+    
+    # Random mask: True = explore, False = exploit
+    random_mask = torch.rand(batch_size, device=device) < epsilon
+    
+    # Random action: uniform over {0, 1, 2}
+    random_action = torch.randint(0, 3, (batch_size,), device=device)
+    
+    # Greedy action: argmax of Q-values
+    greedy_action = torch.argmax(q_logits, dim=-1)
     
     # Combine: use random action where mask is True, greedy otherwise
     action = torch.where(random_mask, random_action, greedy_action)

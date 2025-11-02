@@ -92,6 +92,12 @@ mtp_loss_weight: 0.5
 mtp_share_embeddings: True
 mtp_share_output_head: True
 
+# ===== TRM Recursive Reasoning Features (NEW) =====
+enable_adaptive_hcycles: true
+hcycle_confidence_threshold: 2.0
+enable_hierarchical_attention: false
+q_head_num_actions: 3
+
 # ===== Optimization =====
 cpu_optimized: False
 use_gelu: True

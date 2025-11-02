@@ -198,6 +198,9 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
         print(f"\n📦 Loading multimodal capsule dataset: {capsule_path}")
         data = torch.load(capsule_path)
         
+        # Import CapsuleState for expansion tracking
+        from models.capsule_state import CapsuleState
+        
         # Extract components (unified format)
         sketches = data['sketches']  # [N, k, hidden_size]
         checksums = data.get('checksums', None)
@@ -223,6 +226,11 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             total_puzzles=sketches.shape[0],
             sets=["all"]
         )
+        
+        # Store children and checksums for batch-time CapsuleState creation
+        # These will be accessed by index during training
+        dataset_children = children  # [N, k, m, D] or None
+        dataset_checksums = checksums  # [N, k, R] or None
         
         # Create dataset with available components
         from torch.utils.data import TensorDataset
@@ -765,10 +773,10 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     if isinstance(batch, tuple):
         # HESC mode: batch from TensorDataset
         if len(batch) == 3:
-            # Full capsule data: (sketches, checksums, children)
+            # Capsules with children: (sketches, checksums, children)
             sketches, checksums, children = batch
             batch = {
-                'input': sketches.cuda(),
+                'inputs': sketches.cuda(),
                 'capsule_sketches': sketches.cuda(),
                 'capsule_checksums': checksums.cuda(),
                 'capsule_children': children.cuda(),
@@ -780,7 +788,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             # Capsules without children: (sketches, checksums)
             sketches, checksums = batch
             batch = {
-                'input': sketches.cuda(),
+                'inputs': sketches.cuda(),
                 'capsule_sketches': sketches.cuda(),
                 'capsule_checksums': checksums.cuda(),
                 'labels': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
@@ -791,13 +799,29 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             # Legacy semantic: (embeddings,)
             embeddings = batch[0].cuda()
             batch = {
-                'input': embeddings,
+                'inputs': embeddings,  # Changed from 'input' for consistency
                 'labels': torch.zeros(embeddings.shape[0], dtype=torch.long).cuda(),
                 'puzzle_identifiers': torch.zeros(embeddings.shape[0], dtype=torch.long).cuda()
             }
     else:
         # Standard token mode: batch is dict
         batch = {k: v.cuda() for k, v in batch.items()}
+        
+    # Add CapsuleState for expansion tracking (if enabled)
+    # Works for both tuple and dict batch modes
+    if hasattr(config.arch, 'enable_capsule_expansion') and config.arch.enable_capsule_expansion:
+        if 'inputs' in batch and batch['inputs'].dim() == 3:
+            from models.capsule_state import CapsuleState
+            
+            children = batch.get('capsule_children', None)
+            checksums = batch.get('capsule_checksums', None)
+            
+            capsule_state = CapsuleState(
+                sketches=batch['inputs'].clone(),
+                children=children,
+                checksums=checksums
+            )
+            batch['capsule_state'] = capsule_state
 
     # Init carry if it is None
     if train_state.carry is None:
@@ -923,7 +947,7 @@ def evaluate(
                 if len(batch) == 3:
                     sketches, checksums, children = batch
                     batch = {
-                        'input': sketches.cuda(),
+                        'inputs': sketches.cuda(),
                         'capsule_sketches': sketches.cuda(),
                         'capsule_checksums': checksums.cuda(),
                         'capsule_children': children.cuda(),
@@ -933,7 +957,7 @@ def evaluate(
                 elif len(batch) == 2:
                     sketches, checksums = batch
                     batch = {
-                        'input': sketches.cuda(),
+                        'inputs': sketches.cuda(),
                         'capsule_sketches': sketches.cuda(),
                         'capsule_checksums': checksums.cuda(),
                         'labels': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
@@ -942,13 +966,29 @@ def evaluate(
                 else:
                     embeddings = batch[0].cuda()
                     batch = {
-                        'input': embeddings,
+                        'inputs': embeddings,
                         'labels': torch.zeros(embeddings.shape[0], dtype=torch.long).cuda(),
                         'puzzle_identifiers': torch.zeros(embeddings.shape[0], dtype=torch.long).cuda()
                     }
             else:
                 # Standard dict mode
                 batch = {k: v.cuda() for k, v in batch.items()}
+                
+                # Add CapsuleState for expansion tracking (if enabled)
+                if hasattr(config.arch, 'enable_capsule_expansion') and config.arch.enable_capsule_expansion:
+                    if 'inputs' in batch and batch['inputs'].dim() == 3:  # [B, k, D]
+                        from models.capsule_state import CapsuleState
+                        
+                        # Create CapsuleState with available components
+                        children = batch.get('capsule_children', None)  # [B, k, m, D] if available
+                        checksums = batch.get('capsule_checksums', None)  # [B, k, R] if available
+                        
+                        capsule_state = CapsuleState(
+                            sketches=batch['inputs'].clone(),  # [B, k, D]
+                            children=children,  # Full expansion support if available
+                            checksums=checksums,  # Reconstructability tracking
+                        )
+                        batch['capsule_state'] = capsule_state
             with torch.device("cuda"):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 

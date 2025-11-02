@@ -51,3 +51,13 @@ checkpoint_path: "checkpoints/text-trm-10m"
 ema: True  # Exponential Moving Average for stability
 ema_rate: 0.9995  # Slightly higher for text (smoother averaging)
 freeze_weights: False
+
+# TRM Recursive Reasoning Features
+enable_dqn: false
+enable_memory: false
+enable_mtp: true  # Helpful for text prediction
+enable_adaptive_hcycles: true
+hcycle_confidence_threshold: 2.0
+enable_hierarchical_attention: false
+q_head_num_actions: 3
+q_head_type: "mlp"

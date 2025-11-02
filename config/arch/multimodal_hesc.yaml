@@ -47,8 +47,8 @@ ema_decay: 0.999
 # ===== DQN (Re-enabled - compatible with vision-unified) =====
 enable_dqn: True
 dqn_buffer_capacity: 500000  # Corrected from 20K (was filling in <1 step)
-dqn_buffer_min_size: 50000
-dqn_batch_size: 256
+dqn_buffer_min_size: 1000  # Reduced from 50K - start DQN training earlier
+dqn_batch_size: 128  # Reduced from 256 for smaller buffer
 dqn_gamma: 0.99
 dqn_epsilon_start: 0.3
 dqn_epsilon_end: 0.05
@@ -99,6 +99,13 @@ mtp_share_output_head: True
 # Reconstruction loss weight (from our fixes)
 reconstruction_weight: 0.5
 checksum_halt_threshold: 0.5
+
+# ===== TRM Recursive Reasoning Features (NEW) =====
+enable_adaptive_hcycles: true
+hcycle_confidence_threshold: 2.0
+enable_hierarchical_attention: true
+enable_capsule_expansion: false  # Requires batch['capsule_state']
+q_head_num_actions: 3
 
 # ===== Optimization =====
 cpu_optimized: False

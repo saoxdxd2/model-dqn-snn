@@ -107,10 +107,12 @@ class ACTLossHead(nn.Module):
             logits = outputs.get('final', outputs.get('logits', outputs))
             intermediate_logits = outputs.get('intermediate')
             mtp_logits = outputs.get('mtp_logits')  # Multi-token prediction outputs
-            # Preserve critical keys: q_halt_logits, q_continue_logits, z_H
+            # Preserve critical keys: q_halt_logits, q_continue_logits, q_expand_logits, z_H
             q_halt_logits = outputs.get('q_halt_logits')
             q_continue_logits = outputs.get('q_continue_logits')
+            q_expand_logits = outputs.get('q_expand_logits')  # NEW: 3rd Q-value for capsule expansion
             z_H = outputs.get('z_H')
+            model_expansion_cost = outputs.get('expansion_cost', 0)
             # Rebuild outputs dict with proper structure
             outputs = {'logits': logits}
             if q_halt_logits is not None:
@@ -207,7 +209,12 @@ class ACTLossHead(nn.Module):
         if self.enable_dqn and self.model.config.enable_entropy_regularization:
             # Compute entropy of Q-value distribution: H(π) = -Σ π(a) log π(a)
             # where π(a) = softmax(Q(s,a) / temperature)
-            q_probs = torch.softmax(torch.stack([outputs["q_continue_logits"], outputs["q_halt_logits"]], dim=-1), dim=-1)
+            # Include q_expand if available (3-action instead of 2-action)
+            if q_expand_logits is not None:
+                q_probs = torch.softmax(torch.stack([outputs["q_continue_logits"], outputs["q_halt_logits"], q_expand_logits], dim=-1), dim=-1)
+                metrics["q_expand_mean"] = q_expand_logits.mean().detach()
+            else:
+                q_probs = torch.softmax(torch.stack([outputs["q_continue_logits"], outputs["q_halt_logits"]], dim=-1), dim=-1)
             entropy = -(q_probs * torch.log(q_probs + 1e-8)).sum(-1)  # [batch]
             entropy_bonus = -self.model.config.entropy_regularization_weight * entropy.sum()  # Negative because we want to maximize entropy
             metrics["q_entropy"] = entropy.mean().detach()
@@ -254,12 +261,16 @@ class ACTLossHead(nn.Module):
                 reconstruction_loss = 0
         
                 
-        # Expansion cost tracking (HESC)
+        # Expansion cost tracking (HESC + NEW TRM implementation)
         expansion_cost = 0
+        # Legacy source: from carry state
         if 'num_expansions' in new_carry.current_data:
             num_expansions = new_carry.current_data['num_expansions']
             children_per_capsule = getattr(self.model.config, 'children_per_capsule', 4)
             expansion_cost = 0.01 * num_expansions.float().mean() * children_per_capsule
+        # NEW source: from model output dict (our implementation)
+        if isinstance(model_expansion_cost, torch.Tensor) and model_expansion_cost.sum() > 0:
+            expansion_cost = expansion_cost + model_expansion_cost.mean() if isinstance(expansion_cost, torch.Tensor) else model_expansion_cost.mean()
         
         # VQ codebook loss (for concept vocabulary)
         vq_loss = 0
@@ -374,16 +385,36 @@ class ACTLossHead(nn.Module):
                         threshold=self.model.config.memory_reward_threshold
                     )
             
+            # Log action distribution for monitoring Q-head behavior
+            if new_carry.q_action is not None:
+                action_counts = torch.bincount(new_carry.q_action, minlength=3)
+                total_actions = action_counts.sum().item()
+                if total_actions > 0:
+                    metrics["action_0_continue"] = action_counts[0].item()
+                    metrics["action_1_halt"] = action_counts[1].item()
+                    metrics["action_2_expand"] = action_counts[2].item()
+                    metrics["action_expand_pct"] = (action_counts[2].float() / total_actions * 100).item()
+            
             # Compute intrinsic curiosity bonus for exploration
             intrinsic_bonus = torch.zeros_like(curr_accuracy)
             if hasattr(self, 'intrinsic_reward') and 'z_H' in outputs:
                 current_state = outputs['z_H'][:, 0].detach()  # [batch, hidden_size]
                 intrinsic_bonus = self.intrinsic_reward.compute_intrinsic_reward(current_state)
             
-            # Combined reward: extrinsic + intrinsic
-            # r_total = r_extrinsic + β * r_intrinsic
+            # Expansion reward shaping: bonus for helpful expansions
+            expansion_bonus = torch.zeros_like(curr_accuracy)
+            if new_carry.q_action is not None:
+                expansion_mask = (new_carry.q_action == 2)  # EXPAND actions
+                expansion_bonus = torch.where(
+                    expansion_mask & (accuracy_improvement > 0),
+                    torch.tensor(0.1, device=accuracy_improvement.device),  # +0.1 reward for helpful expansion
+                    torch.tensor(0.0, device=accuracy_improvement.device)
+                )
+            
+            # Combined reward: extrinsic + intrinsic + expansion bonus
+            # r_total = r_extrinsic + β * r_intrinsic + expansion_bonus
             extrinsic_reward = accuracy_improvement - step_penalty + terminal_bonus + memory_bonus
-            rewards = extrinsic_reward + intrinsic_bonus
+            rewards = extrinsic_reward + intrinsic_bonus + expansion_bonus
             
             # Normalize rewards for stability
             self.reward_stats.update(rewards.detach())
@@ -490,9 +521,9 @@ class ACTLossHead(nn.Module):
         if isinstance(reconstruction_loss, torch.Tensor) and reconstruction_loss != 0:
             total_loss = total_loss + 0.5 * reconstruction_loss
         
-        # Add expansion penalty (weight: 0.1)
+        # Add expansion penalty (weight: 0.01 - reduced to avoid discouraging expansion)
         if isinstance(expansion_cost, torch.Tensor) and expansion_cost != 0:
-            total_loss = total_loss + 0.1 * expansion_cost
+            total_loss = total_loss + 0.01 * expansion_cost
         
         # Add VQ codebook loss (weight: 0.25)
         if isinstance(vq_loss, torch.Tensor) and vq_loss != 0:
@@ -519,8 +550,13 @@ class ACTLossHead(nn.Module):
         prev_state = prev_carry.inner_carry.z_H[:, 0]  # [batch, hidden_size]
         curr_state = new_carry.inner_carry.z_H[:, 0]   # [batch, hidden_size]
         
-        # Extract actions (halt = 1, continue = 0)
-        actions = new_carry.halted.long()
+        # Extract actions from Q-head decision (0=CONTINUE, 1=HALT, 2=EXPAND)
+        # Use actual Q-head action, not just halted flag
+        if new_carry.q_action is not None:
+            actions = new_carry.q_action  # [batch] - 0/1/2
+        else:
+            # Fallback to binary action if q_action not stored
+            actions = new_carry.halted.long()  # [batch] - 0/1
         
         # Extract other info
         steps = new_carry.steps
@@ -531,13 +567,13 @@ class ACTLossHead(nn.Module):
         td_errors = None
         if hasattr(self.model.inner, 'q_head'):
             with torch.no_grad():
-                # Current Q-values
-                q_values = self.model.inner.q_head(prev_state)  # [batch, 2]
+                # Current Q-values (2 or 3 actions)
+                q_values = self.model.inner.q_head(prev_state)  # [batch, num_actions]
                 current_q = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)  # [batch]
                 
                 # Target Q-values (use target network if available)
                 q_head_target = getattr(self.model.inner, 'q_head_target', self.model.inner.q_head)
-                next_q_values = q_head_target(curr_state)  # [batch, 2]
+                next_q_values = q_head_target(curr_state)  # [batch, num_actions]
                 next_q_max = next_q_values.max(dim=1)[0]  # [batch]
                 
                 # TD target

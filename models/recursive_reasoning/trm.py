@@ -13,7 +13,7 @@ from models.common import trunc_normal_init_
 from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 from models.common import *
-from models.dqn_utils import compute_epsilon, select_action_epsilon_greedy
+from models.dqn_utils import compute_epsilon, select_action_epsilon_greedy, select_action_epsilon_greedy_3way
 from models.q_heads import create_q_head
 from models.memory_bank import AssociativeMemoryBank
 
@@ -50,19 +50,20 @@ class TinyRecursiveReasoningModel_ACTV1InnerCarry:
 
 @dataclass
 class TinyRecursiveReasoningModel_ACTV1Carry:
-    inner_carry: TinyRecursiveReasoningModel_ACTV1InnerCarry
+    inner_carry: Any
     
-    steps: torch.Tensor
-    halted: torch.Tensor
+    steps: torch.Tensor  # [batch]
+    halted: torch.Tensor  # [batch]
     
-    current_data: Dict[str, torch.Tensor]
+    current_data: Any
     
-    # DQN tracking
-    prev_accuracy: Optional[torch.Tensor] = None
-    training_step: int = 0  # Global training step for epsilon decay
+    # DQN-specific fields
+    prev_accuracy: Optional[torch.Tensor] = None  # [batch] - for reward computation
+    training_step: int = 0
+    q_action: Optional[torch.Tensor] = None  # [batch] - actual Q-head action (0=CONTINUE, 1=HALT, 2=EXPAND)
     
-    # Puzzle boundary tracking (for RNN Q-head state reset)
-    puzzle_ids: Optional[torch.Tensor] = None  # Track current puzzle IDs to detect changes
+    # Puzzle boundary tracking (for RNN Q-head reset)
+    puzzle_ids: Optional[torch.Tensor] = None  # [batch] - current puzzle IDs to detect changes
 
 
 class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
@@ -151,6 +152,13 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     cpu_optimized: bool = False  # Enable CPU-friendly optimizations
     use_gelu: bool = True  # GELU (GPU) vs ReLU (CPU faster)
     ffn_expansion_ratio: float = 4.0  # 4.0 for GPU, 2.0 for CPU
+    
+    # TRM-Specific Recursive Reasoning Features (NEW)
+    enable_adaptive_hcycles: bool = False  # Enable early exit from H-cycles based on confidence
+    hcycle_confidence_threshold: float = 2.0  # Q-value threshold for early exit (2.0 = ~88% prob)
+    enable_hierarchical_attention: bool = False  # Enable parent-child attention bias for capsules
+    enable_capsule_expansion: bool = False  # Enable DQN-controlled capsule expansion
+    q_head_num_actions: int = 3  # Number of Q-head actions: [HALT, CONTINUE, EXPAND]
 
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
@@ -287,6 +295,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             self.output_vocab_size = output_vocab_size
         
         # Q-head: Configurable architecture (MLP/RNN/Mini-Attention)
+        # Output: 3 actions [HALT, CONTINUE, EXPAND] instead of 2 [HALT, CONTINUE]
+        self.config.q_head_num_actions = getattr(self.config, 'q_head_num_actions', 3)
         self.q_head = create_q_head(self.config)
         
         # DQN: Target network for stable Q-learning
@@ -296,6 +306,12 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             # Freeze target network
             for param in self.q_head_target.parameters():
                 param.requires_grad = False
+        
+        # Capsule expansion tracking
+        self.enable_capsule_expansion = getattr(self.config, 'enable_capsule_expansion', False)
+        if self.enable_capsule_expansion:
+            from models.capsule_state import CapsuleState
+            self.capsule_state_class = CapsuleState
 
         self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  if self.config.puzzle_emb_len == 0 else self.config.puzzle_emb_len  # ceil div
         if self.config.puzzle_emb_ndim > 0:
@@ -437,9 +453,36 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], 
                 enable_deep_supervision: bool = False, supervision_steps: int = 4) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Prepare positional encodings and hierarchical attention bias
         seq_info = dict(
             cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
         )
+        
+        # Hierarchical attention: compute spatial bias for capsule parent-child structure
+        spatial_bias = None
+        if getattr(self.config, 'enable_hierarchical_attention', False):
+            # Create attention bias that encourages parent-child and sibling attention
+            batch_size, seq_len, _ = carry.z_H.shape
+            children_per_capsule = getattr(self.config, 'children_per_capsule', 4)
+            
+            # Build hierarchical structure: position i attends strongly to positions [i*m, (i+1)*m)
+            spatial_bias = torch.zeros(batch_size, seq_len, seq_len, device=carry.z_H.device)
+            for i in range(seq_len):
+                # Parent to children
+                child_start = i * children_per_capsule
+                child_end = min((i + 1) * children_per_capsule, seq_len)
+                if child_start < seq_len:
+                    spatial_bias[:, i, child_start:child_end] = 2.0  # Strong parent→child bias
+                
+                # Children to parent
+                parent_idx = i // children_per_capsule
+                if parent_idx < seq_len:
+                    spatial_bias[:, i, parent_idx] = 1.5  # Strong child→parent bias
+                
+                # Siblings (same parent)
+                sibling_start = (i // children_per_capsule) * children_per_capsule
+                sibling_end = min(sibling_start + children_per_capsule, seq_len)
+                spatial_bias[:, i, sibling_start:sibling_end] = 0.5  # Moderate sibling bias
 
         # Input encoding
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
@@ -451,26 +494,55 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         intermediate_outputs = [] if enable_deep_supervision else None
         supervision_interval = max(1, self.config.H_cycles // supervision_steps) if enable_deep_supervision else self.config.H_cycles
         
-        # Process H-cycles with gradient checkpointing for memory efficiency
+        # Process H-cycles with adaptive early exit (IMPROVED: dynamic recursion depth)
+        enable_adaptive_cycles = getattr(self.config, 'enable_adaptive_hcycles', False)
+        h_cycles_actual = self.config.H_cycles
+        
         for h_step in range(self.config.H_cycles):
             # Determine if this step should have gradients
             is_supervision_step = enable_deep_supervision and (h_step % supervision_interval == 0 or h_step == self.config.H_cycles - 1)
             is_final_step = (h_step == self.config.H_cycles - 1)
             
-            # Dynamic memory query at each H-cycle
+            # Adaptive early exit: check if reasoning has converged
+            if enable_adaptive_cycles and h_step > 0 and not is_final_step:
+                with torch.no_grad():
+                    # Query Q-head for confidence
+                    temp_q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
+                    q_halt = temp_q_logits[:, 0] if temp_q_logits.shape[-1] >= 1 else temp_q_logits[:, 0]
+                    
+                    # Early exit if high confidence (> 2.0 means ~88% probability)
+                    confidence_threshold = getattr(self.config, 'hcycle_confidence_threshold', 2.0)
+                    if (q_halt > confidence_threshold).all():
+                        h_cycles_actual = h_step + 1
+                        break
+            
+            # Dynamic memory query at each H-cycle (IMPROVED: query all positions)
             memory_content = None
             if self.memory is not None:
                 with torch.no_grad():  # Memory read is always no_grad for stability
-                    memory_content = self.memory.read(z_H[:, 0])  # [batch, hidden_size]
-                    memory_content = memory_content.unsqueeze(1)  # [batch, 1, hidden_size]
+                    # Query ALL positions for context-aware pattern retrieval
+                    memory_content = self.memory.read(z_H)  # [batch, seq_len, hidden_size]
             
-            # L-cycles with memory-enhanced input
+            # Concept expansion during reasoning (IMPROVED: multi-resolution semantic processing)
+            # Early H-cycles: abstract concepts; Later H-cycles: refined concepts
+            concept_refinement = None
+            if hasattr(self.lm_head, 'use_vq') and self.lm_head.use_vq and h_step > 0:
+                with torch.no_grad():
+                    # Quantize current state to concepts
+                    concept_ids, _ = self.lm_head.quantize_hidden(z_H[:, self.puzzle_emb_len:])
+                    # Re-embed concepts for refinement injection
+                    concept_refinement = self.lm_head.codebook.embeddings(concept_ids)
+            
+            # L-cycles with memory-enhanced input and hierarchical attention
             for _L_step in range(self.config.L_cycles):
                 h_input = z_H + input_embeddings
                 if memory_content is not None:
                     h_input = h_input + memory_content
-                z_L = self.L_level(z_L, h_input, **seq_info)
-            z_H = self.L_level(z_H, z_L, **seq_info)
+                if concept_refinement is not None:
+                    # Inject concept refinement (50% weight to preserve original signal)
+                    h_input = h_input + 0.5 * concept_refinement
+                z_L = self.L_level(z_L, h_input, spatial_bias=spatial_bias, **seq_info)
+            z_H = self.L_level(z_H, z_L, spatial_bias=spatial_bias, **seq_info)
             
             # Collect intermediate output for supervision (keep in graph)
             if is_supervision_step and intermediate_outputs is not None:
@@ -493,7 +565,53 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             _, vq_loss = self.lm_head.quantize_hidden(z_H[:, self.puzzle_emb_len:])
         
         output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
+        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)  # [batch, num_actions]
+        
+        # Parse Q-values: [HALT, CONTINUE, EXPAND] or legacy [HALT, CONTINUE]
+        if q_logits.shape[-1] >= 3:
+            q_halt_logits = q_logits[:, 0]
+            q_continue_logits = q_logits[:, 1]
+            q_expand_logits = q_logits[:, 2]
+        else:
+            # Legacy 2-action mode
+            q_halt_logits = q_logits[:, 0]
+            q_continue_logits = q_logits[:, 1]
+            q_expand_logits = None
+        
+        # Capsule expansion (if enabled and EXPAND action triggered)
+        # CRITICAL: Use actual q_action decision, not Q-value comparison
+        expansion_cost = torch.zeros(batch["inputs"].size(0), device=z_H.device)
+        updated_z_H = z_H  # Will be modified if expansion happens
+        
+        if self.enable_capsule_expansion and q_expand_logits is not None and 'capsule_state' in batch:
+            with torch.no_grad():
+                # Compute q_action decision (argmax of Q-values)
+                q_stacked = torch.stack([q_continue_logits, q_halt_logits, q_expand_logits], dim=-1)  # [B, 3]
+                q_actions_temp = torch.argmax(q_stacked, dim=-1)  # [B] - 0/1/2
+                
+                # Trigger expansion ONLY if action == 2 (EXPAND)
+                expand_mask = (q_actions_temp == 2)
+                if expand_mask.any():
+                    capsule_state = batch['capsule_state']
+                    for batch_idx in torch.where(expand_mask)[0]:
+                        # Expand first non-expanded capsule
+                        unexpanded = ~capsule_state.expanded_mask[batch_idx]
+                        if unexpanded.any():
+                            capsule_idx = torch.where(unexpanded)[0][0].item()
+                            success = capsule_state.expand_capsule(batch_idx.item(), capsule_idx)
+                            
+                            # CRITICAL: Update z_H with expanded child embeddings
+                            if success and capsule_state.children is not None:
+                                # Replace capsule representation with child embedding
+                                child_emb = capsule_state.children[batch_idx, capsule_idx, 0]  # First child
+                                updated_z_H = updated_z_H.clone()  # Avoid in-place modification
+                                updated_z_H[batch_idx, capsule_idx] = child_emb
+                    
+                    # Compute expansion cost for reward shaping
+                    expansion_cost = capsule_state.get_expansion_cost()
+        
+        # Use updated z_H for output projection
+        z_H = updated_z_H
         
         # Multi-Token Prediction (if enabled)
         mtp_logits = None
@@ -517,7 +635,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 h_prev = h_current
         
         # Store intermediate outputs, MTP, and VQ loss in dict
-        if intermediate_outputs or mtp_logits or vq_loss is not None:
+        if intermediate_outputs or mtp_logits or vq_loss is not None or expansion_cost.sum() > 0:
             output_dict = {'final': output if not isinstance(output, dict) else output}
             if intermediate_outputs:
                 output_dict['intermediate'] = intermediate_outputs
@@ -525,9 +643,15 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 output_dict['mtp'] = mtp_logits
             if vq_loss is not None:
                 output_dict['vq_loss'] = vq_loss
+            if expansion_cost.sum() > 0:
+                output_dict['expansion_cost'] = expansion_cost
             output = output_dict
         
-        return new_carry, output, (q_logits[:, 0], q_logits[:, 1])
+        # Return Q-values: (halt, continue, expand) - expand is optional
+        if q_logits.shape[-1] >= 3:
+            return new_carry, output, (q_halt_logits, q_continue_logits, q_expand_logits)
+        else:
+            return new_carry, output, (q_halt_logits, q_continue_logits)
 
 
 class TinyRecursiveReasoningModel_ACTV1(nn.Module):
@@ -567,6 +691,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             # DQN tracking
             prev_accuracy=torch.zeros((batch_size, ), dtype=torch.float32, device=device) if self.config.enable_dqn else None,
             training_step=0,
+            q_action=torch.zeros((batch_size, ), dtype=torch.long, device=device) if self.config.enable_dqn else None,
             
             # Puzzle boundary tracking
             puzzle_ids=torch.zeros((batch_size, ), dtype=torch.int64, device=device) if hasattr(self.inner, 'q_head') and hasattr(self.inner.q_head, 'reset_hidden') else None
@@ -584,11 +709,24 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         # Forward inner model (enable deep supervision in training)
         enable_deep_supervision = self.training and hasattr(self.config, 'deep_supervision_steps')
         supervision_steps = getattr(self.config, 'deep_supervision_steps', 1)
-        new_inner_carry, logits_or_dict, (q_halt_logits, q_continue_logits) = self.inner(
+        inner_result = self.inner(
             new_inner_carry, new_current_data, 
             enable_deep_supervision=enable_deep_supervision,
             supervision_steps=supervision_steps
         )
+        
+        # Handle 2-action or 3-action Q-head
+        if len(inner_result) == 3:
+            new_inner_carry, logits_or_dict, q_values = inner_result
+            if len(q_values) == 3:
+                q_halt_logits, q_continue_logits, q_expand_logits = q_values
+            else:
+                q_halt_logits, q_continue_logits = q_values
+                q_expand_logits = None
+        else:
+            # Fallback for legacy return format
+            new_inner_carry, logits_or_dict = inner_result[:2]
+            q_halt_logits = q_continue_logits = q_expand_logits = None
 
         # Unwrap deep supervision outputs (critical for workflow)
         if isinstance(logits_or_dict, dict) and 'final' in logits_or_dict:
@@ -596,7 +734,12 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             outputs = logits_or_dict  # Contains 'final' and 'intermediate'
             outputs['q_halt_logits'] = q_halt_logits
             outputs['q_continue_logits'] = q_continue_logits
+            if q_expand_logits is not None:
+                outputs['q_expand_logits'] = q_expand_logits
             outputs['z_H'] = new_inner_carry.z_H
+            # Pass through expansion_cost if present
+            if 'expansion_cost' in logits_or_dict:
+                outputs['expansion_cost'] = logits_or_dict['expansion_cost']
         else:
             # Normal: just tensor
             outputs = {
@@ -605,10 +748,21 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                 "q_continue_logits": q_continue_logits,
                 "z_H": new_inner_carry.z_H
             }
+            if q_expand_logits is not None:
+                outputs['q_expand_logits'] = q_expand_logits
 
         with torch.no_grad():
-            # Initialize halted flag
-            halted = carry.halted
+            # Compute actual Q-head action decision (0=CONTINUE, 1=HALT, 2=EXPAND)
+            if q_expand_logits is not None:
+                # 3-action Q-head: stack all Q-values and take argmax
+                q_stacked = torch.stack([q_continue_logits, q_halt_logits, q_expand_logits], dim=-1)  # [batch, 3]
+                q_actions = torch.argmax(q_stacked, dim=-1)  # [batch] - 0/1/2
+            else:
+                # 2-action Q-head (legacy): 0=continue, 1=halt
+                q_actions = (q_halt_logits > q_continue_logits).long()
+            
+            # Initialize halted flag (action=1 means HALT)
+            halted = carry.halted | (q_actions == 1)  # HALT if Q-head chose action 1
             
             # Detect puzzle boundary changes (new puzzle started)
             puzzle_changed = torch.zeros_like(halted)
@@ -641,14 +795,24 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                 # NOTE: In eval mode with use_learned_halting_eval=False, always use max steps for consistent batching
                 
                 if self.config.enable_dqn:
-                    # DQN: Epsilon-greedy exploration
+                    # DQN: Epsilon-greedy exploration with 3 actions
                     epsilon = compute_epsilon(
                         carry.training_step,
                         self.config.dqn_epsilon_start,
                         self.config.dqn_epsilon_end,
                         self.config.dqn_epsilon_decay_steps
                     )
-                    halted = halted | select_action_epsilon_greedy(q_halt_logits, epsilon, self.training)
+                    
+                    # Use 3-action epsilon-greedy if EXPAND is available
+                    if q_expand_logits is not None:
+                        # Stack Q-values: [CONTINUE, HALT, EXPAND]
+                        q_stacked_for_selection = torch.stack([q_continue_logits, q_halt_logits, q_expand_logits], dim=-1)
+                        selected_actions = select_action_epsilon_greedy_3way(q_stacked_for_selection, epsilon, self.training)
+                        # HALT if selected action == 1
+                        halted = halted | (selected_actions == 1)
+                    else:
+                        # Legacy 2-action mode
+                        halted = halted | select_action_epsilon_greedy(q_halt_logits, epsilon, self.training)
                 else:
                     # Original: random exploration
                     if self.config.no_ACT_continue:
@@ -691,11 +855,12 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         final_puzzle_ids = new_puzzle_ids if carry.puzzle_ids is not None and 'puzzle_identifiers' in new_current_data else None
         
         return TinyRecursiveReasoningModel_ACTV1Carry(
-            new_inner_carry, 
-            new_steps, 
-            halted, 
-            new_current_data,
+            inner_carry=new_inner_carry,
+            steps=new_steps + 1,
+            halted=halted,
+            current_data=new_current_data,
             prev_accuracy=new_prev_accuracy,
             training_step=new_training_step,
+            q_action=q_actions if self.config.enable_dqn else None,
             puzzle_ids=final_puzzle_ids
         ), outputs

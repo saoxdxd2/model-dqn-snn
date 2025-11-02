@@ -13,7 +13,7 @@ from models.layers import CastedLinear, rms_norm
 class MLPQHead(nn.Module):
     """Simple MLP Q-head (baseline, fast)."""
     
-    def __init__(self, hidden_size: int, num_actions: int = 2):
+    def __init__(self, hidden_size: int, num_actions: int = 3):
         super().__init__()
         self.q_head = CastedLinear(hidden_size, num_actions, bias=True)
         
@@ -229,7 +229,7 @@ def create_q_head(config) -> nn.Module:
     """Factory function to create Q-head based on config."""
     q_head_type = getattr(config, 'q_head_type', 'mlp')
     hidden_size = config.hidden_size
-    num_actions = 2  # halt or continue
+    num_actions = getattr(config, 'q_head_num_actions', 3)  
     
     if q_head_type == 'mlp':
         return MLPQHead(hidden_size, num_actions)

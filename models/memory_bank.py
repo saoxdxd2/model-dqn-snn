@@ -60,6 +60,28 @@ class AssociativeMemoryBank(nn.Module):
         Cache enabled automatically in eval mode (20-30% speedup on repeated patterns).
         
         Args:
+            query: [batch, hidden_size] or [batch, seq_len, hidden_size] - current reasoning state
+            use_gating: whether to apply learned gating
+        
+        Returns:
+            memory_output: [batch, hidden_size] or [batch, seq_len, hidden_size] - retrieved memory
+        """
+        # Handle multi-position queries
+        if query.ndim == 3:
+            # [batch, seq_len, hidden_size] -> query all positions
+            batch_size, seq_len, hidden_size = query.shape
+            query_flat = query.reshape(-1, hidden_size)  # [batch*seq_len, hidden_size]
+            memory_flat = self._read_single(query_flat, use_gating)  # [batch*seq_len, hidden_size]
+            return memory_flat.reshape(batch_size, seq_len, hidden_size)
+        else:
+            # [batch, hidden_size] -> single position query (backward compatible)
+            return self._read_single(query, use_gating)
+    
+    def _read_single(self, query: torch.Tensor, use_gating: bool = True) -> torch.Tensor:
+        """
+        Internal method for single-position query.
+        
+        Args:
             query: [batch, hidden_size] - current reasoning state
             use_gating: whether to apply learned gating
         
