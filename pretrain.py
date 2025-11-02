@@ -265,7 +265,13 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
         # Load unified multimodal capsule dataset
         import torch
         
-        capsule_path = config.semantic_dataset.replace('semantic_embeddings', 'capsule_dataset') if split == 'train' else config.semantic_eval_dataset.replace('semantic_embeddings', 'capsule_dataset')
+        # Construct capsule path - handle both explicit semantic_dataset and data_paths override
+        if hasattr(config, 'semantic_dataset') and config.semantic_dataset:
+            capsule_path = config.semantic_dataset.replace('semantic_embeddings', 'capsule_dataset') if split == 'train' else config.semantic_eval_dataset.replace('semantic_embeddings', 'capsule_dataset')
+        else:
+            # Fallback: construct from data_paths
+            base_path = config.data_paths[0] if split == 'train' else (config.data_paths_test[0] if config.data_paths_test else config.data_paths[0])
+            capsule_path = os.path.join(base_path, 'capsule_dataset.pt' if split == 'train' else 'capsule_dataset_test.pt')
         
         if not os.path.exists(capsule_path):
             raise FileNotFoundError(
