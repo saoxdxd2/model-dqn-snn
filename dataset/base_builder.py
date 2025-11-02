@@ -123,18 +123,19 @@ class BaseDatasetBuilder(ABC):
                 augmented = []
                 batch_size = 5000  # Process in batches to free memory
                 
-                for i in range(0, len(processed), batch_size):
+                from tqdm import tqdm
+                for i in tqdm(range(0, len(processed), batch_size), desc="   Augmenting", ncols=70):
                     batch = processed[i:i+batch_size]
                     for sample in batch:
                         augmented.extend(self.augment_sample(sample))
-                
-                # Free processed batch immediately
-                del batch
-                
-                # Periodic cleanup
-                if i % 10000 == 0 and i > 0:
-                    import gc
-                    gc.collect()
+                    
+                    # Free processed batch immediately
+                    del batch
+                    
+                    # Periodic cleanup
+                    if i % 10000 == 0 and i > 0:
+                        import gc
+                        gc.collect()
             
             del processed  # Free original
         else:
