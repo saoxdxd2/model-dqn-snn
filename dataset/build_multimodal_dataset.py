@@ -573,12 +573,18 @@ def build(config: MultimodalDatasetConfig):
     
     def encode_to_capsules(samples, batch_size=16):
         """Encode samples to capsule format."""
+        import time
+        from tqdm import tqdm
+        
         all_sketches = []
         all_checksums = []
         all_children = []
         
-        # Process in batches
-        for i in range(0, len(samples), batch_size):
+        num_batches = (len(samples) + batch_size - 1) // batch_size
+        start_time = time.time()
+        
+        # Process in batches with progress bar
+        for i in tqdm(range(0, len(samples), batch_size), total=num_batches, desc="   Encoding"):
             batch_samples = samples[i:i+batch_size]
             
             # Prepare batch - render text to images if needed
@@ -616,9 +622,14 @@ def build(config: MultimodalDatasetConfig):
                     all_children.append(result['children'].cpu())
         
         # Concatenate all batches
+        elapsed = time.time() - start_time
         sketches = torch.cat(all_sketches, dim=0) if all_sketches else torch.zeros(1, config.target_capsules, config.hidden_size)
         checksums = torch.cat(all_checksums, dim=0) if all_checksums else torch.zeros(1, config.target_capsules, 32)
         children = torch.cat(all_children, dim=0) if all_children else None
+        
+        # Print timing info
+        samples_per_sec = len(samples) / elapsed if elapsed > 0 else 0
+        print(f"   ⏱️  Encoded {len(samples)} samples in {elapsed:.1f}s ({samples_per_sec:.1f} samples/sec)")
         
         return {
             'sketches': sketches,
