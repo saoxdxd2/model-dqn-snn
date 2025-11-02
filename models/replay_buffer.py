@@ -57,6 +57,10 @@ class DQNReplayBuffer:
         
         # Selective storage (Schaul et al., 2015: store only high TD-error transitions)
         self.td_threshold = td_threshold
+        
+        # On-policy sampling bias
+        self.recent_fraction = recent_fraction  # Mix recent and old transitions
+        self.max_age = max_age  # Discard old transitions
         self.rejected_count = 0  # Track filtered transitions
         self.total_push_attempts = 0
         
@@ -172,7 +176,47 @@ class DQNReplayBuffer:
         if batch_size < 1:
             raise ValueError(f"Invalid batch_size: {batch_size}")
         
-        if self.prioritized:
+        # Recent fraction sampling: mix of recent and old transitions
+        if self.recent_fraction > 0:
+            recent_batch_size = int(batch_size * self.recent_fraction)
+            old_batch_size = batch_size - recent_batch_size
+            
+            # Define "recent" as last 1000 steps or 10% of buffer
+            recent_window = min(1000, self.size // 10)
+            recent_start = max(0, self.size - recent_window)
+            
+            # Sample from recent transitions
+            if recent_batch_size > 0 and recent_window > 0:
+                recent_indices = np.random.choice(
+                    np.arange(recent_start, self.size),
+                    size=min(recent_batch_size, recent_window),
+                    replace=False
+                )
+            else:
+                recent_indices = np.array([], dtype=np.int64)
+            
+            # Sample from old transitions
+            if old_batch_size > 0:
+                old_range = np.arange(0, recent_start) if recent_start > 0 else np.array([0])
+                if len(old_range) > 0:
+                    old_indices = np.random.choice(
+                        old_range,
+                        size=min(old_batch_size, len(old_range)),
+                        replace=False
+                    )
+                else:
+                    old_indices = np.array([], dtype=np.int64)
+            else:
+                old_indices = np.array([], dtype=np.int64)
+            
+            # Combine
+            indices = np.concatenate([recent_indices, old_indices])
+            np.random.shuffle(indices)  # Mix them up
+            
+            # Uniform weights for on-policy bias
+            weights = torch.ones(len(indices), device=device, dtype=torch.float32)
+            
+        elif self.prioritized:
             # Prioritized sampling
             priorities = self.priorities[:self.size] ** self.alpha
             probabilities = priorities / priorities.sum()

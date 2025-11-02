@@ -307,7 +307,7 @@ def select_continual_learning_mode():
             # Continue current phase
             remaining_epochs = selected_status.get('config_epochs', 0)
             dataset_path = selected_status.get('dataset', 'data/text-wikitext2')
-            model_key = dataset_to_model_key(dataset_path)
+            model_key = dataset_path_to_model_key(dataset_path)
             return selected_ckpt['path'], model_key, remaining_epochs
         elif choice == "2":
             print("\n⚠️  Proceeding to next phase with incomplete base...")
@@ -575,6 +575,10 @@ Auto-Resume:
     if args.dataset_only:
         print("\n✅ Dataset preparation complete. Exiting (--dataset-only).")
         sys.exit(0)
+    
+    # Initialize training parameters
+    checkpoint_path = None
+    epochs_override = None
     
     # Start training
     train_model(model_config, unknown_args, checkpoint_path=checkpoint_path, epochs_override=epochs_override)

@@ -85,6 +85,14 @@ enable_entropy_regularization: False
 
 # ===== Prioritized Replay (DISABLED) =====
 enable_prioritized_replay: False
+
+# ===== Per-Layer Gradient Norms (PHASE 1) =====
+encoder_max_grad_norm: 1.0
+h_level_max_grad_norm: 1.0
+l_level_max_grad_norm: 1.0
+q_head_max_grad_norm: 2.0  # Higher for RL signal
+memory_max_grad_norm: 1.0
+lm_head_max_grad_norm: 1.0
 per_alpha: 0.6
 per_beta: 0.4
 

@@ -7,13 +7,13 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 from functools import partial
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import random
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 from models.common import *
-from models.dqn_utils import compute_epsilon, select_action_epsilon_greedy, select_action_epsilon_greedy_3way
+from models.dqn_utils import compute_epsilon, compute_q_temperature, select_action_epsilon_greedy, select_action_epsilon_greedy_3way
 from models.q_heads import create_q_head
 from models.memory_bank import AssociativeMemoryBank
 
@@ -159,6 +159,34 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     enable_hierarchical_attention: bool = False  # Enable parent-child attention bias for capsules
     enable_capsule_expansion: bool = False  # Enable DQN-controlled capsule expansion
     q_head_num_actions: int = 3  # Number of Q-head actions: [HALT, CONTINUE, EXPAND]
+    
+    @field_validator('dqn_gamma')
+    @classmethod
+    def validate_gamma(cls, v):
+        if not 0 < v < 1:
+            raise ValueError(f"dqn_gamma must be in (0,1), got {v}")
+        return v
+    
+    @field_validator('dqn_epsilon_start', 'dqn_epsilon_end')
+    @classmethod
+    def validate_epsilon(cls, v):
+        if not 0 <= v <= 1:
+            raise ValueError(f"epsilon must be in [0,1], got {v}")
+        return v
+    
+    @field_validator('batch_size', 'global_batch_size')
+    @classmethod
+    def validate_batch_size(cls, v):
+        if not 1 <= v <= 8192:
+            raise ValueError(f"batch_size must be in [1,8192], got {v}")
+        return v
+    
+    @field_validator('halt_max_steps')
+    @classmethod
+    def validate_max_steps(cls, v):
+        if not 1 <= v <= 1000:
+            raise ValueError(f"halt_max_steps must be in [1,1000], got {v}")
+        return v
 
 
 class TinyRecursiveReasoningModel_ACTV1Block(nn.Module):
@@ -291,8 +319,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             self.output_vocab_size = num_concepts + 4  # concepts + control
         else:
             # Standard BPE token output
-            self.lm_head = CastedLinear(self.config.hidden_size, output_vocab_size, bias=False)
-            self.output_vocab_size = output_vocab_size
+            self.lm_head = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
+            self.output_vocab_size = self.config.vocab_size
         
         # Q-head: Configurable architecture (MLP/RNN/Mini-Attention)
         # Output: 3 actions [HALT, CONTINUE, EXPAND] instead of 2 [HALT, CONTINUE]
@@ -587,6 +615,12 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             with torch.no_grad():
                 # Compute q_action decision (argmax of Q-values)
                 q_stacked = torch.stack([q_continue_logits, q_halt_logits, q_expand_logits], dim=-1)  # [B, 3]
+                
+                # Apply temperature annealing if enabled
+                if self.training and getattr(self.config, 'enable_q_temperature_annealing', False):
+                    temperature = compute_q_temperature(getattr(self, 'training_step', 0), self.config)
+                    q_stacked = q_stacked / temperature
+                
                 q_actions_temp = torch.argmax(q_stacked, dim=-1)  # [B] - 0/1/2
                 
                 # Trigger expansion ONLY if action == 2 (EXPAND)
@@ -756,6 +790,12 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             if q_expand_logits is not None:
                 # 3-action Q-head: stack all Q-values and take argmax
                 q_stacked = torch.stack([q_continue_logits, q_halt_logits, q_expand_logits], dim=-1)  # [batch, 3]
+                
+                # Apply temperature annealing if enabled
+                if self.training and getattr(self.config, 'enable_q_temperature_annealing', False):
+                    temperature = compute_q_temperature(getattr(self, 'training_step', 0), self.config)
+                    q_stacked = q_stacked / temperature
+                
                 q_actions = torch.argmax(q_stacked, dim=-1)  # [batch] - 0/1/2
             else:
                 # 2-action Q-head (legacy): 0=continue, 1=halt

@@ -104,6 +104,82 @@ class PretrainConfig(pydantic.BaseModel):
     ema: bool = False # use Exponential-Moving-Average
     ema_rate: float = 0.999 # EMA-rate
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
+    
+    # DQN Stability Features
+    dqn_warmup_steps: int = 5000  # Steps before DQN affects representation
+    freeze_representation_during_warmup: bool = True  # Freeze h_blocks/l_blocks during warmup
+    
+    # Optimizer Stability
+    optimizer_type: str = "adamatan2"  # "adamatan2" or "adamw"
+    enable_optimizer_fallback: bool = True  # Auto-switch to AdamW on NaN
+    nan_threshold_for_fallback: int = 3  # Switch after N NaN occurrences
+    
+    # Expansion Penalty Annealing
+    expansion_penalty_schedule: str = "cosine"  # "cosine", "linear", or "fixed"
+    expansion_penalty_start: float = 0.1  # Initial penalty
+    expansion_penalty_end: float = 0.001  # Final penalty
+    expansion_anneal_steps: int = 50000  # Steps to anneal over
+    
+    # Replay Buffer Sampling
+    replay_recent_fraction: float = 0.25  # Fraction from recent transitions
+    replay_max_age: int = 100000  # Discard transitions older than this
+
+def per_layer_gradient_normalization(model: nn.Module, config) -> dict:
+    """
+    Apply per-layer gradient normalization instead of global clipping.
+    
+    Benefits:
+    - Prevents strong gradients in one module from being clipped
+    - Allows different learning dynamics per component
+    - More stable training for hierarchical models like TRM
+    
+    Args:
+        model: TRM model
+        config: Training config
+    
+    Returns:
+        Dictionary of gradient norms per component
+    """
+    grad_norms = {}
+    
+    # Define module groups and their keywords
+    module_groups = {
+        'encoder': ['embed', 'input_proj', 'puzzle_emb'],
+        'H_level': ['H_level', 'H_init', 'h_blocks'],
+        'L_level': ['L_level', 'L_init', 'l_blocks'],
+        'q_head': ['q_head'],
+        'memory': ['memory'],
+        'lm_head': ['lm_head', 'output']
+    }
+    
+    # Get max norms per group (from config with defaults)
+    max_norms = {
+        'encoder': getattr(config.arch, 'encoder_max_grad_norm', 1.0),
+        'H_level': getattr(config.arch, 'h_level_max_grad_norm', 1.0),
+        'L_level': getattr(config.arch, 'l_level_max_grad_norm', 1.0),
+        'q_head': getattr(config.arch, 'q_head_max_grad_norm', 2.0),  # Allow larger for RL
+        'memory': getattr(config.arch, 'memory_max_grad_norm', 1.0),
+        'lm_head': getattr(config.arch, 'lm_head_max_grad_norm', 1.0),
+    }
+    
+    # Clip per group
+    for group_name, keywords in module_groups.items():
+        # Collect parameters for this group
+        group_params = []
+        for name, param in model.named_parameters():
+            if param.grad is not None and any(kw in name for kw in keywords):
+                group_params.append(param)
+        
+        if group_params:
+            # Clip this group
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                group_params,
+                max_norm=max_norms[group_name]
+            )
+            grad_norms[f'grad_{group_name}_norm'] = grad_norm.item()
+    
+    return grad_norms
+
 
 @dataclass
 class TrainState:
@@ -115,6 +191,8 @@ class TrainState:
     step: int
     total_steps: int
     last_checkpoint_step: int = 0  # Track last saved checkpoint
+    representation_frozen: bool = False  # Track if representation layers are frozen
+    nan_count: int = 0  # Track NaN occurrences for optimizer fallback
 
 
 def detect_dataset_features(data_path: str) -> dict:
@@ -389,17 +467,41 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
 
+    # Helper function to create optimizer with fallback
+    def create_optimizer_with_fallback(params, config, optimizer_type="main"):
+        """Create optimizer with automatic fallback to AdamW if AdamAtan2 fails."""
+        lr = 1e-8  # Will be set by scheduler
+        wd = config.weight_decay
+        betas = (config.beta1, config.beta2)
+        
+        if config.optimizer_type.lower() == "adamw":
+            # Direct AdamW request
+            optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=wd, betas=betas)
+            if rank == 0:
+                print(f"  Using AdamW optimizer for {optimizer_type}")
+        else:
+            # Try AdamAtan2 first
+            try:
+                optimizer = AdamAtan2(params, lr=lr, weight_decay=wd, betas=betas)
+                if rank == 0:
+                    print(f"  Using AdamAtan2 optimizer for {optimizer_type}")
+            except Exception as e:
+                if config.enable_optimizer_fallback:
+                    if rank == 0:
+                        print(f"  ⚠️  AdamAtan2 failed: {e}")
+                        print(f"  Falling back to AdamW optimizer for {optimizer_type}")
+                    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=wd, betas=betas)
+                else:
+                    raise e
+        
+        return optimizer
+    
     # Optimizers and lr
     # Handle puzzle_emb_ndim=0 case: no puzzle embeddings, only main optimizer
     if config.arch.puzzle_emb_ndim == 0 or not hasattr(model.model, 'puzzle_emb'):
         # Text/Code/Vision models without puzzle-specific embeddings
         optimizers = [
-            AdamAtan2(
-                model.parameters(),
-                lr=1e-8,  # Small positive value, will be set by scheduler
-                weight_decay=config.weight_decay,
-                betas=(config.beta1, config.beta2)
-            )
+            create_optimizer_with_fallback(model.parameters(), config, "main")
         ]
         optimizer_lrs = [
             config.lr
@@ -430,12 +532,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 weight_decay=config.puzzle_emb_weight_decay,
                 world_size=world_size
             ),
-            AdamAtan2(
-                model.parameters(),
-                lr=1e-8,  # Small positive value, will be set by scheduler
-                weight_decay=config.weight_decay,
-                betas=(config.beta1, config.beta2)
-            )
+            create_optimizer_with_fallback(model.parameters(), config, "main")
         ]
         optimizer_lrs = [
             config.puzzle_emb_lr,
@@ -562,51 +659,82 @@ def save_checkpoint_atomic(checkpoint: dict, filepath: str):
     
     Uses atomic write (temp file + rename) to prevent corruption during save.
     Generates SHA256 checksum for compression safety.
+    Creates backup of previous checkpoint for rollback.
     """
-    # Write to temporary file first (atomic operation)
-    temp_filepath = filepath + ".tmp"
+    # Define all temp file paths upfront to avoid scope issues
+    temp_checkpoint = filepath + ".tmp"
+    backup_file = filepath + ".backup"
+    checksum_file = filepath + ".sha256"
+    checksum_temp = checksum_file + ".tmp"
     
     try:
-        # Save checkpoint to temp file
-        torch.save(checkpoint, temp_filepath)
+        # Backup existing checkpoint before overwriting
+        if os.path.exists(filepath):
+            try:
+                shutil.copy2(filepath, backup_file)
+            except Exception as e:
+                print(f"⚠️  Failed to create backup: {e}")
+        
+        # Save checkpoint file atomically
+        try:
+            torch.save(checkpoint, temp_checkpoint)
+            
+            # Verify integrity before committing
+            try:
+                test_load = torch.load(temp_checkpoint, map_location='cpu')
+                del test_load  # Free memory
+            except Exception as e:
+                print(f"❌ Checkpoint verification failed: {e}")
+                if os.path.exists(backup_file):
+                    print("   Restoring from backup...")
+                    shutil.copy2(backup_file, filepath)
+                raise e
+            
+            # Move atomically (crash-safe)
+            shutil.move(temp_checkpoint, filepath)
+            
+        except Exception as e:
+            # Clean up failed temp file
+            if os.path.exists(temp_checkpoint):
+                os.remove(temp_checkpoint)
+            raise e
         
         # Compute checksum
-        checksum = compute_file_checksum(temp_filepath)
+        checksum = compute_file_checksum(filepath)
         
         # Save checksum metadata
-        checksum_file = filepath + ".sha256"
         metadata = {
             "checksum": checksum,
             "step": checkpoint.get('step', 0),
-            "size_bytes": os.path.getsize(temp_filepath),
-            "timestamp": os.path.getmtime(temp_filepath)
+            "size_bytes": os.path.getsize(filepath),
+            "timestamp": os.path.getmtime(filepath)
         }
-        with open(checksum_file + ".tmp", 'w') as f:
+        with open(checksum_temp, 'w') as f:
             json.dump(metadata, f, indent=2)
         
         # Atomic rename (this is the actual "commit" point)
         # If interrupted here, temp files exist but original is intact
-        os.replace(temp_filepath, filepath)
-        os.replace(checksum_file + ".tmp", checksum_file)
+        os.replace(checksum_temp, checksum_file)
         
         return checksum
         
     except Exception as e:
-        # Clean up temp files on error
-        if os.path.exists(temp_filepath):
-            os.remove(temp_filepath)
-        if os.path.exists(checksum_file + ".tmp"):
-            os.remove(checksum_file + ".tmp")
+        # Clean up temp files on error (now all variables are in scope)
+        if os.path.exists(temp_checkpoint):
+            os.remove(temp_checkpoint)
+        if os.path.exists(checksum_temp):
+            os.remove(checksum_temp)
         raise e
 
 
 def save_train_state(config: PretrainConfig, train_state: TrainState):
-    """Save complete training state with corruption protection.
+    """Save complete training state with corruption protection and backup.
     
     Features:
     - Atomic writes (temp file + rename)
     - SHA256 checksum verification
     - Safe for compression/transfer
+    - Creates backup of previous checkpoint for rollback.
     """
     if config.checkpoint_path is None:
         return
@@ -636,6 +764,7 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
     # Get dataset-specific checkpoint name (e.g., text.pt, arc.pt, vision.pt)
     checkpoint_name = get_checkpoint_name(config.data_paths[0] if config.data_paths else 'model')
     checkpoint_file = os.path.join(config.checkpoint_path, checkpoint_name)
+    backup_file = checkpoint_file + ".backup"
     
     # Save single checkpoint file with atomic write + checksum
     checksum = save_checkpoint_atomic(checkpoint, checkpoint_file)
@@ -768,6 +897,36 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
         return
+    
+    # DQN Warmup: Freeze representation layers during early training
+    if hasattr(config, 'dqn_warmup_steps') and config.freeze_representation_during_warmup:
+        if train_state.step < config.dqn_warmup_steps and not train_state.representation_frozen:
+            # Freeze representation layers (h_blocks, l_blocks)
+            if rank == 0:
+                print(f"\n{'='*70}")
+                print(f"  🔒 DQN WARMUP: Freezing representation layers")
+                print(f"  Steps 0-{config.dqn_warmup_steps}: Supervised learning only")
+                print(f"  Step {config.dqn_warmup_steps}+: Full DQN training")
+                print(f"{'='*70}\n")
+            
+            for name, param in train_state.model.named_parameters():
+                if 'h_blocks' in name or 'l_blocks' in name or 'h_level' in name or 'l_level' in name:
+                    param.requires_grad = False
+            
+            train_state.representation_frozen = True
+        
+        elif train_state.step == config.dqn_warmup_steps and train_state.representation_frozen:
+            # Unfreeze after warmup
+            if rank == 0:
+                print(f"\n{'='*70}")
+                print(f"  🔓 DQN WARMUP COMPLETE: Unfreezing representation layers")
+                print(f"  Full model training enabled")
+                print(f"{'='*70}\n")
+            
+            for param in train_state.model.parameters():
+                param.requires_grad = True
+            
+            train_state.representation_frozen = False
 
     # Handle HESC capsules (tuple) vs dict batches
     if isinstance(batch, tuple):
@@ -830,6 +989,47 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     # Forward
     train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    
+    # NaN Detection and Optimizer Fallback
+    if torch.isnan(loss) or torch.isinf(loss):
+        train_state.nan_count += 1
+        
+        if rank == 0:
+            print(f"\n{'='*70}")
+            print(f"  ⚠️  NaN/Inf DETECTED in loss at step {train_state.step}")
+            print(f"  NaN count: {train_state.nan_count}/{config.nan_threshold_for_fallback}")
+            print(f"  Loss value: {loss.item()}")
+        
+        if config.enable_optimizer_fallback and train_state.nan_count >= config.nan_threshold_for_fallback:
+            if rank == 0:
+                print(f"  🔄 Switching to AdamW optimizer (fallback)")
+                print(f"{'='*70}\n")
+            
+            # Recreate optimizers with AdamW
+            old_config_type = config.optimizer_type
+            config.optimizer_type = "adamw"
+            
+            # Preserve optimizer state if possible
+            for i, opt in enumerate(train_state.optimizers):
+                if isinstance(opt, torch.optim.AdamW):
+                    continue  # Already AdamW
+                
+                # Create new AdamW optimizer
+                new_opt = torch.optim.AdamW(
+                    opt.param_groups[0]['params'],
+                    lr=train_state.optimizer_lrs[i],
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2)
+                )
+                train_state.optimizers[i] = new_opt
+            
+            train_state.nan_count = 0  # Reset counter
+        
+        # Skip this batch
+        if rank == 0:
+            print(f"  ⏭️  Skipping batch due to NaN/Inf")
+            print(f"{'='*70}\n")
+        return
 
     ((1 / global_batch_size) * loss).backward()
 
@@ -844,8 +1044,14 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     if gradient_monitor is not None and rank == 0:
         grad_stats = gradient_monitor.update()
     
-    # Gradient clipping for stability
-    grad_norm = torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), max_norm=1.0)
+    # Gradient normalization: per-layer or global
+    if getattr(config, 'enable_per_layer_grad_norm', False):
+        # Per-layer gradient normalization (more fine-grained control)
+        grad_norms_dict = per_layer_gradient_normalization(train_state.model, config)
+        grad_norm = sum(grad_norms_dict.values()) / len(grad_norms_dict) if grad_norms_dict else 0.0
+    else:
+        # Global gradient clipping (default)
+        grad_norm = torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), max_norm=1.0)
             
     # Apply optimizer
     lr_this_step = None    
@@ -877,7 +1083,17 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
 
             reduced_metrics["train/lr"] = lr_this_step
-            reduced_metrics["train/grad_norm"] = grad_norm.item()
+            
+            # Log gradient norms
+            if getattr(config, 'enable_per_layer_grad_norm', False) and isinstance(grad_norm, dict):
+                # Log per-component norms
+                for key, value in grad_norms_dict.items():
+                    reduced_metrics[f"train/{key}"] = value
+                # Average for compatibility
+                reduced_metrics["train/grad_norm"] = grad_norm
+            else:
+                # Global norm
+                reduced_metrics["train/grad_norm"] = grad_norm if isinstance(grad_norm, float) else grad_norm.item()
             
             # Add gradient flow statistics if available
             if grad_stats is not None:
@@ -1028,7 +1244,7 @@ def evaluate(
                     (len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda"
                 )
 
-            metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
+            metric_values[set_id] += torch.stack([torch.as_tensor(metrics[k], device='cuda') if not isinstance(metrics[k], torch.Tensor) else metrics[k] for k in metric_keys])
 
             del metrics
 
@@ -1167,6 +1383,17 @@ def launch(hydra_config: DictConfig):
 
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
+    
+    # Validate critical config parameters
+    if RANK == 0:
+        assert 0 < config.epochs <= 1_000_000, f"Invalid epochs: {config.epochs}"
+        assert 1 <= config.global_batch_size <= 8192, f"Invalid batch_size: {config.global_batch_size}"
+        assert 0 < config.lr <= 1.0, f"Invalid learning rate: {config.lr}"
+        assert config.lr_min_ratio >= 0, f"Invalid lr_min_ratio: {config.lr_min_ratio}"
+        
+        if config.eval_interval is not None:
+            assert config.epochs % config.eval_interval == 0, \
+                f"eval_interval ({config.eval_interval}) must divide epochs ({config.epochs})"
 
     # Register signal handler for graceful shutdown (only on rank 0 to avoid duplicate messages)
     if RANK == 0:
@@ -1206,14 +1433,18 @@ def launch(hydra_config: DictConfig):
     train_loader, train_metadata = load_datasets(config, rank=RANK, world_size=WORLD_SIZE, split="train")
     try:
         eval_loader,  eval_metadata  = load_datasets(config, rank=RANK, world_size=WORLD_SIZE, split="test")
-    except:
-        print("NO EVAL DATA FOUND")
+    except Exception as e:
+        if RANK == 0:
+            print(f"⚠️  No eval data found: {e}")
+            print("   Training will continue without evaluation")
         eval_loader = eval_metadata = None
 
     try:
         evaluators = create_evaluators(config, eval_metadata)
-    except:
-        print("No evaluator found")
+    except Exception as e:
+        if RANK == 0:
+            print(f"⚠️  Failed to create evaluators: {e}")
+            print("   Training will continue without custom evaluators")
         evaluators = []
 
     # Train state
@@ -1282,6 +1513,11 @@ def launch(hydra_config: DictConfig):
             train_state.model.train()
             for set_name, batch, global_batch_size in train_loader:
                 metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, gradient_monitor=gradient_monitor)
+                
+                # Periodic memory cleanup to prevent leaks
+                if RANK == 0 and train_state.step % 1000 == 0 and gradient_monitor is not None:
+                    gradient_monitor.clear_old_data(keep_last_n=100)
+                    torch.cuda.empty_cache()
 
                 if RANK == 0 and metrics is not None:
                     wandb.log(metrics, step=train_state.step)

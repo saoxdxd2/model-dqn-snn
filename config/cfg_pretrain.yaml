@@ -55,3 +55,35 @@ hcycle_confidence_threshold: 2.0
 enable_hierarchical_attention: true
 q_head_num_actions: 3
 q_head_type: "mlp"
+
+# DQN Stability Features
+dqn_warmup_steps: 5000  # Freeze representation layers for first 5K steps
+freeze_representation_during_warmup: true  # Prevent DQN from destabilizing early learning
+
+# Optimizer Stability
+optimizer_type: "adamatan2"  # "adamatan2" or "adamw"
+enable_optimizer_fallback: true  # Auto-switch to AdamW on NaN
+nan_threshold_for_fallback: 3  # Switch after 3 NaN occurrences
+
+# Expansion Penalty Annealing (prevents over-expansion early, allows it later)
+expansion_penalty_schedule: "cosine"  # "cosine", "linear", "exponential", or "fixed"
+expansion_penalty_start: 0.1  # High penalty initially (discourage expansion)
+expansion_penalty_end: 0.001  # Low penalty after learning (allow expansion)
+expansion_anneal_steps: 50000  # Anneal over 50K steps
+
+# Replay Buffer Sampling (on-policy bias)
+replay_recent_fraction: 0.25  # 25% from recent transitions (last 1000 steps)
+replay_max_age: 100000  # Discard transitions older than 100K steps
+
+# === PHASE 1 ADVANCED FEATURES ===
+
+# Q-Head Temperature Annealing (Exploration → Exploitation)
+enable_q_temperature_annealing: true
+q_temperature_start: 1.0  # High temp = more exploration
+q_temperature_end: 0.1    # Low temp = more exploitation  
+q_temperature_anneal_steps: 100000
+q_temperature_schedule: "exponential"  # "linear", "exponential", or "cosine"
+
+# Per-Layer Gradient Normalization
+enable_per_layer_grad_norm: true
+# Per-module max gradient norms (defined in arch config)

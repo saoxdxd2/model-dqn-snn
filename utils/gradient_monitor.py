@@ -32,10 +32,11 @@ class GradientFlowMonitor:
         self.track_every_n_steps = track_every_n_steps
         self.step_counter = 0
         
-        # Statistics storage
+        # Statistics storage (with memory management)
         self.gradient_norms = []
         self.dead_neuron_ratios = []
         self.layer_stats = {}
+        self.max_history_size = 1000  # Limit history to prevent memory leaks
         
     def reset(self):
         """Reset all statistics."""
@@ -43,6 +44,13 @@ class GradientFlowMonitor:
         self.dead_neuron_ratios.clear()
         self.layer_stats.clear()
         self.step_counter = 0
+    
+    def clear_old_data(self, keep_last_n: int = 100):
+        """Clear old gradient history, keeping only recent data."""
+        if len(self.gradient_norms) > keep_last_n:
+            self.gradient_norms = self.gradient_norms[-keep_last_n:]
+            self.dead_neuron_ratios = self.dead_neuron_ratios[-keep_last_n:]
+        self.layer_stats.clear()  # Layer stats not needed after aggregation
     
     def should_track(self) -> bool:
         """Check if current step should be tracked."""
@@ -114,9 +122,14 @@ class GradientFlowMonitor:
             'dead_neuron_ratio_max': np.max(all_dead_ratios),
         }
         
-        # Store for history
+        # Store for history (with automatic cleanup)
         self.gradient_norms.append(all_grad_norms)
         self.dead_neuron_ratios.append(all_dead_ratios)
+        
+        # Prevent memory leak: keep only recent history
+        if len(self.gradient_norms) > self.max_history_size:
+            self.gradient_norms = self.gradient_norms[-self.max_history_size:]
+            self.dead_neuron_ratios = self.dead_neuron_ratios[-self.max_history_size:]
         
         # Component-specific tracking (H-level, L-level, Q-head, Memory)
         component_stats = self._aggregate_by_component(layer_stats)

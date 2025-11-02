@@ -15,6 +15,40 @@ from models.intrinsic_reward import IntrinsicRewardModule
 IGNORE_LABEL_ID = -100
 
 
+def compute_annealed_penalty(step: int, config) -> float:
+    """Compute expansion penalty with annealing schedule.
+    
+    Args:
+        step: Current training step
+        config: Model config with annealing parameters
+    
+    Returns:
+        Current penalty value (annealed from start to end)
+    """
+    schedule = getattr(config, 'expansion_penalty_schedule', 'fixed')
+    
+    if schedule == 'fixed':
+        return getattr(config, 'expansion_penalty_start', 0.01)
+    
+    start = getattr(config, 'expansion_penalty_start', 0.1)
+    end = getattr(config, 'expansion_penalty_end', 0.001)
+    anneal_steps = getattr(config, 'expansion_anneal_steps', 50000)
+    
+    if step >= anneal_steps:
+        return end
+    
+    progress = step / anneal_steps
+    
+    if schedule == 'linear':
+        return start + (end - start) * progress
+    elif schedule == 'cosine':
+        return end + 0.5 * (start - end) * (1 + math.cos(math.pi * progress))
+    elif schedule == 'exponential':
+        return start * (end / start) ** progress
+    else:
+        return start
+
+
 def s(x, epsilon=1e-30):
     return torch.where(
         x<0,
@@ -217,7 +251,12 @@ class ACTLossHead(nn.Module):
                 q_probs = torch.softmax(torch.stack([outputs["q_continue_logits"], outputs["q_halt_logits"]], dim=-1), dim=-1)
             entropy = -(q_probs * torch.log(q_probs + 1e-8)).sum(-1)  # [batch]
             entropy_bonus = -self.model.config.entropy_regularization_weight * entropy.sum()  # Negative because we want to maximize entropy
-            metrics["q_entropy"] = entropy.mean().detach()
+            
+            # Entropy monitoring: track mean, std, min, max for interpretability
+            metrics["q_entropy_mean"] = entropy.mean().detach()
+            metrics["q_entropy_std"] = entropy.std().detach()
+            metrics["q_entropy_min"] = entropy.min().detach()
+            metrics["q_entropy_max"] = entropy.max().detach()
         
         # HESC reconstruction loss (capsule-aware)
         reconstruction_loss = 0
@@ -257,17 +296,23 @@ class ACTLossHead(nn.Module):
                     checksum_loss = -checksums.norm(dim=-1).mean() * 0.01
                     reconstruction_loss += checksum_loss
                     
-            except Exception:
+            except Exception as e:
+                # Log warning but continue training
+                if rank == 0 and hasattr(metrics, '__setitem__'):
+                    metrics['reconstruction_error'] = 1.0
                 reconstruction_loss = 0
         
                 
         # Expansion cost tracking (HESC + NEW TRM implementation)
+        # Use annealed penalty instead of fixed 0.01
+        expansion_penalty = compute_annealed_penalty(self.dqn_step_counter if self.enable_dqn else 0, self.model.config)
+        
         expansion_cost = 0
         # Legacy source: from carry state
         if 'num_expansions' in new_carry.current_data:
             num_expansions = new_carry.current_data['num_expansions']
             children_per_capsule = getattr(self.model.config, 'children_per_capsule', 4)
-            expansion_cost = 0.01 * num_expansions.float().mean() * children_per_capsule
+            expansion_cost = expansion_penalty * num_expansions.float().mean() * children_per_capsule
         # NEW source: from model output dict (our implementation)
         if isinstance(model_expansion_cost, torch.Tensor) and model_expansion_cost.sum() > 0:
             expansion_cost = expansion_cost + model_expansion_cost.mean() if isinstance(expansion_cost, torch.Tensor) else model_expansion_cost.mean()
@@ -297,8 +342,9 @@ class ACTLossHead(nn.Module):
                     metrics["cos_sim_mean"] = per_capsule_cos.mean().detach()
                     metrics["cos_sim_min"] = per_capsule_cos.min().detach()
                     metrics["cos_sim_std"] = per_capsule_cos.std().detach()
-            except Exception:
-                pass
+            except Exception as e:
+                # Capsule metrics failed - not critical for training
+                metrics["cos_sim_error"] = 1.0
         
         metrics.update({
             "lm_loss": lm_loss.detach(),
@@ -488,6 +534,12 @@ class ACTLossHead(nn.Module):
             metrics["dqn_loss_weight_adaptive"] = self.dqn_loss_weight
             metrics["dqn_running_accuracy"] = self.running_accuracy
             
+            # Track Q-head temperature if annealing is enabled
+            if getattr(self.model.config, 'enable_q_temperature_annealing', False):
+                from models.dqn_utils import compute_q_temperature
+                q_temp = compute_q_temperature(self.dqn_step_counter, self.model.config)
+                metrics["q_temperature"] = q_temp
+            
             # Memory bank metrics (if enabled)
             if self.model.config.enable_memory and self.model.inner.memory is not None:
                 memory_stats = self.model.inner.memory.get_memory_stats()
@@ -521,9 +573,10 @@ class ACTLossHead(nn.Module):
         if isinstance(reconstruction_loss, torch.Tensor) and reconstruction_loss != 0:
             total_loss = total_loss + 0.5 * reconstruction_loss
         
-        # Add expansion penalty (weight: 0.01 - reduced to avoid discouraging expansion)
+        # Add expansion penalty (annealed weight)
         if isinstance(expansion_cost, torch.Tensor) and expansion_cost != 0:
-            total_loss = total_loss + 0.01 * expansion_cost
+            # expansion_cost already has penalty applied, just add it
+            total_loss = total_loss + expansion_cost
         
         # Add VQ codebook loss (weight: 0.25)
         if isinstance(vq_loss, torch.Tensor) and vq_loss != 0:
