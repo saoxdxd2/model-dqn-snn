@@ -345,11 +345,29 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
                     # batch_data is tuple of (sketches,) or (sketches, checksums) or (sketches, checksums, children)
                     # Format as dict - use 'inputs' key for compatibility with model
                     if len(batch_data) == 3:
-                        batch = {'inputs': batch_data[0], 'checksums': batch_data[1], 'children': batch_data[2]}
+                        sketches = batch_data[0]
+                        batch = {
+                            'inputs': sketches,
+                            'checksums': batch_data[1],
+                            'children': batch_data[2],
+                            'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long)  # Dummy IDs for capsule mode
+                        }
                     elif len(batch_data) == 2:
-                        batch = {'inputs': batch_data[0], 'checksums': batch_data[1], 'children': None}
+                        sketches = batch_data[0]
+                        batch = {
+                            'inputs': sketches,
+                            'checksums': batch_data[1],
+                            'children': None,
+                            'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long)
+                        }
                     else:
-                        batch = {'inputs': batch_data[0], 'checksums': None, 'children': None}
+                        sketches = batch_data[0]
+                        batch = {
+                            'inputs': sketches,
+                            'checksums': None,
+                            'children': None,
+                            'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long)
+                        }
                     
                     # Yield in expected format: (set_name, batch, global_batch_size)
                     yield 'capsule', batch, self.global_batch_size
