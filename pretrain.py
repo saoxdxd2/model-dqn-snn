@@ -343,13 +343,13 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             def __iter__(self):
                 for batch_data in self.raw_loader:
                     # batch_data is tuple of (sketches,) or (sketches, checksums) or (sketches, checksums, children)
-                    # Format as dict for consistency
+                    # Format as dict - use 'inputs' key for compatibility with model
                     if len(batch_data) == 3:
-                        batch = {'sketches': batch_data[0], 'checksums': batch_data[1], 'children': batch_data[2]}
+                        batch = {'inputs': batch_data[0], 'checksums': batch_data[1], 'children': batch_data[2]}
                     elif len(batch_data) == 2:
-                        batch = {'sketches': batch_data[0], 'checksums': batch_data[1], 'children': None}
+                        batch = {'inputs': batch_data[0], 'checksums': batch_data[1], 'children': None}
                     else:
-                        batch = {'sketches': batch_data[0], 'checksums': None, 'children': None}
+                        batch = {'inputs': batch_data[0], 'checksums': None, 'children': None}
                     
                     # Yield in expected format: (set_name, batch, global_batch_size)
                     yield 'capsule', batch, self.global_batch_size
