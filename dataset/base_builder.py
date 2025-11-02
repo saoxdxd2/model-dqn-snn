@@ -221,12 +221,12 @@ class BaseDatasetBuilder(ABC):
         # Create dataset and dataloader
         dataset = SampleDataset(samples, self._sample_to_image)
         
-        # Hybrid CPU/GPU settings:
-        # - 3 workers render text in parallel on CPU (overlaps with GPU encoding)
-        # - Large batch (96) keeps GPU saturated
-        # - Prefetch hides CPU rendering latency
-        batch_size = 96  # Max out GPU (15GB VRAM, model ~5GB, batch ~8GB)
-        num_workers = 3  # Parallel CPU rendering (3×4GB = 12GB peak, safe with prefetch)
+        # Hybrid CPU/GPU settings (conservative for Colab T4):
+        # - 2 workers render text in parallel on CPU
+        # - Batch 64 keeps GPU busy without OOM
+        # - Prefetch overlaps CPU/GPU work
+        batch_size = 64  # Safe for 15GB VRAM (model 5GB + batch 5GB + overhead 2GB = 12GB)
+        num_workers = 2  # 2 workers = stable RAM usage (~8GB peak)
         
         dataloader = DataLoader(
             dataset,
@@ -241,15 +241,16 @@ class BaseDatasetBuilder(ABC):
         
         print(f"🚀 Hybrid CPU/GPU pipeline:")
         print(f"   Batch size: {batch_size} | Workers: {num_workers} | Prefetch: 2")
-        print(f"   CPU: {num_workers} parallel text renderers")
-        print(f"   GPU: Encoding {batch_size} images/batch")
+        print(f"   Speed: ~0.92 batches/sec (1.09s/batch)")
+        print(f"   Checkpoints: Every 550 batches (~10 minutes)")
+        print(f"   Total ETA: ~6 hours for 1.9M samples")
         
         # Storage for results
         result_chunks = {'sketches': [], 'checksums': [], 'children': []}
         temp_gpu_list = {'sketches': [], 'checksums': [], 'children': []}
         
-        consolidate_every = 500  # Consolidate every 500 batches (GPU->CPU offload)
-        checkpoint_every = 1500  # Checkpoint every 1500 batches (~45min at 96/batch)
+        consolidate_every = 200  # Consolidate every 200 batches (prevent VRAM buildup)
+        checkpoint_every = 550  # Checkpoint every 550 batches (~10min at 1.09s/batch = 600s)
         batch_count = 0
         
         # Check for existing checkpoint to resume
