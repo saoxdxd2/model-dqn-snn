@@ -244,11 +244,29 @@ class BaseDatasetBuilder(ABC):
         device = next(self.encoder.parameters()).device
         
         consolidate_every = 800  # Consolidate every 800 batches (reduced overhead)
+        checkpoint_every = 2000  # Save checkpoint every 2000 batches (~100k samples)
         batch_count = 0
+        
+        # Check for existing checkpoint to resume
+        checkpoint_path = self.config.output_dir / "encoding_checkpoint.pt"
+        start_batch = 0
+        if checkpoint_path.exists():
+            print(f"📂 Found checkpoint, attempting resume...")
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location='cpu')
+                result_chunks = checkpoint['result_chunks']
+                start_batch = checkpoint['batch_count']
+                print(f"✅ Resumed from batch {start_batch}/{len(dataloader)}")
+            except Exception as e:
+                print(f"⚠️  Checkpoint load failed: {e}, starting fresh")
         
         # Process with DataLoader (automatic batching + parallel preprocessing)
         with torch.no_grad():
-            for batch_images in tqdm(dataloader, desc="Encoding"):
+            for batch_idx, batch_images in enumerate(tqdm(dataloader, desc="Encoding", initial=start_batch)):
+                # Skip already processed batches
+                if batch_idx < start_batch:
+                    continue
+                
                 # Move batch to GPU device
                 batch_images = batch_images.to(device)
                 
@@ -264,23 +282,49 @@ class BaseDatasetBuilder(ABC):
                 batch_count += 1
                 
                 # Periodic consolidation to prevent VRAM overflow
-                # 800 batches × 48 samples × 12 capsules × 768 × 4 bytes = ~1.77 GB
-                if batch_count % consolidate_every == 0:
+                if batch_count >= consolidate_every:
+                    # Consolidate GPU tensors
                     for key in temp_gpu_list:
                         if temp_gpu_list[key]:
-                            # Concatenate on GPU, convert to fp16, move to CPU
-                            chunk = torch.cat(temp_gpu_list[key], dim=0).half().cpu()
-                            result_chunks[key].append(chunk)
-                            temp_gpu_list[key] = []  # Clear GPU memory
+                            consolidated = torch.cat(temp_gpu_list[key], dim=0)
+                            # Convert to fp16 immediately (2x memory reduction)
+                            result_chunks[key].append(consolidated.half().cpu())
+                            temp_gpu_list[key].clear()
                     
-                    if torch.cuda.is_available():
+                    batch_count = 0
+                    torch.cuda.empty_cache()
+                    
+                    # Save checkpoint periodically (every 2000 batches)
+                    if batch_idx > 0 and batch_idx % checkpoint_every == 0:
+                        print(f"\n💾 Saving checkpoint at batch {batch_idx}...")
+                        torch.save({
+                            'result_chunks': result_chunks,
+                            'batch_count': batch_idx,
+                            'total_batches': len(dataloader)
+                        }, checkpoint_path)
+                        print(f"✅ Checkpoint saved to {checkpoint_path}")
+                        
+                        # Auto-sync to Google Drive if in Colab
+                        try:
+                            import sys
+                            if 'google.colab' in sys.modules:
+                                from pathlib import Path
+                                drive_dir = Path("/content/drive/MyDrive/model-dqn-snn")
+                                if drive_dir.exists():
+                                    import shutil
+                                    shutil.copy2(checkpoint_path, drive_dir / checkpoint_path.name)
+                                    print(f"☁️  Synced to Google Drive")
+                        except:
+                            pass
+                        
                         torch.cuda.empty_cache()
         
         # Final consolidation of remaining batches
         for key in temp_gpu_list:
             if temp_gpu_list[key]:
-                chunk = torch.cat(temp_gpu_list[key], dim=0).half().cpu()
-                result_chunks[key].append(chunk)
+                consolidated = torch.cat(temp_gpu_list[key], dim=0)
+                # Convert to fp16 immediately (2x memory reduction)
+                result_chunks[key].append(consolidated.half().cpu())
         
         del temp_gpu_list
         if torch.cuda.is_available():

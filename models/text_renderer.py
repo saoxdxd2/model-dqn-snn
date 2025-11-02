@@ -48,7 +48,7 @@ def ensure_dejavu_font_installed():
         # Copy to system fonts
         subprocess.run([
             "bash", "-c",
-            "find /tmp/dejavu_fonts -name 'DejaVuSansMono.ttf' -exec cp {} /usr/local/share/fonts/truetype/dejavu/ \;"
+            r"find /tmp/dejavu_fonts -name 'DejaVuSansMono.ttf' -exec cp {} /usr/local/share/fonts/truetype/dejavu/ \;"
         ], check=True, stderr=subprocess.DEVNULL)
         
         # Refresh font cache
