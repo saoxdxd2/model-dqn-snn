@@ -352,7 +352,7 @@ class BaseDatasetBuilder(ABC):
         return result
     
     def _sample_to_image(self, sample: DataSample):
-        """Convert any sample type to image for vision-unified encoder."""
+        """Convert any sample type to numpy array image for vision-unified encoder."""
         # Import TextRenderer lazily
         if not hasattr(self, 'text_renderer'):
             from models.text_renderer import TextRenderer
@@ -361,26 +361,27 @@ class BaseDatasetBuilder(ABC):
                 height=getattr(self.config, 'text_image_height', 224)
             )
         
-        # Text → render to image
+        # Text → render to image → convert to numpy
         if sample.text:
-            return self.text_renderer.render_plain_text(sample.text)
+            pil_img = self.text_renderer.render_plain_text(sample.text)
+            return np.array(pil_img)
         
-        # Grid → render to image (convert to text first)
+        # Grid → render to image → convert to numpy
         elif sample.grid is not None:
             grid_text = self._grid_to_text(sample.grid)
-            return self.text_renderer.render_plain_text(grid_text)
+            pil_img = self.text_renderer.render_plain_text(grid_text)
+            return np.array(pil_img)
         
-        # Image → return directly (already an image)
+        # Image → return as numpy array
         elif sample.image is not None:
-            from PIL import Image
-            # Convert numpy array to PIL Image if needed
+            # Already numpy array
             if isinstance(sample.image, np.ndarray):
-                return Image.fromarray(sample.image.astype(np.uint8))
-            return sample.image
+                return sample.image.astype(np.uint8)
+            # Convert PIL to numpy
+            return np.array(sample.image)
         
-        # Fallback: blank image
-        from PIL import Image
-        return Image.new('RGB', (224, 224), color='white')
+        # Fallback: blank image as numpy array
+        return np.ones((224, 224, 3), dtype=np.uint8) * 255
     
     # Legacy token encoding removed - vision-unified only uses capsules
     
