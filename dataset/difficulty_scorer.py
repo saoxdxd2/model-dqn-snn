@@ -140,6 +140,21 @@ def compute_heuristic_difficulty(input_grid: np.ndarray, output_grid: np.ndarray
     return scores
 
 
+def score_difficulty(input_grid: np.ndarray, output_grid: np.ndarray) -> dict:
+    """
+    Public API for difficulty scoring (heuristic-based).
+    This is the main entry point for external callers.
+    
+    Args:
+        input_grid: Input puzzle grid (numpy array)
+        output_grid: Output puzzle grid (numpy array)
+    
+    Returns:
+        scores: dict with difficulty metrics
+    """
+    return compute_heuristic_difficulty(input_grid, output_grid)
+
+
 class DatasetQualityEnhancer:
     """
     GPU-accelerated quality enhancement for puzzle datasets.

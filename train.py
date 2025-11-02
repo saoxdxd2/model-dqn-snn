@@ -476,10 +476,44 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False):
         return False
 
 
+def _extract_output_dir_from_args(args_list: list) -> str:
+    """Extract output directory from dataset_args command-line arguments list.
+    
+    Args:
+        args_list: List of command-line arguments (e.g., ['--output-dir', 'datasets/vision_unified', ...])
+    
+    Returns:
+        output_dir: The output directory path, or None if not found
+    """
+    try:
+        # Find --output-dir flag and get the next element
+        for i, arg in enumerate(args_list):
+            if arg == '--output-dir' and i + 1 < len(args_list):
+                return args_list[i + 1]
+    except (IndexError, AttributeError):
+        pass
+    return None
+
+
 def train_model(model_config: dict, extra_args: list, checkpoint_path: str = None, epochs_override: int = None):
     """Start training with specified config."""
     config_name = model_config['config']
-    data_path = model_config['dataset_args']['output_dir']
+    
+    # Extract data path from dataset_args (which is a list of CLI arguments)
+    dataset_args = model_config.get('dataset_args', [])
+    if isinstance(dataset_args, dict):
+        # Legacy dict format support
+        data_path = dataset_args.get('output_dir')
+    elif isinstance(dataset_args, list):
+        # New list format (command-line args)
+        data_path = _extract_output_dir_from_args(dataset_args)
+    else:
+        data_path = None
+    
+    if not data_path:
+        print("\n❌ Error: Could not determine dataset output directory")
+        print(f"   dataset_args: {dataset_args}")
+        sys.exit(1)
     
     print(f"\n🚀 Starting training: {model_config['name']}")
     print("-" * 70)
