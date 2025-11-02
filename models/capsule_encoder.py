@@ -78,4 +78,4 @@ class CapsuleEncoder(nn.Module):
         if images is None:
             raise ValueError("TRM encoder requires images (render text to images first)")
         
-        return self.encoder(images, return_children=return_children)
+        return self.encoder(images=images, return_children=return_children)

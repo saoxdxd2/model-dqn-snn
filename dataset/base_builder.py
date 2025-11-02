@@ -198,6 +198,16 @@ class BaseDatasetBuilder(ABC):
         from torch.utils.data import Dataset, DataLoader
         from tqdm import tqdm
         
+        # Custom collate function to handle numpy arrays -> PyTorch tensors (CHW format)
+        def collate_images(batch):
+            """Convert batch of numpy images [H,W,C] to tensor [B,C,H,W]."""
+            import torch
+            # Stack numpy arrays and convert to tensor
+            batch_array = np.stack(batch, axis=0)  # [B, H, W, C]
+            # Convert to tensor and transpose to CHW format
+            batch_tensor = torch.from_numpy(batch_array).permute(0, 3, 1, 2)  # [B, C, H, W]
+            return batch_tensor.float() / 255.0  # Normalize to [0, 1]
+        
         # Custom Dataset for efficient batching
         class SampleDataset(Dataset):
             def __init__(self, samples, image_converter):
@@ -222,6 +232,7 @@ class BaseDatasetBuilder(ABC):
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
+            collate_fn=collate_images,  # Custom collate for numpy -> tensor conversion
             pin_memory=torch.cuda.is_available(),  # Faster GPU transfer
             prefetch_factor=2,  # Prefetch batches
             persistent_workers=True  # Keep workers alive
@@ -238,8 +249,8 @@ class BaseDatasetBuilder(ABC):
         # Process with DataLoader (automatic batching + parallel preprocessing)
         with torch.no_grad():
             for batch_images in tqdm(dataloader, desc="Encoding"):
-                # Encode batch (stays on GPU)
-                batch_result = self.encoder(batch_images, return_children=True)
+                # Encode batch (stays on GPU) - pass as keyword argument
+                batch_result = self.encoder(images=batch_images, return_children=True)
                 
                 # Keep on GPU and accumulate (uses VRAM, not CPU RAM)
                 for key in temp_gpu_list:
@@ -310,7 +321,7 @@ class BaseDatasetBuilder(ABC):
             batch_images = [self._sample_to_image(s) for s in samples[i:i+batch_size]]
             
             with torch.no_grad():
-                batch_result = self.encoder(batch_images, return_children=True)
+                batch_result = self.encoder(images=batch_images, return_children=True)
             
             # Clear batch images immediately
             del batch_images
