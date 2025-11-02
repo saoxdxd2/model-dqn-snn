@@ -1001,7 +1001,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             }
     else:
         # Standard token mode: batch is dict
-        batch = {k: v.cuda() for k, v in batch.items()}
+        # Handle None values (e.g., missing children/checksums in capsule mode)
+        batch = {k: v.cuda() if v is not None else None for k, v in batch.items()}
         
     # Add CapsuleState for expansion tracking (if enabled)
     # Works for both tuple and dict batch modes
