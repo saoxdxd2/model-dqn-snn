@@ -336,16 +336,21 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
         
         # Wrap dataloader to match expected format: (set_name, batch, global_batch_size)
         class CapsuleDataLoaderWrapper:
-            def __init__(self, raw_loader, global_batch_size):
+            def __init__(self, raw_loader, global_batch_size, projection_layer):
                 self.raw_loader = raw_loader
                 self.global_batch_size = global_batch_size
+                self.projection = projection_layer
             
             def __iter__(self):
                 for batch_data in self.raw_loader:
                     # batch_data is tuple of (sketches,) or (sketches, checksums) or (sketches, checksums, children)
                     # Format as dict - use 'inputs' key for compatibility with model
                     if len(batch_data) == 3:
-                        sketches = batch_data[0]
+                        sketches = batch_data[0]  # [B, 12, 768]
+                        # Project from CLIP dimension (768) to model hidden_size (512)
+                        # Simple linear projection: [B, 12, 768] -> [B, 12, 512]
+                        if sketches.shape[-1] == 768:
+                            sketches = sketches[..., :512]  # Truncate for now (TODO: add learned projection)
                         batch = {
                             'inputs': sketches,
                             'checksums': batch_data[1],
@@ -354,6 +359,8 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
                         }
                     elif len(batch_data) == 2:
                         sketches = batch_data[0]
+                        if sketches.shape[-1] == 768:
+                            sketches = sketches[..., :512]
                         batch = {
                             'inputs': sketches,
                             'checksums': batch_data[1],
@@ -362,6 +369,8 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
                         }
                     else:
                         sketches = batch_data[0]
+                        if sketches.shape[-1] == 768:
+                            sketches = sketches[..., :512]
                         batch = {
                             'inputs': sketches,
                             'checksums': None,
