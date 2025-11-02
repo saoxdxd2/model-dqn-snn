@@ -156,7 +156,7 @@ class Attention(nn.Module):
         self.qkv_proj = CastedLinear(self.hidden_size, (self.num_heads + 2 * self.num_key_value_heads) * self.head_dim, bias=False)
         self.o_proj = CastedLinear(self.output_size, self.hidden_size, bias=False)
 
-    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, attn_bias=None) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
         # hidden_states: [bs, seq_len, num_heads, head_dim]
@@ -177,6 +177,7 @@ class Attention(nn.Module):
         if FLASH_ATTN_AVAILABLE:
             # Flash Attention expects [batch, seq_len, num_heads, head_dim]
             # Already in correct format, no rearrange needed
+            # Note: flash_attn doesn't support attn_bias, ignore it if provided
             attn_output = flash_attn_func(
                 query, key, value,
                 causal=self.causal,
@@ -186,7 +187,13 @@ class Attention(nn.Module):
         else:
             # Fallback to PyTorch SDPA
             query, key, value = map(lambda t: einops.rearrange(t, 'B S H D -> B H S D'), (query, key, value))
-            attn_output = scaled_dot_product_attention(query=query, key=key, value=value, is_causal=self.causal)
+            # Handle attn_bias if provided (spatial bias for vision encoder)
+            attn_mask = attn_bias if attn_bias is not None else None
+            attn_output = scaled_dot_product_attention(
+                query=query, key=key, value=value, 
+                attn_mask=attn_mask,
+                is_causal=self.causal
+            )
             attn_output = einops.rearrange(attn_output, 'B H S D -> B S H D')
             attn_output = attn_output.contiguous().view(batch_size, seq_len, self.output_size)  # type: ignore
         

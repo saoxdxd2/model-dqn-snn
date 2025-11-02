@@ -10,6 +10,58 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 from typing import Union, List, Optional, Tuple
 import textwrap
+import subprocess
+import os
+
+
+def ensure_dejavu_font_installed():
+    """Install DejaVuSansMono font on Colab/Linux if not available."""
+    font_path = "/usr/local/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+    
+    # Check if already installed and working
+    try:
+        font = ImageFont.truetype(font_path, 14)
+        return font_path
+    except:
+        pass
+    
+    print("📦 Installing DejaVuSansMono font...")
+    
+    try:
+        # Clean up any broken files
+        subprocess.run(["rm", "-f", font_path], check=False, stderr=subprocess.DEVNULL)
+        
+        # Create directory
+        os.makedirs("/usr/local/share/fonts/truetype/dejavu", exist_ok=True)
+        
+        # Download official .deb package
+        subprocess.run([
+            "wget", "-q",
+            "https://ftp.debian.org/debian/pool/main/f/fonts-dejavu/fonts-dejavu-core_2.37-2_all.deb",
+            "-O", "/tmp/fonts-dejavu.deb"
+        ], check=True, stderr=subprocess.DEVNULL)
+        
+        # Extract TTF file
+        subprocess.run(["dpkg-deb", "-x", "/tmp/fonts-dejavu.deb", "/tmp/dejavu_fonts"],
+                      check=True, stderr=subprocess.DEVNULL)
+        
+        # Copy to system fonts
+        subprocess.run([
+            "bash", "-c",
+            "find /tmp/dejavu_fonts -name 'DejaVuSansMono.ttf' -exec cp {} /usr/local/share/fonts/truetype/dejavu/ \;"
+        ], check=True, stderr=subprocess.DEVNULL)
+        
+        # Refresh font cache
+        subprocess.run(["fc-cache", "-fv"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # Verify installation
+        font = ImageFont.truetype(font_path, 14)
+        print("✅ DejaVuSansMono font installed successfully!")
+        return font_path
+        
+    except Exception as e:
+        print(f"⚠️  Font installation failed: {e}")
+        return None
 
 
 class TextRenderer:
@@ -51,28 +103,46 @@ class TextRenderer:
         self.padding = padding
         
         # Try to load font, fallback to default if not found
+        font_loaded = False
+        
+        # Try system font first
         try:
-            # Try system font first
             self.font = ImageFont.truetype(font_family, font_size)
+            font_loaded = True
         except IOError:
-            try:
-                # Try common paths
-                import os
-                font_paths = [
-                    f"/usr/share/fonts/truetype/dejavu/{font_family}",
-                    f"C:\\Windows\\Fonts\\{font_family}",
-                    f"/System/Library/Fonts/{font_family}",
-                ]
-                for path in font_paths:
-                    if os.path.exists(path):
+            pass
+        
+        if not font_loaded:
+            # Try common paths
+            font_paths = [
+                f"/usr/local/share/fonts/truetype/dejavu/{font_family}",
+                f"/usr/share/fonts/truetype/dejavu/{font_family}",
+                f"C:\\Windows\\Fonts\\{font_family}",
+                f"/System/Library/Fonts/{font_family}",
+            ]
+            for path in font_paths:
+                if os.path.exists(path):
+                    try:
                         self.font = ImageFont.truetype(path, font_size)
+                        font_loaded = True
                         break
-                else:
-                    # Fallback to default PIL font
-                    print(f"⚠️  Font {font_family} not found, using default")
-                    self.font = ImageFont.load_default()
-            except:
-                self.font = ImageFont.load_default()
+                    except:
+                        continue
+        
+        # If still not found, try automatic installation (Linux/Colab)
+        if not font_loaded and font_family == "DejaVuSansMono.ttf":
+            installed_path = ensure_dejavu_font_installed()
+            if installed_path:
+                try:
+                    self.font = ImageFont.truetype(installed_path, font_size)
+                    font_loaded = True
+                except:
+                    pass
+        
+        # Final fallback to default PIL font
+        if not font_loaded:
+            print(f"⚠️  Font {font_family} not found, using default")
+            self.font = ImageFont.load_default()
         
         # Calculate usable text area
         self.text_width = width - 2 * padding
