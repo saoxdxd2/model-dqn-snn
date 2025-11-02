@@ -586,7 +586,76 @@ def build(config: MultimodalDatasetConfig):
         'sets': ['test']
     }
     
-    # Save metadata as dataset.json (not the samples themselves)
+    # Tokenize samples and create numpy arrays
+    print("\n🔤 Tokenizing samples...")
+    from dataset.common import get_tokenizer
+    tokenizer = get_tokenizer('gpt2')
+    
+    def tokenize_and_create_arrays(samples, set_name='train'):
+        """Convert text samples to tokenized numpy arrays."""
+        all_inputs = []
+        all_labels = []
+        puzzle_identifiers = []
+        puzzle_indices = [0]  # Start index for each puzzle
+        
+        for idx, sample in enumerate(samples):
+            # Get text content
+            text = sample.text if sample.text else ""
+            if not text:
+                continue
+            
+            # Tokenize
+            tokens = tokenizer.encode(text, max_length=512, truncation=True)
+            if len(tokens) == 0:
+                continue
+            
+            # Create input and label sequences (autoregressive: input[:-1], label[1:])
+            inputs = np.array(tokens[:-1], dtype=np.int32)
+            labels = np.array(tokens[1:], dtype=np.int32)
+            
+            # Add to arrays
+            all_inputs.append(inputs)
+            all_labels.append(labels)
+            puzzle_identifiers.extend([idx] * len(inputs))
+            puzzle_indices.append(puzzle_indices[-1] + len(inputs))
+        
+        # Concatenate all sequences
+        if len(all_inputs) == 0:
+            # Create dummy data if no valid samples
+            all_inputs = np.array([0], dtype=np.int32)
+            all_labels = np.array([0], dtype=np.int32)
+            puzzle_identifiers = np.array([0], dtype=np.int32)
+            puzzle_indices = np.array([0, 1], dtype=np.int32)
+        else:
+            all_inputs = np.concatenate(all_inputs)
+            all_labels = np.concatenate(all_labels)
+            puzzle_identifiers = np.array(puzzle_identifiers, dtype=np.int32)
+            puzzle_indices = np.array(puzzle_indices, dtype=np.int32)
+        
+        # Create group indices (single group for all puzzles)
+        group_indices = np.array([0, len(puzzle_indices) - 1], dtype=np.int32)
+        
+        return {
+            'inputs': all_inputs,
+            'labels': all_labels,
+            'puzzle_identifiers': puzzle_identifiers,
+            'puzzle_indices': puzzle_indices,
+            'group_indices': group_indices
+        }
+    
+    train_arrays = tokenize_and_create_arrays(train_samples, 'train')
+    test_arrays = tokenize_and_create_arrays(test_samples, 'test')
+    
+    # Save numpy arrays
+    print("💾 Saving numpy arrays...")
+    for set_name, arrays in [('train', train_arrays), ('test', test_arrays)]:
+        set_dir = train_dir if set_name == 'train' else test_dir
+        for field_name, data in arrays.items():
+            filepath = os.path.join(set_dir, f"{set_name}__{field_name}.npy")
+            np.save(filepath, data)
+            print(f"   ✓ {filepath} ({data.shape})")
+    
+    # Save metadata as dataset.json
     with open(os.path.join(train_dir, 'dataset.json'), 'w') as f:
         json.dump(train_metadata, f, indent=2)
     
