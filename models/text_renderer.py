@@ -185,7 +185,9 @@ class TextRenderer:
                 print("⚠️  pygments not installed, rendering as plain text")
                 syntax_highlight = False
             except Exception as e:
-                print(f"⚠️  Syntax highlighting failed: {e}, using plain text")
+                # Suppress repetitive font warnings (already shown during init)
+                if not hasattr(self, '_font_warning_shown'):
+                    pass  # Warning already shown in __init__
                 syntax_highlight = False
         
         # Fallback to plain text rendering
