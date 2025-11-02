@@ -339,10 +339,16 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
     if hasattr(config, 'groups_per_batch'):
         kwargs['groups_per_batch'] = config.groups_per_batch
     
+    # Calculate epochs_per_iter based on eval_interval (same logic as in launch function)
+    epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
+    
     try:
         dataset = PuzzleDataset(PuzzleDatasetConfig(
             seed=config.seed,
             dataset_paths=dataset_paths,
+            global_batch_size=config.global_batch_size,
+            test_set_mode=(split != 'train'),  # True for test/eval, False for train
+            epochs_per_iter=epochs_per_iter,
             rank=rank,
             num_replicas=world_size,
             **kwargs
