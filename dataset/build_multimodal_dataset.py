@@ -664,7 +664,12 @@ def build_composite(
         include_text=True,
         include_images=True,
         include_grids=True,
-        use_capsules=True,
+        # Encode to capsules (DISABLED - too slow and memory intensive during dataset building)
+        # This should happen on-the-fly during training instead
+        # if config.use_capsules:
+        #     print("🧶 Encoding to HESC capsules...")
+        #     dataset = encode_to_capsules(dataset, config)
+        use_capsules=False,
         num_concepts=num_concepts,
         target_capsules=target_capsules,
         enable_quality_scoring=enable_quality_scoring
