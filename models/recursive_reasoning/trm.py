@@ -174,7 +174,7 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
             raise ValueError(f"epsilon must be in [0,1], got {v}")
         return v
     
-    @field_validator('batch_size', 'global_batch_size')
+    @field_validator('batch_size')
     @classmethod
     def validate_batch_size(cls, v):
         if not 1 <= v <= 8192:
