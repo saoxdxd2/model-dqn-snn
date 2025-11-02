@@ -22,45 +22,9 @@ import argparse
 import torch
 
 
-# Communication Training Roadmap (optimized for chat quality)
-COMMUNICATION_ROADMAP = [
-    {
-        "phase": 1,
-        "name": "Foundation (Language Structure)",
-        "dataset": "text",
-        "epochs": 5000,
-        "time_hours": 9,
-        "goal": "Learn formal English, grammar, vocabulary",
-        "continue_from": None
-    },
-    {
-        "phase": 2,
-        "name": "Fluency (Conversational Flow)",
-        "dataset": "text-tiny",
-        "epochs": 2000,
-        "time_hours": 12,
-        "goal": "Simple, fluent generation (children's stories)",
-        "continue_from": "text"
-    },
-    {
-        "phase": 3,
-        "name": "Instruction Following (Q&A)",
-        "dataset": "alpaca",
-        "epochs": 1000,
-        "time_hours": 6,
-        "goal": "Learn instruction→response patterns",
-        "continue_from": "text-tiny"
-    },
-    {
-        "phase": 4,
-        "name": "Conversational Polish",
-        "dataset": "sharegpt",
-        "epochs": 500,
-        "time_hours": 8,
-        "goal": "Multi-turn dialogue",
-        "continue_from": "alpaca"
-    }
-]
+# Vision-Unified: Single checkpoint path
+CHECKPOINT_DIR = Path("checkpoints/multimodal-hesc")
+CHECKPOINT_FILE = CHECKPOINT_DIR / "latest.pt"
 
 # Vision-Unified: Single model for all modalities
 # Text → rendered to images → TRM encoder → capsules
@@ -73,16 +37,15 @@ MODELS = {
         "dataset_builder": "dataset/build_multimodal_dataset.py",
         "dataset_command": "build-composite",
         "dataset_args": [
-            "--sources", "wikitext2", "cifar10", "kaggle/combined/arc-agi",
+            "--sources", "kaggle/combined", "tinystories",
             "--output-dir", "datasets/vision_unified",
             "--augment"
         ],
         "description": (
             "TRM Vision-Unified Pipeline (5M encoder + 5M reasoner):\n"
-            "  • Text → rendered to 224×224 images → TRM encoder\n"
-            "  • Images → TRM encoder (no CLIP)\n"
-            "  • Grids → rendered to images → TRM encoder\n"
-            "  • All data → 12 capsules × 512D\n"
+            "  • ARC puzzles: Spatial reasoning (kaggle/combined)\n"
+            "  • TinyStories: Simple fluent text generation\n"
+            "  • All → rendered to images → TRM encoder → 12 capsules\n"
             "  • Architecture: Encoder(2L, H=2, L=3), Reasoner(H=3, L=2)\n"
             "  • Features: DQN, Memory Bank, MTP\n"
             "  • 30× smaller than CLIP, 17× faster"
@@ -91,92 +54,26 @@ MODELS = {
 }
 
 
-def check_phase_completion(checkpoint_path: str) -> dict:
-    """Check if training phase is complete."""
+def check_checkpoint_exists() -> bool:
+    """Check if vision-unified checkpoint exists."""
+    return CHECKPOINT_FILE.exists()
+
+
+def get_checkpoint_info() -> dict:
+    """Get info about vision-unified checkpoint if it exists."""
+    if not CHECKPOINT_FILE.exists():
+        return None
+    
     try:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        
-        current_step = checkpoint.get('step', 0)
-        target_steps = checkpoint.get('total_steps', 0)
-        config_epochs = checkpoint.get('config_epochs', 0)
-        dataset = checkpoint.get('dataset', 'unknown')
-        
-        if target_steps > 0:
-            progress = (current_step / target_steps) * 100
-            is_complete = current_step >= target_steps
-        else:
-            # Legacy checkpoint without metadata - assume incomplete
-            progress = 0
-            is_complete = False
-        
+        checkpoint = torch.load(CHECKPOINT_FILE, map_location='cpu')
         return {
-            'current_step': current_step,
-            'target_steps': target_steps,
-            'config_epochs': config_epochs,
-            'dataset': dataset,
-            'progress_pct': progress,
-            'is_complete': is_complete,
-            'corrupted': False
+            'epoch': checkpoint.get('epoch', 0),
+            'step': checkpoint.get('step', 0),
+            'path': str(CHECKPOINT_FILE)
         }
     except Exception as e:
-        error_msg = str(e)
-        is_corrupted = 'PytorchStreamReader' in error_msg or 'zip archive' in error_msg
-        
-        if is_corrupted:
-            print(f"   ❌ CORRUPTED CHECKPOINT: {e}")
-        else:
-            print(f"   ⚠️  Could not read checkpoint metadata: {e}")
-        
-        return {
-            'is_complete': False, 
-            'progress_pct': 0,
-            'corrupted': is_corrupted,
-            'error': error_msg
-        }
-
-
-def detect_checkpoints():
-    """Detect all available checkpoints in checkpoints/ directory.
-    
-    Looks for dataset-specific .pt files (text.pt, arc.pt, etc) or legacy latest.pt.
-    """
-    checkpoint_dir = Path("checkpoints")
-    if not checkpoint_dir.exists():
-        return []
-    
-    checkpoints = []
-    for subdir in checkpoint_dir.iterdir():
-        if subdir.is_dir():
-            # Look for any .pt files in the directory
-            pt_files = list(subdir.glob("*.pt"))
-            
-            if pt_files:
-                # Prefer dataset-specific names over latest.pt
-                checkpoint_file = None
-                for pt_file in pt_files:
-                    if pt_file.name != "latest.pt":
-                        checkpoint_file = pt_file
-                        break
-                
-                # Fallback to latest.pt if no dataset-specific file found
-                if checkpoint_file is None:
-                    checkpoint_file = subdir / "latest.pt"
-                    if not checkpoint_file.exists():
-                        continue
-                
-                # Check completion status
-                status = check_phase_completion(str(checkpoint_file))
-                
-                # Extract dataset name from checkpoint filename
-                dataset_name = checkpoint_file.stem  # e.g., "text" from "text.pt"
-                
-                checkpoints.append({
-                    "name": f"{subdir.name} ({dataset_name})",
-                    "path": str(checkpoint_file),
-                    "dir": str(subdir),
-                    "status": status
-                })
-    return checkpoints
+        print(f"   ⚠️  Warning: Could not read checkpoint: {e}")
+        return None
 
 
 def dataset_path_to_model_key(dataset_path: str) -> str:
@@ -225,11 +122,13 @@ def recommend_next_phase(completed_datasets):
     return None  # All phases completed!
 
 
-def select_continual_learning_mode():
-    """Interactive continual learning: select checkpoint and next dataset."""
-    
-    # Detect checkpoints
-    checkpoints = detect_checkpoints()
+# Removed: Old continual learning system
+# Vision-unified uses simple auto-resume from checkpoints/multimodal-hesc/latest.pt
+
+def check_dataset_exists(output_dir: str) -> bool:
+    """Check if dataset already exists."""
+    train_path = Path(output_dir) / "train" / "dataset.json"
+    return train_path.exists()
     if not checkpoints:
         print("\n❌ No checkpoints found in checkpoints/ directory.")
         print("   Train a base model first (e.g., Phase 1: WikiText-2)\n")
@@ -435,19 +334,25 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False):
     if 'dataset_command' in model_config:
         cmd.append(model_config['dataset_command'])
     
-    # Convert to dict if it's a list
+    # Convert list to dict, collecting multiple values for same key
     if isinstance(args, list):
         args_dict = {}
         i = 0
         while i < len(args):
             if args[i].startswith('--'):
                 key = args[i][2:].replace('-', '_')
-                if i + 1 < len(args) and not args[i + 1].startswith('--'):
-                    args_dict[key] = args[i + 1]
-                    i += 2
+                values = []
+                i += 1
+                # Collect all non-flag values
+                while i < len(args) and not args[i].startswith('--'):
+                    values.append(args[i])
+                    i += 1
+                
+                if values:
+                    # Multiple values = list, single value = string
+                    args_dict[key] = values if len(values) > 1 else values[0]
                 else:
                     args_dict[key] = True
-                    i += 1
             else:
                 i += 1
         args = args_dict
@@ -459,7 +364,9 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False):
             if value:
                 cmd.append(flag)
         elif isinstance(value, list):
-            cmd.extend([flag] + value)
+            # Multiple values for same flag
+            cmd.append(flag)
+            cmd.extend(value)
         else:
             cmd.extend([flag, str(value)])
     
@@ -608,12 +515,20 @@ Auto-Resume:
         print("\n✅ Dataset preparation complete. Exiting (--dataset-only).")
         sys.exit(0)
     
-    # Initialize training parameters
+    # Auto-resume from checkpoint if it exists
+    checkpoint_info = get_checkpoint_info()
     checkpoint_path = None
-    epochs_override = None
+    
+    if checkpoint_info:
+        print(f"\n📂 Found checkpoint: {checkpoint_info['path']}")
+        print(f"   Epoch: {checkpoint_info['epoch']}, Step: {checkpoint_info['step']}")
+        print("   Training will auto-resume from this checkpoint\n")
+        checkpoint_path = checkpoint_info['path']
+    else:
+        print("\n🆕 No checkpoint found - starting fresh training\n")
     
     # Start training
-    train_model(model_config, unknown_args, checkpoint_path=checkpoint_path, epochs_override=epochs_override)
+    train_model(model_config, unknown_args, checkpoint_path=checkpoint_path, epochs_override=None)
     
     print("\n" + "=" * 70)
     print("  ✅ Training completed!")
