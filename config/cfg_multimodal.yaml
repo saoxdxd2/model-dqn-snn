@@ -9,15 +9,15 @@ hydra:
   output_subdir: null
 
 # Data paths
-data_paths: ['datasets/multimodal_unified']
+data_paths: ['datasets/vision_unified']
 data_paths_test: []
 
 evaluators: []
 
 # HESC capsule mode (REQUIRED)
 semantic_mode: true
-semantic_dataset: "datasets/multimodal_unified/capsule_dataset.pt"
-semantic_eval_dataset: "datasets/multimodal_unified/capsule_dataset_test.pt"
+semantic_dataset: "datasets/vision_unified/capsule_dataset.pt"
+semantic_eval_dataset: "datasets/vision_unified/capsule_dataset_test.pt"
 
 # Multi-Token Prediction (DeepSeek-V3 inspired)
 enable_mtp: true

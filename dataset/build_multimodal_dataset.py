@@ -549,145 +549,122 @@ def build(config: MultimodalDatasetConfig):
     import json
     os.makedirs(config.output_dir, exist_ok=True)
     
-    # Save train/test splits as JSON
-    train_dir = os.path.join(config.output_dir, 'train')
-    test_dir = os.path.join(config.output_dir, 'test')
-    os.makedirs(train_dir, exist_ok=True)
-    os.makedirs(test_dir, exist_ok=True)
-    
-    # Create proper PuzzleDatasetMetadata for each split
+    # Get samples
     train_samples = dataset['train']
     test_samples = dataset['test']
     
-    # Calculate metadata values (simplified for text-only datasets)
-    train_metadata = {
-        'pad_id': 0,
-        'ignore_label_id': -100,
-        'blank_identifier_id': 0,
-        'vocab_size': 50257,  # GPT-2 vocab size (standard for text)
-        'seq_len': 512,  # Standard sequence length
-        'num_puzzle_identifiers': len(train_samples),
-        'total_groups': 1,  # Single group for unified dataset
-        'mean_puzzle_examples': 1.0,
-        'total_puzzles': len(train_samples),
-        'sets': ['train']  # Dataset set name
-    }
+    # Vision-unified pipeline: text → images → capsules
+    print("\n🎨 Encoding to capsules (vision-unified mode)...")
     
-    test_metadata = {
-        'pad_id': 0,
-        'ignore_label_id': -100,
-        'blank_identifier_id': 0,
-        'vocab_size': 50257,
-        'seq_len': 512,
-        'num_puzzle_identifiers': len(test_samples),
-        'total_groups': 1,
-        'mean_puzzle_examples': 1.0,
-        'total_puzzles': len(test_samples),
-        'sets': ['test']
-    }
+    # Initialize capsule encoder
+    from models.capsule_encoder import CapsuleEncoder
+    encoder = CapsuleEncoder(
+        hidden_size=config.hidden_size,
+        target_capsules=config.target_capsules,
+        children_per_capsule=config.children_per_capsule,
+        encoder_model=config.encoder_model or "openai/clip-vit-large-patch14",
+        freeze_encoder=True,
+        use_spatial=True
+    )
+    encoder.eval()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    encoder = encoder.to(device)
     
-    # Tokenize samples and create numpy arrays
-    print("\n🔤 Tokenizing samples...")
-    from dataset.common import get_tokenizer
-    tokenizer = get_tokenizer('gpt2')
-    
-    def tokenize_and_create_arrays(samples, set_name='train'):
-        """Convert text samples to tokenized numpy arrays."""
-        all_inputs = []
-        all_labels = []
-        puzzle_identifiers = []
-        puzzle_indices = [0]  # Start index for each puzzle
+    def encode_to_capsules(samples, batch_size=16):
+        """Encode samples to capsule format."""
+        all_sketches = []
+        all_checksums = []
+        all_children = []
         
-        for idx, sample in enumerate(samples):
-            # Get text content
-            text = sample.text if sample.text else ""
-            if not text:
-                continue
+        # Process in batches
+        for i in range(0, len(samples), batch_size):
+            batch_samples = samples[i:i+batch_size]
             
-            # Tokenize
-            tokens = tokenizer.encode(text, max_length=512, truncation=True)
-            if len(tokens) == 0:
-                continue
+            # Prepare batch - render text to images if needed
+            batch_images = []
+            batch_texts = []
             
-            # Create input and label sequences (autoregressive: input[:-1], label[1:])
-            inputs = np.array(tokens[:-1], dtype=np.int32)
-            labels = np.array(tokens[1:], dtype=np.int32)
+            for sample in batch_samples:
+                if sample.image is not None:
+                    batch_images.append(sample.image)
+                elif sample.text:
+                    # Text mode: use CLIP text encoder directly (no rendering)
+                    batch_texts.append(sample.text)
             
-            # Add to arrays
-            all_inputs.append(inputs)
-            all_labels.append(labels)
-            puzzle_identifiers.extend([idx] * len(inputs))
-            puzzle_indices.append(puzzle_indices[-1] + len(inputs))
+            # Encode batch
+            with torch.no_grad():
+                if batch_images:
+                    # Convert PIL images to tensors
+                    from torchvision import transforms
+                    transform = transforms.Compose([
+                        transforms.Resize((224, 224)),
+                        transforms.ToTensor(),
+                        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                    ])
+                    image_tensors = torch.stack([transform(img) for img in batch_images]).to(device)
+                    result = encoder(images=image_tensors, return_children=True)
+                elif batch_texts:
+                    # Text encoding via CLIP text encoder
+                    result = encoder(texts=batch_texts, return_children=True)
+                else:
+                    continue
+                
+                all_sketches.append(result['sketches'].cpu())
+                all_checksums.append(result['checksums'].cpu())
+                if 'children' in result:
+                    all_children.append(result['children'].cpu())
         
-        # Concatenate all sequences
-        if len(all_inputs) == 0:
-            # Create dummy data if no valid samples
-            all_inputs = np.array([0], dtype=np.int32)
-            all_labels = np.array([0], dtype=np.int32)
-            puzzle_identifiers = np.array([0], dtype=np.int32)
-            puzzle_indices = np.array([0, 1], dtype=np.int32)
-        else:
-            all_inputs = np.concatenate(all_inputs)
-            all_labels = np.concatenate(all_labels)
-            puzzle_identifiers = np.array(puzzle_identifiers, dtype=np.int32)
-            puzzle_indices = np.array(puzzle_indices, dtype=np.int32)
-        
-        # Create group indices (single group for all puzzles)
-        group_indices = np.array([0, len(puzzle_indices) - 1], dtype=np.int32)
+        # Concatenate all batches
+        sketches = torch.cat(all_sketches, dim=0) if all_sketches else torch.zeros(1, config.target_capsules, config.hidden_size)
+        checksums = torch.cat(all_checksums, dim=0) if all_checksums else torch.zeros(1, config.target_capsules, 32)
+        children = torch.cat(all_children, dim=0) if all_children else None
         
         return {
-            'inputs': all_inputs,
-            'labels': all_labels,
-            'puzzle_identifiers': puzzle_identifiers,
-            'puzzle_indices': puzzle_indices,
-            'group_indices': group_indices
+            'sketches': sketches,
+            'checksums': checksums,
+            'children': children
         }
     
-    train_arrays = tokenize_and_create_arrays(train_samples, 'train')
-    test_arrays = tokenize_and_create_arrays(test_samples, 'test')
+    print("   Encoding train samples...")
+    train_capsules = encode_to_capsules(train_samples)
+    print(f"   ✓ Train: {train_capsules['sketches'].shape[0]} samples → {config.target_capsules} capsules")
     
-    # Save numpy arrays
-    print("💾 Saving numpy arrays...")
-    for set_name, arrays in [('train', train_arrays), ('test', test_arrays)]:
-        set_dir = train_dir if set_name == 'train' else test_dir
-        for field_name, data in arrays.items():
-            filepath = os.path.join(set_dir, f"{set_name}__{field_name}.npy")
-            np.save(filepath, data)
-            print(f"   ✓ {filepath} ({data.shape})")
+    print("   Encoding test samples...")
+    test_capsules = encode_to_capsules(test_samples)
+    print(f"   ✓ Test: {test_capsules['sketches'].shape[0]} samples → {config.target_capsules} capsules")
     
-    # Save metadata as dataset.json
-    with open(os.path.join(train_dir, 'dataset.json'), 'w') as f:
-        json.dump(train_metadata, f, indent=2)
+    # Save as capsule_dataset.pt (semantic mode format)
+    print("\n💾 Saving capsule datasets...")
+    train_path = os.path.join(config.output_dir, 'capsule_dataset.pt')
+    test_path = os.path.join(config.output_dir, 'capsule_dataset_test.pt')
     
-    with open(os.path.join(test_dir, 'dataset.json'), 'w') as f:
-        json.dump(test_metadata, f, indent=2)
+    torch.save(train_capsules, train_path)
+    torch.save(test_capsules, test_path)
     
-    # Optionally save sample data separately for inspection
-    def sample_to_dict(sample):
-        return {
-            'sample_id': sample.sample_id,
-            'modality': sample.modality.value if hasattr(sample.modality, 'value') else str(sample.modality),
-            'text': sample.text,
-            'metadata': sample.metadata
-        }
+    print(f"   ✓ {train_path}")
+    print(f"   ✓ {test_path}")
     
-    with open(os.path.join(train_dir, 'samples.json'), 'w') as f:
-        json.dump([sample_to_dict(s) for s in train_samples], f)
+    # Also save metadata for compatibility
+    metadata = {
+        'num_samples': train_capsules['sketches'].shape[0],
+        'num_capsules': config.target_capsules,
+        'hidden_size': config.hidden_size,
+        'has_children': train_capsules['children'] is not None
+    }
     
-    with open(os.path.join(test_dir, 'samples.json'), 'w') as f:
-        json.dump([sample_to_dict(s) for s in test_samples], f)
-    
-    # Post-processing pipeline (concept expansion, quality scoring)
-    _post_process(config, dataset)
+    with open(os.path.join(config.output_dir, 'dataset_info.json'), 'w') as f:
+        json.dump(metadata, f, indent=2)
     
     # Print summary
-    train_size = dataset['train'].get('sketches', torch.empty(0)).shape[0] if 'sketches' in dataset['train'] else len(dataset['train']) if isinstance(dataset['train'], list) else 0
-    test_size = dataset['test'].get('sketches', torch.empty(0)).shape[0] if 'sketches' in dataset['test'] else len(dataset['test']) if isinstance(dataset['test'], list) else 0
+    train_count = train_capsules['sketches'].shape[0]
+    test_count = test_capsules['sketches'].shape[0]
     
-    print(f"\n✅ Complete: {train_size} train, {test_size} test samples")
+    print(f"\n✅ Complete: {train_count} train, {test_count} test samples")
+    print(f"   Format: {config.target_capsules} capsules per sample")
     print(f"   Output: {config.output_dir}")
+    print(f"\n💡 Training will use semantic_mode=true with capsule datasets")
     
-    if train_size == 0:
+    if train_count == 0:
         print(f"\n⚠️  WARNING: No samples were loaded from sources:")
         for src in config.source_paths:
             print(f"   - {src}")
