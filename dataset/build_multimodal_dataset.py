@@ -76,6 +76,7 @@ class MultimodalDatasetConfig(BaseModel):
     # HESC capsule config
     hidden_size: int = 768
     target_capsules: int = 12
+    children_per_capsule: int = 4  # Fine-grained tokens per capsule
     num_concepts: int = 2048
     encoder_model: str = "openai/clip-vit-large-patch14"
     
