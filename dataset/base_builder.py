@@ -249,6 +249,9 @@ class BaseDatasetBuilder(ABC):
         # Process with DataLoader (automatic batching + parallel preprocessing)
         with torch.no_grad():
             for batch_images in tqdm(dataloader, desc="Encoding"):
+                # Move batch to GPU device
+                batch_images = batch_images.to(device)
+                
                 # Encode batch (stays on GPU) - pass as keyword argument
                 batch_result = self.encoder(images=batch_images, return_children=True)
                 
