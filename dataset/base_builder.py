@@ -382,10 +382,18 @@ class BaseDatasetBuilder(ABC):
         num_concepts = getattr(self.config, 'num_concepts', 2048)
         vocab_size = num_concepts + 4  # Concept vocab
         
-        if 'sketches' in train_data:
-            seq_len = train_data['sketches'].shape[1]
+        if isinstance(train_data, dict):
+            if 'sketches' in train_data:
+                seq_len = train_data['sketches'].shape[1]
+            else:
+                seq_len = 1024  # Default
         else:
             seq_len = 1024  # Default
+        
+        if isinstance(train_data, dict):
+            total_samples = len(train_data.get('sketches', []))
+        else:
+            total_samples = len(train_data) if train_data else 0
         
         return PuzzleDatasetMetadata(
             seq_len=seq_len,
@@ -394,13 +402,13 @@ class BaseDatasetBuilder(ABC):
             ignore_label_id=-100,
             blank_identifier_id=0,
             num_puzzle_identifiers=0,
-            total_groups=len(train_data.get('sketches', [])),
+            total_groups=total_samples,
             mean_puzzle_examples=1.0,
-            total_puzzles=len(train_data.get('sketches', [])),
+            total_puzzles=total_samples,
             sets=["all"]
         )
-    
-    def save(self, dataset: Dict, output_dir: str):
+
+# ... (rest of the code remains the same)
         """Save dataset to disk with parallel I/O."""
         import os
         from concurrent.futures import ThreadPoolExecutor
