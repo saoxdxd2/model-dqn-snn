@@ -220,38 +220,6 @@ def recommend_next_phase(completed_datasets):
     return None  # All phases completed!
 
 
-def print_roadmap():
-    """Print the communication training roadmap."""
-    print("\n" + "="*70)
-    print("  🗺️  COMMUNICATION TRAINING ROADMAP")
-    print("="*70)
-    print("\nOptimal path for chat model (total ~35 hours):\n")
-    
-    total_hours = 0
-    for phase in COMMUNICATION_ROADMAP:
-        print(f"Phase {phase['phase']}: {phase['name']}")
-        print(f"  Dataset: {phase['dataset']}")
-        print(f"  Epochs: {phase['epochs']}")
-        print(f"  Time: ~{phase['time_hours']} hours")
-        print(f"  Goal: {phase['goal']}")
-        if phase['continue_from']:
-            print(f"  Continue from: Phase {phase['phase']-1} ({phase['continue_from']})")
-        print()
-        total_hours += phase['time_hours']
-    
-    print(f"Total training time: ~{total_hours} hours")
-    print("="*70 + "\n")
-
-
-def print_banner():
-    """Print welcome banner."""
-    print("=" * 70)
-    print("  🧠 TRM Training Pipeline - Unified Entry Point")
-    print("  Recursive Reasoning Transformer with Adaptive Computation")
-    print("=" * 70)
-    print()
-
-
 def select_continual_learning_mode():
     """Interactive continual learning: select checkpoint and next dataset."""
     
@@ -408,51 +376,6 @@ def select_continual_learning_mode():
     return selected_ckpt['path'], selected_dataset, epochs
 
 
-def select_model_interactive():
-    """Interactive model selection."""
-    
-    # Check if we should show continual learning option
-    checkpoints = detect_checkpoints()
-    
-    print("Training Modes:\n")
-    print("  [1] Fresh Training (Start new model)")
-    if checkpoints:
-        print("  [2] Continual Learning (Continue from checkpoint)")
-    print("  [3] View Communication Roadmap")
-    print()
-    
-    mode_choice = input(f"Select mode [1-{3 if checkpoints else 1}]: ").strip()
-    
-    if mode_choice == "2" and checkpoints:
-        ckpt_path, dataset, epochs = select_continual_learning_mode()
-        if ckpt_path:
-            return {"mode": "continual", "checkpoint": ckpt_path, "dataset": dataset, "epochs": epochs}
-        else:
-            sys.exit(0)
-    elif mode_choice == "3":
-        print_roadmap()
-        input("Press Enter to continue...")
-        return select_model_interactive()  # Recurse
-    
-    # Fresh training mode
-    print("\nAvailable Models:\n")
-    for idx, (key, info) in enumerate(MODELS.items(), 1):
-        print(f"  [{idx}] {info['name']}")
-        print(f"      {info['description']}")
-        print()
-    
-    while True:
-        try:
-            choice = input("Select model [1-{}]: ".format(len(MODELS)))
-            choice_idx = int(choice) - 1
-            if 0 <= choice_idx < len(MODELS):
-                selected_key = list(MODELS.keys())[choice_idx]
-                return {"mode": "fresh", "dataset": selected_key}
-            else:
-                print(f"Invalid choice. Enter 1-{len(MODELS)}")
-        except (ValueError, KeyboardInterrupt):
-            print("\nExiting...")
-            sys.exit(0)
 
 
 def check_dataset_exists(output_dir: str) -> bool:
@@ -633,35 +556,14 @@ Auto-Resume:
     
     args, unknown_args = parser.parse_known_args()
     
-    print_banner()
+    print("="*70)
+    print("  TRM Training Pipeline - Auto-Starting")
+    print("  Vision-Unified Model: Text + Images + Puzzles")
+    print("="*70)
+    print()
     
-    # Model selection
-    checkpoint_path = None
-    epochs_override = None
-    
-    if args.model:
-        selected_model = args.model
-        selection = {"mode": "fresh", "dataset": selected_model}
-    else:
-        selection = select_model_interactive()
-    
-    # Handle continual learning mode
-    if isinstance(selection, dict) and selection["mode"] == "continual":
-        checkpoint_path = selection["checkpoint"]
-        selected_model = selection["dataset"]
-        epochs_override = selection["epochs"]
-        print(f"\n🔄 Continual Learning Mode")
-        print(f"   Checkpoint: {checkpoint_path}")
-        print(f"   Dataset: {selected_model}")
-        print(f"   Epochs: {epochs_override}\n")
-    else:
-        selected_model = selection["dataset"]
-    
-    if selected_model not in MODELS:
-        print(f"❌ Unknown model: {selected_model}")
-        print(f"Available models: {', '.join(MODELS.keys())}")
-        sys.exit(1)
-    
+    # Auto-select vision-unified model (no user prompts)
+    selected_model = "vision-unified"
     model_config = MODELS[selected_model]
     
     # Dataset preparation (auto-skips if exists unless --rebuild-dataset)

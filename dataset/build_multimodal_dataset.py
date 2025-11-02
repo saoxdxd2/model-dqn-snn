@@ -458,17 +458,15 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
     def preprocess_sample(self, sample: DataSample) -> DataSample:
         """Unified preprocessing: normalize sizes, combine modalities."""
         
-        # Text → Image rendering (vision-unified pipeline)
-        if sample.text and self.text_renderer is not None and sample.image is None:
-            # Render text to image for unified vision processing
-            try:
-                rendered_image = self.text_renderer.render_code(sample.text)
-                sample.image = rendered_image  # PIL Image
-                sample.metadata['text_rendered'] = True
-                sample.metadata['original_text'] = sample.text[:200]  # Keep snippet for debugging
-            except Exception as e:
-                print(f"⚠️  Failed to render text for {sample.sample_id}: {e}")
-                # Continue with text as-is
+        # Text → Image rendering (DISABLED during dataset building - too slow)
+        # This should happen during training on-the-fly instead
+        # if sample.text and self.text_renderer is not None and sample.image is None:
+        #     try:
+        #         rendered_image = self.text_renderer.render_code(sample.text)
+        #         sample.image = rendered_image
+        #         sample.metadata['text_rendered'] = True
+        #     except Exception as e:
+        #         pass# Continue with text as-is
         
         # Image: resize and compress to uint8 (4x memory reduction)
         if sample.image and PIL_AVAILABLE and isinstance(sample.image, Image.Image):

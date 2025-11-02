@@ -97,22 +97,10 @@ class BaseDatasetBuilder(ABC):
         print("⚙️  Preprocessing...")
         import os
         
-        num_workers = min(8, os.cpu_count() or 4)  # Use up to 8 cores
-        
-        if num_workers > 1 and len(raw_samples) > 1000:
-            # Parallel processing with joblib (faster than multiprocessing)
-            try:
-                from joblib import Parallel, delayed
-                processed = Parallel(n_jobs=num_workers, backend='threading', verbose=0)(
-                    delayed(self.preprocess_sample)(s) for s in raw_samples
-                )
-            except ImportError:
-                # Fallback to list comprehension
-                print("   ⚠️  joblib not found, using single-thread (install: pip install joblib)")
-                processed = [self.preprocess_sample(s) for s in raw_samples]
-        else:
-            # Single-threaded for small datasets
-            processed = [self.preprocess_sample(s) for s in raw_samples]
+        # Note: Parallel processing disabled for text rendering (PIL font pickling issues)
+        # Process sequentially with progress indicator
+        from tqdm import tqdm
+        processed = [self.preprocess_sample(s) for s in tqdm(raw_samples, desc="   Processing", ncols=70)]
         
         del raw_samples  # Free original
         
