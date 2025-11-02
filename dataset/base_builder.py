@@ -109,13 +109,24 @@ class BaseDatasetBuilder(ABC):
         # Augment with streaming to prevent RAM explosion
         print("🔄 Augmenting...")
         if getattr(self.config, 'augment', False):
-            augmented = []
-            batch_size = 5000  # Process in batches to free memory
+            # OPTIMIZATION: Skip augmentation for text-only datasets
+            # Check first sample to determine dataset type
+            has_visual_data = False
+            if len(processed) > 0:
+                first_sample = processed[0]
+                has_visual_data = (first_sample.image is not None or first_sample.grid is not None)
             
-            for i in range(0, len(processed), batch_size):
-                batch = processed[i:i+batch_size]
-                for sample in batch:
-                    augmented.extend(self.augment_sample(sample))
+            if not has_visual_data:
+                print("   Skipping augmentation (text-only dataset)")
+                augmented = processed
+            else:
+                augmented = []
+                batch_size = 5000  # Process in batches to free memory
+                
+                for i in range(0, len(processed), batch_size):
+                    batch = processed[i:i+batch_size]
+                    for sample in batch:
+                        augmented.extend(self.augment_sample(sample))
                 
                 # Free processed batch immediately
                 del batch
