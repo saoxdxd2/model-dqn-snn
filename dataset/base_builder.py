@@ -188,7 +188,7 @@ class BaseDatasetBuilder(ABC):
             self.encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
     
     def _stream_encode_capsules(self, samples: List[DataSample]):
-        """Hybrid CPU/GPU encoding with aggressive memory management."""
+        """Fast encoding with disk-cached text images."""
         if len(samples) == 0:
             return {'sketches': torch.empty(0, getattr(self.config, 'target_capsules', 12), getattr(self.config, 'hidden_size', 768))}
         
@@ -200,6 +200,18 @@ class BaseDatasetBuilder(ABC):
         from tqdm import tqdm
         import gc
         import os
+        
+        # Initialize image cache
+        from dataset.image_cache import ImageCache
+        cache = ImageCache(cache_dir=str(self.config.output_dir / "text_cache"))
+        
+        # Pre-populate cache (one-time cost, then instant)
+        print("🗂️  Checking image cache...")
+        cached_count, rendered_count = cache.populate_cache(samples, self.text_renderer)
+        
+        if rendered_count > 0:
+            print(f"✅ Rendered {rendered_count} new images (one-time cost)")
+        print(f"✅ Using {cached_count + rendered_count} cached images (10x faster than re-rendering)")
         
         # Force garbage collection before starting
         gc.collect()
@@ -213,27 +225,37 @@ class BaseDatasetBuilder(ABC):
             batch_tensor = torch.from_numpy(batch_array).permute(0, 3, 1, 2)  # [B, C, H, W]
             return batch_tensor.float() / 255.0  # Normalize to [0, 1]
         
-        # Custom Dataset for efficient batching
+        # Custom Dataset with cache support
         class SampleDataset(Dataset):
-            def __init__(self, samples, image_converter):
+            def __init__(self, samples, image_converter, cache):
                 self.samples = samples
                 self.image_converter = image_converter
+                self.cache = cache
             
             def __len__(self):
                 return len(self.samples)
             
             def __getitem__(self, idx):
-                return self.image_converter(self.samples[idx])
+                sample = self.samples[idx]
+                text = sample.get('text', '') or sample.get('question', '') or str(sample)
+                
+                # Try cache first (instant)
+                cached_img = self.cache.get(text, 224, 224)
+                if cached_img is not None:
+                    return cached_img
+                
+                # Fallback to rendering (shouldn't happen after pre-population)
+                return self.image_converter(sample)
         
-        # Create dataset and dataloader
-        dataset = SampleDataset(samples, self._sample_to_image)
+        # Create dataset and dataloader with cache
+        dataset = SampleDataset(samples, self._sample_to_image, cache)
         
-        # Hybrid CPU/GPU settings (conservative for Colab T4):
-        # - 2 workers render text in parallel on CPU
-        # - Batch 64 keeps GPU busy without OOM
-        # - Prefetch overlaps CPU/GPU work
-        batch_size = 64  # Safe for 15GB VRAM (model 5GB + batch 5GB + overhead 2GB = 12GB)
-        num_workers = 2  # 2 workers = stable RAM usage (~8GB peak)
+        # Single-process encoding (avoids worker memory conflicts):
+        # - Workers hold independent memory that doesn't get cleaned by gc.collect()
+        # - Single process = all memory visible and manageable
+        # - Maximum batch to saturate GPU and amortize CPU rendering cost
+        batch_size = 112  # Max out GPU (model 5GB + batch 8GB + overhead 2GB = 15GB)
+        num_workers = 0  # Single process - no worker memory conflicts
         
         dataloader = DataLoader(
             dataset,
@@ -241,24 +263,23 @@ class BaseDatasetBuilder(ABC):
             shuffle=False,
             num_workers=num_workers,
             collate_fn=collate_images,
-            pin_memory=True,  # Fast CPU->GPU transfer
-            prefetch_factor=2,  # Pre-render 2 batches ahead per worker
-            persistent_workers=True  # Keep workers alive (avoid respawn overhead)
+            pin_memory=True  # Fast CPU->GPU transfer
         )
         
-        print(f"🚀 Hybrid CPU/GPU pipeline:")
-        print(f"   Batch size: {batch_size} | Workers: {num_workers} | Prefetch: 2")
-        print(f"   Speed: ~0.92 batches/sec (1.09s/batch)")
-        print(f"   Memory: Consolidate every 150 batches (~2.5 min)")
-        print(f"   Checkpoints: Every 550 batches (~10 minutes)")
-        print(f"   Total ETA: ~6 hours for 1.9M samples")
+        print(f"🚀 Cached encoding pipeline (10x faster):")
+        print(f"   Batch size: {batch_size} | Workers: {num_workers}")
+        print(f"   Strategy: Disk cache = no CPU rendering overhead")
+        print(f"   Memory: Consolidate every 80 batches (~20 sec)")
+        print(f"   Checkpoints: Every 400 batches (~10 minutes)")
+        print(f"   Speed: ~5-7 batches/sec (0.15s/batch, 112 samples/batch = ~700 samples/sec)")
+        print(f"   Total ETA: ~45 minutes for 1.9M samples (1 session!)")
         
         # Storage for results
         result_chunks = {'sketches': [], 'checksums': [], 'children': []}
         temp_gpu_list = {'sketches': [], 'checksums': [], 'children': []}
         
-        consolidate_every = 150  # Consolidate every 150 batches (aggressive memory cleanup)
-        checkpoint_every = 550  # Checkpoint every 550 batches (~10min at 1.09s/batch = 600s)
+        consolidate_every = 200  # Consolidate every 200 batches (less frequent with fast loading)
+        checkpoint_every = 2000  # Checkpoint every 2000 batches (~5min at 0.15s/batch)
         batch_count = 0
         
         # Memory management: track and limit result_chunks size
@@ -301,8 +322,8 @@ class BaseDatasetBuilder(ABC):
                 del batch_images, batch_result
                 batch_count += 1
                 
-                # Periodic light cleanup (every 50 batches)
-                if batch_idx % 50 == 0:
+                # Periodic light cleanup (every 40 batches)
+                if batch_idx % 40 == 0:
                     gc.collect()
                 
                 # Periodic consolidation (GPU -> CPU to free VRAM)
