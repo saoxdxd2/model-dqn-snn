@@ -51,20 +51,34 @@ class StreamingCacheEncoder:
         
         from dataset.image_cache import ImageCache
         
-        # Render in batches
+        # Render in batches (skip already cached)
         batch_size = 1000
         total = len(samples)
         cached_count = 0
+        skipped_count = 0
         
         for i in range(0, total, batch_size):
             batch = samples[i:i+batch_size]
-            self.cache._render_samples_parallel(batch, num_workers=2)
             
-            cached_so_far = i + len(batch)
+            # Filter out already-cached samples
+            uncached = []
+            for sample in batch:
+                text = sample.get('text', '') or sample.get('question', '')
+                if not self.cache.get(text, 224, 224):
+                    uncached.append(sample)
+                else:
+                    skipped_count += 1
+            
+            # Only render uncached samples
+            if uncached:
+                self.cache._render_samples_parallel(uncached, num_workers=2)
+                cached_count += len(uncached)
+            
+            processed_so_far = i + len(batch)
             
             # Progress update
-            if cached_so_far % 50000 == 0:
-                print(f"📦 Producer: {cached_so_far}/{len(samples)} samples cached...")
+            if processed_so_far % 50000 == 0:
+                print(f"📦 Producer: {processed_so_far}/{total} processed ({skipped_count} skipped, {cached_count} rendered)")
             
             # Periodic metadata save
             if (i // batch_size) % 5 == 0:
@@ -73,7 +87,10 @@ class StreamingCacheEncoder:
         # Signal completion
         self.cache_complete.set()
         self.ready_queue.put(None)  # Sentinel to stop consumer
-        print(f"✅ Producer: All {total} samples cached")
+        print(f"✅ Producer: Complete! {total} samples processed")
+        print(f"   {skipped_count} already cached (skipped)")
+        print(f"   {cached_count} newly rendered")
+        print(f"   Cache is now 100% complete")
     
     def consumer_thread(self, samples):
         """
