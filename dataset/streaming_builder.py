@@ -24,7 +24,7 @@ class StreamingCacheEncoder:
     - Queue: Coordinates which batches are ready
     """
     
-    def __init__(self, cache, encoder, device, batch_size=144):
+    def __init__(self, cache, encoder, device, batch_size=192):
         self.cache = cache
         self.encoder = encoder
         self.device = device
@@ -35,8 +35,9 @@ class StreamingCacheEncoder:
         self.stop_flag = threading.Event()
         self.cache_complete = threading.Event()
         
-        # Results
+        # Results (consolidated periodically to save memory)
         self.encoded_results = {'sketches': [], 'checksums': [], 'children': []}
+        self.temp_gpu_results = {'sketches': [], 'checksums': [], 'children': []}
         self.lock = threading.Lock()
         
     def producer_thread(self, samples, renderer, start_threshold=50000):
@@ -134,22 +135,54 @@ class StreamingCacheEncoder:
             dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=2,
             pin_memory=True,
-            prefetch_factor=2
+            prefetch_factor=1  # Reduce prefetch to save RAM
         )
         
-        # Encode batches
+        # Encode batches with periodic consolidation
+        import gc
+        batch_count = 0
+        consolidate_every = 50  # Consolidate every 50 batches (192*50=9600 samples)
+        
         with torch.no_grad():
             for batch_images in tqdm(dataloader, desc="GPU Encoding"):
                 batch_images = batch_images.to(self.device)
                 result = self.encoder(images=batch_images, return_children=True)
                 
-                # Store results
-                with self.lock:
-                    for key in self.encoded_results:
-                        if key in result and result[key] is not None:
-                            self.encoded_results[key].append(result[key].cpu())
+                # Accumulate on GPU first
+                for key in self.temp_gpu_results:
+                    if key in result and result[key] is not None:
+                        self.temp_gpu_results[key].append(result[key])
+                
+                del batch_images, result
+                batch_count += 1
+                
+                # Periodic consolidation (GPU -> CPU, free VRAM)
+                if batch_count % consolidate_every == 0:
+                    with self.lock:
+                        for key in self.temp_gpu_results:
+                            if self.temp_gpu_results[key]:
+                                consolidated = torch.cat(self.temp_gpu_results[key], dim=0)
+                                self.encoded_results[key].append(consolidated.half().cpu())
+                                self.temp_gpu_results[key].clear()
+                                del consolidated
+                    
+                    # Aggressive cleanup
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                
+                # Light cleanup every 20 batches
+                if batch_count % 20 == 0:
+                    gc.collect()
+        
+        # Final consolidation
+        with self.lock:
+            for key in self.temp_gpu_results:
+                if self.temp_gpu_results[key]:
+                    consolidated = torch.cat(self.temp_gpu_results[key], dim=0)
+                    self.encoded_results[key].append(consolidated.half().cpu())
+                    self.temp_gpu_results[key].clear()
         
         print(f"✅ Consumer: Encoding complete")
     
@@ -169,6 +202,8 @@ class StreamingCacheEncoder:
         print(f"🌊 STREAMING PIPELINE")
         print(f"   CPU: Rendering {len(samples)} samples")
         print(f"   GPU: Encoding starts after {start_threshold} cached")
+        print(f"   Batch size: {self.batch_size} (large batches move data to GPU, reduce RAM)")
+        print(f"   Memory: Consolidates every 50 batches (~9.6k samples to CPU)")
         print(f"   Strategy: Overlap for maximum throughput")
         print(f"{'='*70}\n")
         
