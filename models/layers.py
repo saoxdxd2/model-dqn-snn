@@ -24,6 +24,12 @@ except ImportError:
 
 if not FLASH_ATTN_AVAILABLE:
     from torch.nn.functional import scaled_dot_product_attention
+    # Enable memory-efficient attention for T4 (faster than default SDPA)
+    import torch.backends.cuda
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_flash_sdp(False)  # Not available on T4
+        torch.backends.cuda.enable_math_sdp(False)  # Slowest fallback
 
 from models.common import trunc_normal_init_
 

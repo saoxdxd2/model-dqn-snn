@@ -115,7 +115,7 @@ class ImageCache:
         return results
     
     def populate_cache(self, samples, renderer=None, batch_size=1000, save_every=5, num_workers=None):
-        """Pre-populate cache with parallel rendering (4-8x faster)."""
+        """Pre-populate cache with parallel rendering (2-3x faster)."""
         if num_workers is None:
             num_workers = max(1, cpu_count() - 1)  # Leave 1 core free
         
@@ -126,16 +126,16 @@ class ImageCache:
         rendered = 0
         batch_count = 0
         
-        # Prepare args for parallel processing
-        args_list = [(sample, 224, 224) for sample in samples]
+        # Process in smaller chunks with multiprocessing for better progress tracking
+        chunk_size = batch_size  # Process 1000 samples at a time
         
-        # Process in batches with multiprocessing
         with Pool(num_workers) as pool:
-            for i in tqdm(range(0, total, batch_size), desc="Caching"):
-                batch_args = args_list[i:i+batch_size]
+            for i in tqdm(range(0, total, chunk_size), desc="Caching"):
+                chunk = samples[i:i+chunk_size]
+                args_list = [(sample, 224, 224) for sample in chunk]
                 
-                # Parallel render batch
-                results = pool.map(self._render_sample, batch_args)
+                # Parallel render this chunk (blocks until done)
+                results = pool.map(self._render_sample, args_list, chunksize=50)
                 
                 # Save rendered images
                 for img_array, text in results:
@@ -147,7 +147,7 @@ class ImageCache:
                 
                 batch_count += 1
                 
-                # Save metadata periodically
+                # Save metadata periodically (every 5k samples)
                 if batch_count % save_every == 0:
                     self._save_metadata()
         
