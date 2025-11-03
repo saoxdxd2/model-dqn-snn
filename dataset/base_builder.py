@@ -240,7 +240,9 @@ class BaseDatasetBuilder(ABC):
             print(f"   GPU starts after 50k samples cached (~5 min)")
             
             from dataset.streaming_builder import StreamingCacheEncoder
-            streamer = StreamingCacheEncoder(cache, self.encoder, device, batch_size=192)
+            checkpoint_dir = str(Path(self.config.output_dir) / "stream_checkpoints")
+            Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+            streamer = StreamingCacheEncoder(cache, self.encoder, device, batch_size=256, checkpoint_dir=checkpoint_dir)
             return streamer.stream_build(samples, self.text_renderer, start_threshold=50000)
         else:
             print(f"💾 Using STANDARD mode (cache complete)")

@@ -24,20 +24,20 @@ class StreamingCacheEncoder:
     - Queue: Coordinates which batches are ready
     """
     
-    def __init__(self, cache, encoder, device, batch_size=192):
+    def __init__(self, cache, encoder, device, batch_size=256, checkpoint_dir=None):
         self.cache = cache
         self.encoder = encoder
         self.device = device
         self.batch_size = batch_size
+        self.checkpoint_dir = checkpoint_dir
         
         # Coordination
         self.ready_queue = queue.Queue(maxsize=10)  # Batches ready to encode
         self.stop_flag = threading.Event()
         self.cache_complete = threading.Event()
         
-        # Results (consolidated periodically to save memory)
-        self.encoded_results = {'sketches': [], 'checksums': [], 'children': []}
-        self.temp_gpu_results = {'sketches': [], 'checksums': [], 'children': []}
+        # Direct-to-disk mode (no RAM accumulation)
+        self.batch_files = []  # Track individual batch files
         self.lock = threading.Lock()
         
     def producer_thread(self, samples, renderer, start_threshold=50000):
@@ -140,49 +140,40 @@ class StreamingCacheEncoder:
             prefetch_factor=1  # Reduce prefetch to save RAM
         )
         
-        # Encode batches with periodic consolidation
+        # Encode batches - save each directly to disk (no RAM accumulation)
         import gc
+        import os
         batch_count = 0
-        consolidate_every = 50  # Consolidate every 50 batches (192*50=9600 samples)
         
         with torch.no_grad():
             for batch_images in tqdm(dataloader, desc="GPU Encoding"):
                 batch_images = batch_images.to(self.device)
                 result = self.encoder(images=batch_images, return_children=True)
                 
-                # Accumulate on GPU first
-                for key in self.temp_gpu_results:
-                    if key in result and result[key] is not None:
-                        self.temp_gpu_results[key].append(result[key])
+                # Save this batch immediately to disk (GPU -> Disk)
+                if self.checkpoint_dir:
+                    batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_count:05d}.pt")
+                    batch_data = {
+                        'sketches': result['sketches'].half().cpu(),
+                        'checksums': result['checksums'].half().cpu() if 'checksums' in result else None,
+                        'children': result['children'].half().cpu() if 'children' in result else None
+                    }
+                    torch.save(batch_data, batch_file)
+                    
+                    with self.lock:
+                        self.batch_files.append(batch_file)
                 
-                del batch_images, result
+                del batch_images, result, batch_data
                 batch_count += 1
                 
-                # Periodic consolidation (GPU -> CPU, free VRAM)
-                if batch_count % consolidate_every == 0:
-                    with self.lock:
-                        for key in self.temp_gpu_results:
-                            if self.temp_gpu_results[key]:
-                                consolidated = torch.cat(self.temp_gpu_results[key], dim=0)
-                                self.encoded_results[key].append(consolidated.half().cpu())
-                                self.temp_gpu_results[key].clear()
-                                del consolidated
-                    
-                    # Aggressive cleanup
+                # Cleanup every 10 batches
+                if batch_count % 10 == 0:
                     gc.collect()
                     torch.cuda.empty_cache()
                 
-                # Light cleanup every 20 batches
-                if batch_count % 20 == 0:
-                    gc.collect()
-        
-        # Final consolidation
-        with self.lock:
-            for key in self.temp_gpu_results:
-                if self.temp_gpu_results[key]:
-                    consolidated = torch.cat(self.temp_gpu_results[key], dim=0)
-                    self.encoded_results[key].append(consolidated.half().cpu())
-                    self.temp_gpu_results[key].clear()
+                # Progress checkpoint every 500 batches
+                if batch_count % 500 == 0:
+                    print(f"💾 Saved {batch_count} batches to disk (RAM usage: minimal)")
         
         print(f"✅ Consumer: Encoding complete")
     
@@ -199,12 +190,13 @@ class StreamingCacheEncoder:
             Encoded results dict
         """
         print(f"\n{'='*70}")
-        print(f"🌊 STREAMING PIPELINE")
+        print(f"🌊 STREAMING PIPELINE (Direct-to-Disk)")
         print(f"   CPU: Rendering {len(samples)} samples")
         print(f"   GPU: Encoding starts after {start_threshold} cached")
-        print(f"   Batch size: {self.batch_size} (large batches move data to GPU, reduce RAM)")
-        print(f"   Memory: Consolidates every 50 batches (~9.6k samples to CPU)")
-        print(f"   Strategy: Overlap for maximum throughput")
+        print(f"   Batch size: {self.batch_size}")
+        print(f"   Memory: Each batch saved directly to disk (minimal RAM)")
+        print(f"   Batch files: {self.checkpoint_dir}")
+        print(f"   Strategy: GPU -> Disk (no RAM accumulation)")
         print(f"{'='*70}\n")
         
         # Start producer thread
@@ -225,12 +217,52 @@ class StreamingCacheEncoder:
         producer.join()
         consumer.join()
         
-        # Consolidate results
+        # Load all batch files from disk and concatenate
+        import os
+        import gc
+        
+        print(f"\n📚 Loading {len(self.batch_files)} batches from disk...")
+        all_results = {'sketches': [], 'checksums': [], 'children': []}
+        
+        # Load in chunks to avoid RAM spike
+        chunk_size = 100  # Load 100 batches at a time
+        for i in range(0, len(self.batch_files), chunk_size):
+            chunk_files = self.batch_files[i:i+chunk_size]
+            chunk_data = {'sketches': [], 'checksums': [], 'children': []}
+            
+            for batch_file in chunk_files:
+                if os.path.exists(batch_file):
+                    batch = torch.load(batch_file, map_location='cpu')
+                    for key in chunk_data:
+                        if key in batch and batch[key] is not None:
+                            chunk_data[key].append(batch[key])
+                    del batch
+            
+            # Concatenate this chunk
+            for key in chunk_data:
+                if chunk_data[key]:
+                    all_results[key].append(torch.cat(chunk_data[key], dim=0))
+            
+            del chunk_data
+            gc.collect()
+            
+            if (i + chunk_size) % 500 == 0:
+                print(f"  Loaded {min(i+chunk_size, len(self.batch_files))}/{len(self.batch_files)} batches")
+        
+        # Final concatenation
+        print(f"⚙️  Final concatenation...")
         result = {}
-        for key, chunks in self.encoded_results.items():
+        for key, chunks in all_results.items():
             if chunks:
-                result[key] = torch.cat(chunks, dim=0)
+                result[key] = torch.cat(chunks, dim=0).float()  # Convert back to FP32
             else:
                 result[key] = torch.empty(0)
         
+        # Cleanup batch files
+        print(f"🧹 Cleaning up {len(self.batch_files)} batch files...")
+        for batch_file in self.batch_files:
+            if os.path.exists(batch_file):
+                os.remove(batch_file)
+        
+        print(f"✅ Complete! Final shape: {result['sketches'].shape}")
         return result
