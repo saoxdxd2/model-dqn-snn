@@ -187,29 +187,27 @@ class StreamingCacheEncoder:
                 consolidated[key] = torch.cat(chunk_data[key], dim=0)
         del chunk_data
         
-        # Save to Drive (compressed)
+        # Save to Drive (will sync to user's local machine automatically)
         chunk_idx = len(self.drive_checkpoints)
-        drive_file = os.path.join(self.drive_dir, f"encoding_chunk_{chunk_idx:03d}.pt")
+        drive_file = os.path.join(self.drive_dir, f"consolidated_{chunk_idx:03d}.pt")
+        
         torch.save(consolidated, drive_file)
-        
-        # Delete previous Drive chunk (keep only latest)
-        if self.drive_checkpoints:
-            prev_chunk = self.drive_checkpoints[-1]
-            if os.path.exists(prev_chunk):
-                os.remove(prev_chunk)
-                print(f"🧹 Deleted previous chunk from Drive (freed space)")
-        
         self.drive_checkpoints.append(drive_file)
         del consolidated
         
-        # Delete local batch files to free disk space
-        for batch_file in batch_subset:
-            if os.path.exists(batch_file):
-                os.remove(batch_file)
+        # Note: Keep on Drive - will sync to C:\Users\sao\Documents\model-engine
+        # Once synced to local machine, user can manually delete from Drive if needed
+        
+        # Keep consolidated chunks on Drive, don't delete from Drive
+        print(f"✅ Saved chunk {chunk_idx} to Drive - will sync to local machine")
+        print(f"   Drive location: {self.drive_dir}")
+        print(f"   Will sync to: C:\\Users\\sao\\Documents\\model-engine")
+        print(f"   You can delete from Drive after confirming sync completed")
         
         gc.collect()
         chunk_size_mb = os.path.getsize(drive_file) / 1024 / 1024
-        print(f"✅ Saved chunk {chunk_idx} to Drive ({chunk_size_mb:.1f}MB), freed {len(batch_subset)} batch files")
+        print(f"✅ Saved chunk {chunk_idx} to Drive ({chunk_size_mb:.1f}MB) - will sync to local machine")
+        print(f"   Freed {len(batch_subset)} batch files from Colab")
     
     def stream_build(self, samples, renderer, start_threshold=50000):
         """
@@ -250,32 +248,29 @@ class StreamingCacheEncoder:
         producer.join()
         consumer.join()
         
-        # Consolidate any remaining batches to Drive
+        # Consolidate any remaining batches
         import os
         import gc
         
         if self.drive_dir:
             remaining_batches = len(self.batch_files) - (len(self.drive_checkpoints) * 1000)
             if remaining_batches > 0:
-                print(f"\n📤 Consolidating final {remaining_batches} batches to Drive...")
+                print(f"\n📤 Consolidating final {remaining_batches} batches...")
                 self._consolidate_to_drive(len(self.batch_files))
         
-        # Load from Drive (only the final chunk remains - previous deleted)
-        print(f"\n📚 Loading final chunk from Drive...")
+        # Load from local consolidated files
+        print(f"\n📚 Loading {len(self.drive_checkpoints)} consolidated chunks from local disk...")
         all_results = {'sketches': [], 'checksums': [], 'children': []}
         
-        if self.drive_checkpoints:
-            final_chunk = self.drive_checkpoints[-1]  # Only last chunk exists
-            if os.path.exists(final_chunk):
-                chunk = torch.load(final_chunk, map_location='cpu')
+        for i, chunk_file in enumerate(self.drive_checkpoints):
+            if os.path.exists(chunk_file):
+                chunk = torch.load(chunk_file, map_location='cpu')
                 for key in all_results:
                     if key in chunk:
                         all_results[key].append(chunk[key])
                 del chunk
                 gc.collect()
-                print(f"  ✅ Loaded final chunk ({os.path.getsize(final_chunk)/1024/1024:.1f}MB)")
-            else:
-                print(f"  ⚠️  Warning: Final chunk not found at {final_chunk}")
+                print(f"  Loaded chunk {i+1}/{len(self.drive_checkpoints)}")
         
         # Final concatenation
         print(f"⚙️  Final concatenation...")
@@ -286,21 +281,18 @@ class StreamingCacheEncoder:
             else:
                 result[key] = torch.empty(0)
         
-        # Cleanup any remaining batch files
+        # Cleanup any remaining batch files from Colab
         remaining_files = [f for f in self.batch_files if os.path.exists(f)]
         if remaining_files:
-            print(f"🧹 Cleaning up {len(remaining_files)} remaining batch files...")
+            print(f"🧹 Cleaning up {len(remaining_files)} remaining batch files from Colab...")
             for batch_file in remaining_files:
                 os.remove(batch_file)
         
-        # Clean up final Drive chunk
-        if self.drive_checkpoints:
-            final_chunk = self.drive_checkpoints[-1]
-            if os.path.exists(final_chunk):
-                os.remove(final_chunk)
-                print(f"🧹 Cleaned up final Drive chunk")
-        
-        print(f"💾 Drive storage freed (all temp chunks deleted)")
+        # Keep Drive chunks - they will sync to local machine
+        print(f"💾 Kept {len(self.drive_checkpoints)} chunks in Drive (syncing to local machine)")
+        print(f"   Drive location: {self.drive_dir}")
+        print(f"   Will sync to: C:\\Users\\sao\\Documents\\model-engine")
+        print(f"   You can delete from Drive after confirming sync completed")
         
         print(f"✅ Complete! Final shape: {result['sketches'].shape}")
         return result

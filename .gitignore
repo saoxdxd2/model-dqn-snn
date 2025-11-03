@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Dataset files
+datasets/
+*.pt
+*.pth
+*.npy
+*.npz
+
+# Consolidated encoding chunks (large files - synced via Drive)
+consolidated_*.pt
+encoding_chunk_*.pt
+recovery_checkpoint.pt
+stream_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
