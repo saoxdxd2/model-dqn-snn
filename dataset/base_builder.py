@@ -170,6 +170,19 @@ class BaseDatasetBuilder(ABC):
             'metadata': self.create_metadata(train_encoded)
         }
     
+    def _sample_is_cached(self, sample, cache):
+        """Check if a sample is already in cache."""
+        if hasattr(sample, 'text'):
+            text = sample.text
+        elif hasattr(sample, 'question'):
+            text = sample.question
+        elif isinstance(sample, dict):
+            text = sample.get('text', '') or sample.get('question', '')
+        else:
+            text = str(sample)
+        
+        return cache.get(text, 224, 224) is not None
+    
     def _init_encoder(self):
         """Initialize CapsuleEncoder (shared by all encoding methods)."""
         if self.encoder is None:
@@ -188,7 +201,7 @@ class BaseDatasetBuilder(ABC):
             self.encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
     
     def _stream_encode_capsules(self, samples: List[DataSample]):
-        """Fast encoding with disk-cached text images."""
+        """Fast encoding with disk-cached text images (streaming mode available)."""
         if len(samples) == 0:
             return {'sketches': torch.empty(0, getattr(self.config, 'target_capsules', 12), getattr(self.config, 'hidden_size', 768))}
         
@@ -206,13 +219,30 @@ class BaseDatasetBuilder(ABC):
         from pathlib import Path
         cache = ImageCache(cache_dir=str(Path(self.config.output_dir) / "text_cache"))
         
-        # Pre-populate cache (one-time cost, then instant)
-        print("🗂️  Checking image cache...")
-        cached_count, rendered_count = cache.populate_cache(samples, self.text_renderer)
+        # Check if we should use streaming mode
+        use_streaming = getattr(self.config, 'streaming_mode', True)  # Default ON
         
-        if rendered_count > 0:
-            print(f"✅ Rendered {rendered_count} new images (one-time cost)")
-        print(f"✅ Using {cached_count + rendered_count} cached images (10x faster than re-rendering)")
+        print("🗂️  Checking image cache...")
+        
+        # Check how many samples already cached
+        existing_cached = sum(1 for s in samples[:1000] if self._sample_is_cached(s, cache))
+        cache_hit_rate = existing_cached / min(1000, len(samples))
+        
+        # Use streaming if cache is incomplete (hit rate < 90%)
+        if use_streaming and cache_hit_rate < 0.9:
+            print(f"🌊 Using STREAMING mode (cache {cache_hit_rate*100:.0f}% complete)")
+            print(f"   CPU renders + GPU encodes simultaneously")
+            
+            from dataset.streaming_builder import StreamingCacheEncoder
+            streamer = StreamingCacheEncoder(cache, self.encoder, device, batch_size=144)
+            return streamer.stream_build(samples, self.text_renderer, start_threshold=50000)
+        else:
+            print(f"💾 Using STANDARD mode (cache {cache_hit_rate*100:.0f}% complete)")
+            cached_count, rendered_count = cache.populate_cache(samples, self.text_renderer)
+        
+            if rendered_count > 0:
+                print(f"✅ Rendered {rendered_count} new images (one-time cost)")
+            print(f"✅ Using {cached_count + rendered_count} cached images (10x faster than re-rendering)")
         
         # Force garbage collection before starting
         gc.collect()

@@ -105,6 +105,15 @@ class ImageCache:
         
         return img_array, text
     
+    def _render_samples_parallel(self, samples, num_workers=2):
+        """Render samples in parallel (helper for streaming)."""
+        args_list = [(sample, 224, 224) for sample in samples]
+        
+        with Pool(num_workers) as pool:
+            results = pool.map(self._render_sample, args_list)
+        
+        return results
+    
     def populate_cache(self, samples, renderer=None, batch_size=1000, save_every=5, num_workers=None):
         """Pre-populate cache with parallel rendering (4-8x faster)."""
         if num_workers is None:
