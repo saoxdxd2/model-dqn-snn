@@ -117,7 +117,7 @@ class ImageCache:
     def populate_cache(self, samples, renderer=None, batch_size=1000, save_every=5, num_workers=None):
         """Pre-populate cache with parallel rendering (2-3x faster)."""
         if num_workers is None:
-            num_workers = max(1, cpu_count() - 1)  # Leave 1 core free
+            num_workers = cpu_count()  # Use all cores for rendering
         
         print(f"📦 Pre-populating image cache (parallel: {num_workers} workers)...")
         

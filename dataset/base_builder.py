@@ -224,20 +224,26 @@ class BaseDatasetBuilder(ABC):
         
         print("🗂️  Checking image cache...")
         
-        # Check how many samples already cached
-        existing_cached = sum(1 for s in samples[:1000] if self._sample_is_cached(s, cache))
-        cache_hit_rate = existing_cached / min(1000, len(samples))
+        # Sample across entire dataset to check cache status (not just first 1000)
+        import random
+        sample_size = min(1000, len(samples))
+        sample_indices = random.sample(range(len(samples)), sample_size)
+        existing_cached = sum(1 for idx in sample_indices if self._sample_is_cached(samples[idx], cache))
+        cache_hit_rate = existing_cached / sample_size
         
-        # Use streaming if cache is incomplete (hit rate < 90%)
-        if use_streaming and cache_hit_rate < 0.9:
-            print(f"🌊 Using STREAMING mode (cache {cache_hit_rate*100:.0f}% complete)")
-            print(f"   CPU renders + GPU encodes simultaneously")
+        print(f"📊 Cache status: {cache_hit_rate*100:.0f}% ({existing_cached}/{sample_size} samples)")
+        
+        # Always use streaming for first run to utilize GPU immediately
+        if use_streaming and cache_hit_rate < 0.95:
+            print(f"🌊 Using STREAMING mode (cache incomplete)")
+            print(f"   Strategy: CPU renders + GPU encodes simultaneously")
+            print(f"   GPU starts after 50k samples cached (~5 min)")
             
             from dataset.streaming_builder import StreamingCacheEncoder
             streamer = StreamingCacheEncoder(cache, self.encoder, device, batch_size=144)
             return streamer.stream_build(samples, self.text_renderer, start_threshold=50000)
         else:
-            print(f"💾 Using STANDARD mode (cache {cache_hit_rate*100:.0f}% complete)")
+            print(f"💾 Using STANDARD mode (cache complete)")
             cached_count, rendered_count = cache.populate_cache(samples, self.text_renderer)
         
             if rendered_count > 0:
