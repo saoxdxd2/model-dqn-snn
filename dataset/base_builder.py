@@ -188,7 +188,7 @@ class BaseDatasetBuilder(ABC):
             self.encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
     
     def _stream_encode_capsules(self, samples: List[DataSample]):
-        """Hybrid CPU/GPU encoding: parallel text rendering + large GPU batches."""
+        """Hybrid CPU/GPU encoding with aggressive memory management."""
         if len(samples) == 0:
             return {'sketches': torch.empty(0, getattr(self.config, 'target_capsules', 12), getattr(self.config, 'hidden_size', 768))}
         
@@ -198,6 +198,13 @@ class BaseDatasetBuilder(ABC):
         
         from torch.utils.data import Dataset, DataLoader
         from tqdm import tqdm
+        import gc
+        import os
+        
+        # Force garbage collection before starting
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         # Custom collate function to handle numpy arrays -> PyTorch tensors (CHW format)
         def collate_images(batch):
@@ -242,6 +249,7 @@ class BaseDatasetBuilder(ABC):
         print(f"🚀 Hybrid CPU/GPU pipeline:")
         print(f"   Batch size: {batch_size} | Workers: {num_workers} | Prefetch: 2")
         print(f"   Speed: ~0.92 batches/sec (1.09s/batch)")
+        print(f"   Memory: Consolidate every 150 batches (~2.5 min)")
         print(f"   Checkpoints: Every 550 batches (~10 minutes)")
         print(f"   Total ETA: ~6 hours for 1.9M samples")
         
@@ -249,9 +257,12 @@ class BaseDatasetBuilder(ABC):
         result_chunks = {'sketches': [], 'checksums': [], 'children': []}
         temp_gpu_list = {'sketches': [], 'checksums': [], 'children': []}
         
-        consolidate_every = 200  # Consolidate every 200 batches (prevent VRAM buildup)
+        consolidate_every = 150  # Consolidate every 150 batches (aggressive memory cleanup)
         checkpoint_every = 550  # Checkpoint every 550 batches (~10min at 1.09s/batch = 600s)
         batch_count = 0
+        
+        # Memory management: track and limit result_chunks size
+        max_cpu_chunks = 3  # Keep max 3 chunks in CPU RAM before saving intermediate
         
         # Check for existing checkpoint to resume
         from pathlib import Path
@@ -290,19 +301,40 @@ class BaseDatasetBuilder(ABC):
                 del batch_images, batch_result
                 batch_count += 1
                 
+                # Periodic light cleanup (every 50 batches)
+                if batch_idx % 50 == 0:
+                    gc.collect()
+                
                 # Periodic consolidation (GPU -> CPU to free VRAM)
                 if batch_count >= consolidate_every:
+                    # Consolidate GPU tensors to CPU
                     for key in temp_gpu_list:
                         if temp_gpu_list[key]:
                             consolidated = torch.cat(temp_gpu_list[key], dim=0)
                             result_chunks[key].append(consolidated.half().cpu())
                             temp_gpu_list[key].clear()
+                            del consolidated  # Explicit cleanup
                     
                     batch_count = 0
-                    torch.cuda.empty_cache()
+                    
+                    # Aggressive memory cleanup
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    
+                    # If CPU RAM chunks getting too large, consolidate them too
+                    for key in result_chunks:
+                        if len(result_chunks[key]) > max_cpu_chunks:
+                            # Merge CPU chunks to free fragmented memory
+                            merged = torch.cat(result_chunks[key], dim=0)
+                            result_chunks[key] = [merged]
+                            gc.collect()
                     
                     # Save checkpoint
                     if batch_idx > 0 and batch_idx % checkpoint_every == 0:
+                        # Force memory cleanup before checkpoint
+                        gc.collect()
+                        
                         print(f"\n💾 Checkpoint at batch {batch_idx}/{len(dataloader)}...")
                         torch.save({
                             'result_chunks': result_chunks,
@@ -323,16 +355,20 @@ class BaseDatasetBuilder(ABC):
                         except:
                             pass
                         
-                        torch.cuda.empty_cache()
+                        # Aggressive cleanup after checkpoint
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
         
         # Final consolidation of remaining batches
         for key in temp_gpu_list:
             if temp_gpu_list[key]:
                 consolidated = torch.cat(temp_gpu_list[key], dim=0)
-                # Convert to fp16 immediately (2x memory reduction)
                 result_chunks[key].append(consolidated.half().cpu())
+                del consolidated
         
         del temp_gpu_list
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
