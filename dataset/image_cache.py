@@ -11,6 +11,7 @@ import pickle
 from pathlib import Path
 from typing import Optional
 from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
 
 
 class ImageCache:
@@ -75,45 +76,71 @@ class ImageCache:
             'path': str(cache_path)
         }
     
-    def populate_cache(self, samples, renderer, batch_size=1000, save_every=5):
-        """Pre-populate cache with all samples (saves every 5k samples = ~40 sec)."""
-        print(f"📦 Pre-populating image cache...")
+    def _render_sample(self, args):
+        """Helper for parallel rendering (must be picklable)."""
+        sample, width, height = args
+        
+        # Extract text
+        if hasattr(sample, 'text'):
+            text = sample.text
+        elif hasattr(sample, 'question'):
+            text = sample.question
+        elif isinstance(sample, dict):
+            text = sample.get('text', '') or sample.get('question', '') or str(sample)
+        else:
+            text = str(sample)
+        
+        # Check if already cached
+        cache_key = self._get_cache_key(text, width, height)
+        cache_path = self._get_cache_path(cache_key)
+        
+        if cache_path.exists():
+            return None, text  # Already cached
+        
+        # Render (create renderer in worker process)
+        from models.text_renderer import TextRenderer
+        renderer = TextRenderer(width=width, height=height)
+        pil_img = renderer.render_plain_text(text)
+        img_array = np.array(pil_img)
+        
+        return img_array, text
+    
+    def populate_cache(self, samples, renderer=None, batch_size=1000, save_every=5, num_workers=None):
+        """Pre-populate cache with parallel rendering (4-8x faster)."""
+        if num_workers is None:
+            num_workers = max(1, cpu_count() - 1)  # Leave 1 core free
+        
+        print(f"📦 Pre-populating image cache (parallel: {num_workers} workers)...")
         
         total = len(samples)
         cached = 0
         rendered = 0
         batch_count = 0
         
-        for i in tqdm(range(0, total, batch_size), desc="Caching"):
-            batch = samples[i:i+batch_size]
-            
-            for sample in batch:
-                # Handle both dict and Pydantic DataSample objects
-                if hasattr(sample, 'text'):
-                    text = sample.text
-                elif hasattr(sample, 'question'):
-                    text = sample.question
-                elif isinstance(sample, dict):
-                    text = sample.get('text', '') or sample.get('question', '') or str(sample)
-                else:
-                    text = str(sample)
+        # Prepare args for parallel processing
+        args_list = [(sample, 224, 224) for sample in samples]
+        
+        # Process in batches with multiprocessing
+        with Pool(num_workers) as pool:
+            for i in tqdm(range(0, total, batch_size), desc="Caching"):
+                batch_args = args_list[i:i+batch_size]
                 
-                # Check cache
-                cached_img = self.get(text, 224, 224)
-                if cached_img is not None:
-                    cached += 1
-                else:
-                    # Render and cache (PIL Image -> numpy array)
-                    pil_img = renderer.render_plain_text(text)
-                    img_array = np.array(pil_img)
-                    self.put(text, 224, 224, img_array)
-                    rendered += 1
-            
-            batch_count += 1
-            
-            # Save metadata periodically (every 5 batches = 5k samples = ~40 sec)
-            if batch_count % save_every == 0:
-                self._save_metadata()
+                # Parallel render batch
+                results = pool.map(self._render_sample, batch_args)
+                
+                # Save rendered images
+                for img_array, text in results:
+                    if img_array is None:
+                        cached += 1
+                    else:
+                        self.put(text, 224, 224, img_array)
+                        rendered += 1
+                
+                batch_count += 1
+                
+                # Save metadata periodically
+                if batch_count % save_every == 0:
+                    self._save_metadata()
         
         # Final metadata save
         self._save_metadata()
