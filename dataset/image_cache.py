@@ -102,9 +102,10 @@ class ImageCache:
                 if cached_img is not None:
                     cached += 1
                 else:
-                    # Render and cache
-                    img = renderer.render(text)
-                    self.put(text, 224, 224, img)
+                    # Render and cache (PIL Image -> numpy array)
+                    pil_img = renderer.render_plain_text(text)
+                    img_array = np.array(pil_img)
+                    self.put(text, 224, 224, img_array)
                     rendered += 1
         
         # Save metadata
