@@ -216,10 +216,21 @@ class BaseDatasetBuilder(ABC):
         import gc
         import os
         
-        # Initialize image cache
+        # Initialize image cache (on Drive so it syncs to local 2TB SSD)
         from dataset.image_cache import ImageCache
         from pathlib import Path
-        cache = ImageCache(cache_dir=str(Path(self.config.output_dir) / "text_cache"))
+        import os
+        
+        # Use Drive path if available, otherwise local
+        if os.path.exists("/content/drive/MyDrive"):
+            cache_dir = "/content/drive/MyDrive/model_checkpoints/text_cache"
+            print(f"💾 Using Drive for text cache (will sync to 2TB SSD)")
+            print(f"   Cache: {cache_dir}")
+        else:
+            cache_dir = str(Path(self.config.output_dir) / "text_cache")
+            print(f"⚠️  Drive not mounted, using local cache (session-only)")
+        
+        cache = ImageCache(cache_dir=cache_dir)
         
         # Check if we should use streaming mode
         use_streaming = getattr(self.config, 'streaming_mode', True)  # Default ON
