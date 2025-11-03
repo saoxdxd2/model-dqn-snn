@@ -238,7 +238,16 @@ class BaseDatasetBuilder(ABC):
             
             def __getitem__(self, idx):
                 sample = self.samples[idx]
-                text = sample.get('text', '') or sample.get('question', '') or str(sample)
+                
+                # Handle both dict and Pydantic DataSample objects
+                if hasattr(sample, 'text'):
+                    text = sample.text
+                elif hasattr(sample, 'question'):
+                    text = sample.question
+                elif isinstance(sample, dict):
+                    text = sample.get('text', '') or sample.get('question', '') or str(sample)
+                else:
+                    text = str(sample)
                 
                 # Try cache first (instant)
                 cached_img = self.cache.get(text, 224, 224)

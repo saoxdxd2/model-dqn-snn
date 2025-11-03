@@ -87,7 +87,15 @@ class ImageCache:
             batch = samples[i:i+batch_size]
             
             for sample in batch:
-                text = sample.get('text', '') or sample.get('question', '') or str(sample)
+                # Handle both dict and Pydantic DataSample objects
+                if hasattr(sample, 'text'):
+                    text = sample.text
+                elif hasattr(sample, 'question'):
+                    text = sample.question
+                elif isinstance(sample, dict):
+                    text = sample.get('text', '') or sample.get('question', '') or str(sample)
+                else:
+                    text = str(sample)
                 
                 # Check cache
                 cached_img = self.get(text, 224, 224)
