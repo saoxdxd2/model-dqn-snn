@@ -28,17 +28,16 @@ else:
 
 
 
-
-    # === Complete Colab Setup with Image Cache ===
+# === Complete Colab Setup - Syncs with E:\model_checkpoints ===
 import os, shutil
 from pathlib import Path
 
-# 1. Mount Drive
+# 1. Mount Drive (configured to sync to E:\model_checkpoints on your PC)
 try:
     from google.colab import drive
     drive.mount('/content/drive', force_remount=False)
-    os.makedirs('/content/drive/MyDrive/model-dqn-snn', exist_ok=True)
-    print("✅ Drive mounted")
+    os.makedirs('/content/drive/MyDrive/model_checkpoints', exist_ok=True)
+    print("✅ Drive mounted (syncs to E:\\model_checkpoints)")
 except: 
     print("⚠️  Drive mount failed")
 
@@ -54,40 +53,38 @@ else:
     %cd model-dqn-snn
     print("✅ Repo cloned")
 
-# 3. Restore encoding checkpoint from Drive
-drive_ckpt = Path('/content/drive/MyDrive/model-dqn-snn/encoding_checkpoint.pt')
-local_ckpt = Path('datasets/vision_unified/encoding_checkpoint.pt')
-if drive_ckpt.exists():
-    local_ckpt.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(drive_ckpt, local_ckpt)
-    try:
-        import torch
-        ckpt = torch.load(local_ckpt, map_location='cpu')
-        progress = ckpt['batch_count'] / ckpt['total_batches'] * 100
-        print(f"✅ Restored checkpoint: {progress:.1f}% complete")
-    except:
-        print("✅ Checkpoint restored")
-else:
-    print("ℹ️  Starting fresh")
+# 3. Restore data from Drive (syncs from E:\model_checkpoints)
+print("📦 Checking Drive for cached data (synced from E:\\model_checkpoints)...")
 
-# 4. Restore image cache from Drive (critical for speed!)
-drive_cache = Path('/content/drive/MyDrive/model-dqn-snn/text_cache')
+# Text cache (rendered images)
+drive_cache = Path('/content/drive/MyDrive/model_checkpoints/text_cache')
 local_cache = Path('datasets/vision_unified/text_cache')
+
 if drive_cache.exists():
-    print("📦 Restoring image cache from Drive...")
+    cache_files = list(drive_cache.glob('*.png'))
+    print(f"   Found text cache: {len(cache_files)} images")
+    print("   Restoring to Colab...")
+    local_cache.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(drive_cache, local_cache, dirs_exist_ok=True)
     print("✅ Cache restored (encoding will be 10x faster)")
 else:
-    print("ℹ️  No cache yet (first run will populate it)")
+    print("ℹ️  No cache yet (first run will populate and sync to E:\\)")
 
-# 5. Install dependencies
+# Check for encoding chunks
+drive_chunks = Path('/content/drive/MyDrive/model_checkpoints/encoding_progress')
+if drive_chunks.exists():
+    chunks = list(drive_chunks.glob('consolidated_*.pt'))
+    if chunks:
+        print(f"📚 Found {len(chunks)} encoding chunks (synced from E:\\)")
+
+# 4. Install dependencies
 !pip install -q --no-cache-dir -r requirements.txt
 
-# 6. Start training
+# 5. Start training
 print("\n" + "="*70)
-print("🚀 Starting training with cached pipeline")
-print("   First run: ~60 min (populate cache + encode)")
-print("   Later runs: ~45 min (instant cache load)")
-print("   Saves every 2000 batches to Drive")
+print("🚀 Starting training with Drive↔E:\\ sync")
+print("   First run: Populate cache → Sync to E:\\model_checkpoints")
+print("   Later runs: Load from E:\\ → 10x faster")
+print("   All data auto-syncs: Colab ↔ Drive ↔ E:\\")
 print("="*70 + "\n")
 !python train.py
