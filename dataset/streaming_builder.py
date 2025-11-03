@@ -7,11 +7,13 @@ while CPU continues rendering remaining samples in parallel.
 
 import threading
 import queue
+import gc
 import time
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 from pathlib import Path
 from typing import List
-import torch
-from tqdm import tqdm
 
 
 class StreamingCacheEncoder:
@@ -41,6 +43,10 @@ class StreamingCacheEncoder:
         self.batch_files = []  # Track individual batch files
         self.drive_checkpoints = []  # Track Drive-saved chunks
         self.lock = threading.Lock()
+        
+        # Parallel execution tracking
+        self.cached_count = 0  # Number of samples cached so far
+        self.cache_threshold_reached = threading.Event()  # Signal when threshold reached
         
     def producer_thread(self, samples, renderer, start_threshold=50000):
         """
@@ -86,6 +92,14 @@ class StreamingCacheEncoder:
             
             processed_so_far = i + len(batch)
             
+            # Update cached count for consumer
+            with self.lock:
+                self.cached_count = processed_so_far
+                # Signal GPU to start after threshold
+                if processed_so_far >= start_threshold and not self.cache_threshold_reached.is_set():
+                    print(f"✅ Producer: {processed_so_far} samples cached, signaling GPU to start...")
+                    self.cache_threshold_reached.set()
+            
             # Progress update
             if processed_so_far % 50000 == 0:
                 print(f"📦 Producer: {processed_so_far}/{total} processed ({skipped_count} skipped, {cached_count} rendered)")
@@ -104,13 +118,13 @@ class StreamingCacheEncoder:
     
     def consumer_thread(self, samples):
         """
-        GPU thread: Wait for ALL cache to complete, then encode batches.
+        GPU thread: Start after threshold, encode only cached samples in parallel with caching.
         Saves each batch immediately to disk.
         """
-        # Wait for producer to finish caching ALL samples
-        print(f"⏳ Consumer: Waiting for cache completion...")
-        self.cache_complete.wait()
-        print(f"🚀 Consumer: Cache complete, starting GPU encoding...")
+        # Wait for threshold to be reached
+        print(f"⏳ Consumer: Waiting for initial cache threshold...")
+        self.cache_threshold_reached.wait()
+        print(f"🚀 Consumer: Starting GPU encoding (caching continues in parallel)...") 
         
         # Custom dataset that loads from cache
         class CachedDataset(torch.utils.data.Dataset):
@@ -131,24 +145,49 @@ class StreamingCacheEncoder:
                     raise ValueError(f"Sample {idx} not in cache: {text[:50]}...")
                 return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
         
-        dataset = CachedDataset(samples, self.cache)
-        dataloader = DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=2,
-            pin_memory=True,
-            prefetch_factor=1  # Reduce prefetch to save RAM
-        )
-        
-        # Encode batches - save each directly to disk (no RAM accumulation)
+        # Process samples in order, only encoding what's been cached
         import gc
         import os
         batch_count = 0
+        sample_idx = 0
+        total_batches = (len(samples) + self.batch_size - 1) // self.batch_size
+        
+        pbar = tqdm(total=total_batches, desc="GPU Encoding")
         
         with torch.no_grad():
-            for batch_images in tqdm(dataloader, desc="GPU Encoding"):
-                batch_images = batch_images.to(self.device)
+            while sample_idx < len(samples):
+                # Wait until this batch is fully cached
+                batch_end = min(sample_idx + self.batch_size, len(samples))
+                while True:
+                    with self.lock:
+                        if self.cached_count >= batch_end:
+                            break
+                    # Wait for more samples to be cached
+                    if self.cache_complete.is_set():
+                        break
+                    time.sleep(0.1)
+                
+                # Load this batch from cache
+                batch_samples = samples[sample_idx:batch_end]
+                batch_images = []
+                for sample in batch_samples:
+                    if hasattr(sample, 'text'):
+                        text = sample.text
+                    elif hasattr(sample, 'question'):
+                        text = sample.question
+                    elif isinstance(sample, dict):
+                        text = sample.get('text', '') or sample.get('question', '')
+                    else:
+                        text = str(sample)
+                    
+                    img = self.cache.get(text, 224, 224)
+                    if img is not None:
+                        batch_images.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
+                
+                if not batch_images:
+                    break
+                
+                batch_images = torch.stack(batch_images).to(self.device)
                 result = self.encoder(images=batch_images, return_children=True)
                 
                 # Save this batch immediately to disk (GPU -> Disk)
@@ -179,7 +218,12 @@ class StreamingCacheEncoder:
                 # Consolidate to Drive every 1000 batches (free disk space)
                 if batch_count % 1000 == 0 and self.drive_dir:
                     self._consolidate_to_drive(batch_count)
+                
+                # Move to next batch
+                sample_idx = batch_end
+                pbar.update(1)
         
+        pbar.close()
         print(f"✅ Consumer: Encoding complete")
     
     def _consolidate_to_drive(self, up_to_batch):
@@ -249,12 +293,12 @@ class StreamingCacheEncoder:
             Encoded results dict
         """
         print(f"\n{'='*70}")
-        print(f"💾 CACHE-THEN-ENCODE PIPELINE")
-        print(f"   Phase 1: Cache all {len(samples)} samples (CPU parallel)")
-        print(f"   Phase 2: Encode all samples (GPU, batch={self.batch_size})")
+        print(f"🌊 PARALLEL STREAMING PIPELINE")
+        print(f"   CPU: Caching {len(samples)} samples (parallel workers)")
+        print(f"   GPU: Encoding after {start_threshold} cached (batch={self.batch_size})")
+        print(f"   Strategy: CPU + GPU run simultaneously")
         print(f"   Memory: Each batch saved directly to disk (minimal RAM)")
         print(f"   Batch files: {self.checkpoint_dir}")
-        print(f"   Strategy: Sequential phases (no race conditions)")
         print(f"{'='*70}\n")
         
         # Start producer thread
