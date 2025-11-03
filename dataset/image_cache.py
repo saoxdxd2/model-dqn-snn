@@ -75,13 +75,14 @@ class ImageCache:
             'path': str(cache_path)
         }
     
-    def populate_cache(self, samples, renderer, batch_size=1000):
-        """Pre-populate cache with all samples."""
+    def populate_cache(self, samples, renderer, batch_size=1000, save_every=5):
+        """Pre-populate cache with all samples (saves every 5k samples = ~40 sec)."""
         print(f"📦 Pre-populating image cache...")
         
         total = len(samples)
         cached = 0
         rendered = 0
+        batch_count = 0
         
         for i in tqdm(range(0, total, batch_size), desc="Caching"):
             batch = samples[i:i+batch_size]
@@ -107,8 +108,14 @@ class ImageCache:
                     img_array = np.array(pil_img)
                     self.put(text, 224, 224, img_array)
                     rendered += 1
+            
+            batch_count += 1
+            
+            # Save metadata periodically (every 5 batches = 5k samples = ~40 sec)
+            if batch_count % save_every == 0:
+                self._save_metadata()
         
-        # Save metadata
+        # Final metadata save
         self._save_metadata()
         
         print(f"✅ Cache populated:")
