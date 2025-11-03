@@ -164,14 +164,16 @@ class BaseDatasetBuilder(ABC):
         test_encoded = self._stream_encode_capsules(test_data)
         del test_data  # Free after encoding
         
-        return {
+        result = {
             'train': train_encoded,
             'test': test_encoded,
             'metadata': self.create_metadata(train_encoded)
         }
+        
+        return result
     
     def _sample_is_cached(self, sample, cache):
-        """Check if a sample is already in cache."""
+        """Check if sample is already cached."""
         if hasattr(sample, 'text'):
             text = sample.text
         elif hasattr(sample, 'question'):
@@ -253,11 +255,7 @@ class BaseDatasetBuilder(ABC):
             
             streamer = StreamingCacheEncoder(cache, self.encoder, device, batch_size=256, 
                                             checkpoint_dir=checkpoint_dir, drive_dir=drive_dir)
-            result = streamer.stream_build(samples, self.text_renderer, start_threshold=50000)
-            
-            # Save in chunks to Drive (<5GB limit)
-            self._save_chunked_to_drive(result, 'train')
-            return result
+            return streamer.stream_build(samples, self.text_renderer, start_threshold=50000)
         else:
             print(f"💾 Using STANDARD mode (cache complete)")
             cached_count, rendered_count = cache.populate_cache(samples, self.text_renderer)

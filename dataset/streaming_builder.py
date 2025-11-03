@@ -191,6 +191,14 @@ class StreamingCacheEncoder:
         chunk_idx = len(self.drive_checkpoints)
         drive_file = os.path.join(self.drive_dir, f"encoding_chunk_{chunk_idx:03d}.pt")
         torch.save(consolidated, drive_file)
+        
+        # Delete previous Drive chunk (keep only latest)
+        if self.drive_checkpoints:
+            prev_chunk = self.drive_checkpoints[-1]
+            if os.path.exists(prev_chunk):
+                os.remove(prev_chunk)
+                print(f"🧹 Deleted previous chunk from Drive (freed space)")
+        
         self.drive_checkpoints.append(drive_file)
         del consolidated
         
@@ -252,19 +260,22 @@ class StreamingCacheEncoder:
                 print(f"\n📤 Consolidating final {remaining_batches} batches to Drive...")
                 self._consolidate_to_drive(len(self.batch_files))
         
-        # Load from Drive chunks (much fewer files, already consolidated)
-        print(f"\n📚 Loading {len(self.drive_checkpoints)} chunks from Drive...")
+        # Load from Drive (only the final chunk remains - previous deleted)
+        print(f"\n📚 Loading final chunk from Drive...")
         all_results = {'sketches': [], 'checksums': [], 'children': []}
         
-        for i, chunk_file in enumerate(self.drive_checkpoints):
-            if os.path.exists(chunk_file):
-                chunk = torch.load(chunk_file, map_location='cpu')
+        if self.drive_checkpoints:
+            final_chunk = self.drive_checkpoints[-1]  # Only last chunk exists
+            if os.path.exists(final_chunk):
+                chunk = torch.load(final_chunk, map_location='cpu')
                 for key in all_results:
                     if key in chunk:
                         all_results[key].append(chunk[key])
                 del chunk
                 gc.collect()
-                print(f"  Loaded chunk {i+1}/{len(self.drive_checkpoints)}")
+                print(f"  ✅ Loaded final chunk ({os.path.getsize(final_chunk)/1024/1024:.1f}MB)")
+            else:
+                print(f"  ⚠️  Warning: Final chunk not found at {final_chunk}")
         
         # Final concatenation
         print(f"⚙️  Final concatenation...")
@@ -282,10 +293,14 @@ class StreamingCacheEncoder:
             for batch_file in remaining_files:
                 os.remove(batch_file)
         
-        # Note: Drive chunks are kept for recovery if needed
-        print(f"💾 Kept {len(self.drive_checkpoints)} Drive chunks for backup")
-        print(f"   Location: {self.drive_dir}")
-        print(f"   You can delete these after verifying the final dataset works")
+        # Clean up final Drive chunk
+        if self.drive_checkpoints:
+            final_chunk = self.drive_checkpoints[-1]
+            if os.path.exists(final_chunk):
+                os.remove(final_chunk)
+                print(f"🧹 Cleaned up final Drive chunk")
+        
+        print(f"💾 Drive storage freed (all temp chunks deleted)")
         
         print(f"✅ Complete! Final shape: {result['sketches'].shape}")
         return result
