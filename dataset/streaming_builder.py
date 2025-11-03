@@ -73,7 +73,8 @@ class StreamingCacheEncoder:
                 else:
                     text = str(sample)
                 
-                if not self.cache.get(text, 224, 224):
+                # Check if cached (returns numpy array if cached, None if not)
+                if self.cache.get(text, 224, 224) is None:
                     uncached.append(sample)
                 else:
                     skipped_count += 1
