@@ -242,8 +242,22 @@ class BaseDatasetBuilder(ABC):
             from dataset.streaming_builder import StreamingCacheEncoder
             checkpoint_dir = str(Path(self.config.output_dir) / "stream_checkpoints")
             Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-            streamer = StreamingCacheEncoder(cache, self.encoder, device, batch_size=256, checkpoint_dir=checkpoint_dir)
-            return streamer.stream_build(samples, self.text_renderer, start_threshold=50000)
+            
+            # Drive path for progress saves (if available)
+            drive_dir = "/content/drive/MyDrive/model_checkpoints/encoding_progress"
+            if os.path.exists("/content/drive/MyDrive"):
+                Path(drive_dir).mkdir(parents=True, exist_ok=True)
+            else:
+                drive_dir = None
+                print("⚠️  Drive not mounted, progress won't be saved to Drive")
+            
+            streamer = StreamingCacheEncoder(cache, self.encoder, device, batch_size=256, 
+                                            checkpoint_dir=checkpoint_dir, drive_dir=drive_dir)
+            result = streamer.stream_build(samples, self.text_renderer, start_threshold=50000)
+            
+            # Save in chunks to Drive (<5GB limit)
+            self._save_chunked_to_drive(result, 'train')
+            return result
         else:
             print(f"💾 Using STANDARD mode (cache complete)")
             cached_count, rendered_count = cache.populate_cache(samples, self.text_renderer)

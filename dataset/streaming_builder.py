@@ -24,12 +24,13 @@ class StreamingCacheEncoder:
     - Queue: Coordinates which batches are ready
     """
     
-    def __init__(self, cache, encoder, device, batch_size=256, checkpoint_dir=None):
+    def __init__(self, cache, encoder, device, batch_size=256, checkpoint_dir=None, drive_dir=None):
         self.cache = cache
         self.encoder = encoder
         self.device = device
         self.batch_size = batch_size
         self.checkpoint_dir = checkpoint_dir
+        self.drive_dir = drive_dir  # Google Drive path for progress saves
         
         # Coordination
         self.ready_queue = queue.Queue(maxsize=10)  # Batches ready to encode
@@ -38,6 +39,7 @@ class StreamingCacheEncoder:
         
         # Direct-to-disk mode (no RAM accumulation)
         self.batch_files = []  # Track individual batch files
+        self.drive_checkpoints = []  # Track Drive-saved chunks
         self.lock = threading.Lock()
         
     def producer_thread(self, samples, renderer, start_threshold=50000):
@@ -55,31 +57,14 @@ class StreamingCacheEncoder:
         cached_count = 0
         
         for i in range(0, total, batch_size):
-            if self.stop_flag.is_set():
-                break
-            
             batch = samples[i:i+batch_size]
+            self.cache._render_samples_parallel(batch, num_workers=2)
             
-            # Render batch (uses multiprocessing internally)
-            results = self.cache._render_samples_parallel(batch, num_workers=2)
+            cached_so_far = i + len(batch)
             
-            for img_array, text in results:
-                if img_array is not None:
-                    self.cache.put(text, 224, 224, img_array)
-            
-            cached_count = i + len(batch)
-            
-            # Signal GPU thread once threshold reached
-            if cached_count >= start_threshold and not self.cache_complete.is_set():
-                print(f"✅ Producer: {cached_count} samples cached, starting GPU encoding...")
-                # Add initial batches to queue
-                for batch_idx in range(0, cached_count, self.batch_size):
-                    self.ready_queue.put(batch_idx)
-            
-            # Continue adding batches as we cache more
-            elif cached_count > start_threshold:
-                batch_idx = i
-                self.ready_queue.put(batch_idx)
+            # Progress update
+            if cached_so_far % 50000 == 0:
+                print(f"📦 Producer: {cached_so_far}/{len(samples)} samples cached...")
             
             # Periodic metadata save
             if (i // batch_size) % 5 == 0:
@@ -92,20 +77,16 @@ class StreamingCacheEncoder:
     
     def consumer_thread(self, samples):
         """
-        GPU thread: Encode cached samples as they become available.
+        GPU thread: Wait for ALL cache to complete, then encode batches.
+        Saves each batch immediately to disk.
         """
-        print(f"⏳ Consumer: Waiting for initial cache...")
+        # Wait for producer to finish caching ALL samples
+        print(f"⏳ Consumer: Waiting for cache completion...")
+        self.cache_complete.wait()
+        print(f"🚀 Consumer: Cache complete, starting GPU encoding...")
         
-        # Wait for first batch
-        first_batch = self.ready_queue.get()
-        if first_batch is None:
-            return
-        
-        print(f"🚀 Consumer: Starting GPU encoding...")
-        
-        from torch.utils.data import Dataset, DataLoader
-        
-        class CachedDataset(Dataset):
+        # Custom dataset that loads from cache
+        class CachedDataset(torch.utils.data.Dataset):
             def __init__(self, samples, cache):
                 self.samples = samples
                 self.cache = cache
@@ -115,19 +96,12 @@ class StreamingCacheEncoder:
             
             def __getitem__(self, idx):
                 sample = self.samples[idx]
+                text = sample.get('text', '') or sample.get('question', '')
                 
-                # Extract text
-                if hasattr(sample, 'text'):
-                    text = sample.text
-                elif hasattr(sample, 'question'):
-                    text = sample.question
-                elif isinstance(sample, dict):
-                    text = sample.get('text', '') or sample.get('question', '')
-                else:
-                    text = str(sample)
-                
-                # Load from cache
+                # Load from cache (all samples should be cached now)
                 img = self.cache.get(text, 224, 224)
+                if img is None:
+                    raise ValueError(f"Sample {idx} not in cache: {text[:50]}...")
                 return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
         
         dataset = CachedDataset(samples, self.cache)
@@ -171,11 +145,63 @@ class StreamingCacheEncoder:
                     gc.collect()
                     torch.cuda.empty_cache()
                 
-                # Progress checkpoint every 500 batches
+                # Progress update every 500 batches
                 if batch_count % 500 == 0:
                     print(f"💾 Saved {batch_count} batches to disk (RAM usage: minimal)")
+                
+                # Consolidate to Drive every 1000 batches (free disk space)
+                if batch_count % 1000 == 0 and self.drive_dir:
+                    self._consolidate_to_drive(batch_count)
         
         print(f"✅ Consumer: Encoding complete")
+    
+    def _consolidate_to_drive(self, up_to_batch):
+        """Consolidate processed batches to Drive and clean up local files."""
+        import os
+        import gc
+        
+        # Find batches we haven't saved to Drive yet
+        start_idx = len(self.drive_checkpoints) * 1000
+        end_idx = up_to_batch
+        batch_subset = self.batch_files[start_idx:end_idx]
+        
+        if not batch_subset:
+            return
+        
+        print(f"📤 Consolidating batches {start_idx}-{end_idx} to Drive...")
+        
+        # Load and concatenate this chunk
+        chunk_data = {'sketches': [], 'checksums': [], 'children': []}
+        for batch_file in batch_subset:
+            if os.path.exists(batch_file):
+                batch = torch.load(batch_file, map_location='cpu')
+                for key in chunk_data:
+                    if key in batch and batch[key] is not None:
+                        chunk_data[key].append(batch[key])
+                del batch
+        
+        # Concatenate chunk
+        consolidated = {}
+        for key in chunk_data:
+            if chunk_data[key]:
+                consolidated[key] = torch.cat(chunk_data[key], dim=0)
+        del chunk_data
+        
+        # Save to Drive (compressed)
+        chunk_idx = len(self.drive_checkpoints)
+        drive_file = os.path.join(self.drive_dir, f"encoding_chunk_{chunk_idx:03d}.pt")
+        torch.save(consolidated, drive_file)
+        self.drive_checkpoints.append(drive_file)
+        del consolidated
+        
+        # Delete local batch files to free disk space
+        for batch_file in batch_subset:
+            if os.path.exists(batch_file):
+                os.remove(batch_file)
+        
+        gc.collect()
+        chunk_size_mb = os.path.getsize(drive_file) / 1024 / 1024
+        print(f"✅ Saved chunk {chunk_idx} to Drive ({chunk_size_mb:.1f}MB), freed {len(batch_subset)} batch files")
     
     def stream_build(self, samples, renderer, start_threshold=50000):
         """
@@ -190,13 +216,12 @@ class StreamingCacheEncoder:
             Encoded results dict
         """
         print(f"\n{'='*70}")
-        print(f"🌊 STREAMING PIPELINE (Direct-to-Disk)")
-        print(f"   CPU: Rendering {len(samples)} samples")
-        print(f"   GPU: Encoding starts after {start_threshold} cached")
-        print(f"   Batch size: {self.batch_size}")
+        print(f"💾 CACHE-THEN-ENCODE PIPELINE")
+        print(f"   Phase 1: Cache all {len(samples)} samples (CPU parallel)")
+        print(f"   Phase 2: Encode all samples (GPU, batch={self.batch_size})")
         print(f"   Memory: Each batch saved directly to disk (minimal RAM)")
         print(f"   Batch files: {self.checkpoint_dir}")
-        print(f"   Strategy: GPU -> Disk (no RAM accumulation)")
+        print(f"   Strategy: Sequential phases (no race conditions)")
         print(f"{'='*70}\n")
         
         # Start producer thread
@@ -217,37 +242,29 @@ class StreamingCacheEncoder:
         producer.join()
         consumer.join()
         
-        # Load all batch files from disk and concatenate
+        # Consolidate any remaining batches to Drive
         import os
         import gc
         
-        print(f"\n📚 Loading {len(self.batch_files)} batches from disk...")
+        if self.drive_dir:
+            remaining_batches = len(self.batch_files) - (len(self.drive_checkpoints) * 1000)
+            if remaining_batches > 0:
+                print(f"\n📤 Consolidating final {remaining_batches} batches to Drive...")
+                self._consolidate_to_drive(len(self.batch_files))
+        
+        # Load from Drive chunks (much fewer files, already consolidated)
+        print(f"\n📚 Loading {len(self.drive_checkpoints)} chunks from Drive...")
         all_results = {'sketches': [], 'checksums': [], 'children': []}
         
-        # Load in chunks to avoid RAM spike
-        chunk_size = 100  # Load 100 batches at a time
-        for i in range(0, len(self.batch_files), chunk_size):
-            chunk_files = self.batch_files[i:i+chunk_size]
-            chunk_data = {'sketches': [], 'checksums': [], 'children': []}
-            
-            for batch_file in chunk_files:
-                if os.path.exists(batch_file):
-                    batch = torch.load(batch_file, map_location='cpu')
-                    for key in chunk_data:
-                        if key in batch and batch[key] is not None:
-                            chunk_data[key].append(batch[key])
-                    del batch
-            
-            # Concatenate this chunk
-            for key in chunk_data:
-                if chunk_data[key]:
-                    all_results[key].append(torch.cat(chunk_data[key], dim=0))
-            
-            del chunk_data
-            gc.collect()
-            
-            if (i + chunk_size) % 500 == 0:
-                print(f"  Loaded {min(i+chunk_size, len(self.batch_files))}/{len(self.batch_files)} batches")
+        for i, chunk_file in enumerate(self.drive_checkpoints):
+            if os.path.exists(chunk_file):
+                chunk = torch.load(chunk_file, map_location='cpu')
+                for key in all_results:
+                    if key in chunk:
+                        all_results[key].append(chunk[key])
+                del chunk
+                gc.collect()
+                print(f"  Loaded chunk {i+1}/{len(self.drive_checkpoints)}")
         
         # Final concatenation
         print(f"⚙️  Final concatenation...")
@@ -258,11 +275,17 @@ class StreamingCacheEncoder:
             else:
                 result[key] = torch.empty(0)
         
-        # Cleanup batch files
-        print(f"🧹 Cleaning up {len(self.batch_files)} batch files...")
-        for batch_file in self.batch_files:
-            if os.path.exists(batch_file):
+        # Cleanup any remaining batch files
+        remaining_files = [f for f in self.batch_files if os.path.exists(f)]
+        if remaining_files:
+            print(f"🧹 Cleaning up {len(remaining_files)} remaining batch files...")
+            for batch_file in remaining_files:
                 os.remove(batch_file)
+        
+        # Note: Drive chunks are kept for recovery if needed
+        print(f"💾 Kept {len(self.drive_checkpoints)} Drive chunks for backup")
+        print(f"   Location: {self.drive_dir}")
+        print(f"   You can delete these after verifying the final dataset works")
         
         print(f"✅ Complete! Final shape: {result['sketches'].shape}")
         return result
