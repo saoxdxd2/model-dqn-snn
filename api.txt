@@ -1,0 +1,69 @@
+dab2e42da43bc44934cb07d7973984cad6a4407a
+
+
+# === Complete Colab Setup with Auto-Fix ===
+import os, shutil
+from pathlib import Path
+
+# 1. Mount Drive
+try:
+    from google.colab import drive
+    drive.mount('/content/drive', force_remount=False)
+    os.makedirs('/content/drive/MyDrive/model-dqn-snn', exist_ok=True)
+    print("✅ Drive mounted")
+except: 
+    print("⚠️  Drive mount failed")
+
+# 2. Update existing repo (or clone if missing)
+%cd /content
+if os.path.exists('model-dqn-snn'):
+    %cd model-dqn-snn
+    !git reset --hard HEAD  # Discard local changes
+    !git pull origin main
+    print("✅ Repo updated")
+else:
+    !git clone https://github.com/saoxdxd2/model-dqn-snn.git
+    %cd model-dqn-snn
+    print("✅ Repo cloned")
+
+# 2.5. Fix Path bug in base_builder.py
+print("🔧 Applying fixes...")
+with open('dataset/base_builder.py', 'r') as f:
+    content = f.read()
+
+# Fix: Convert output_dir string to Path
+if 'checkpoint_path = self.config.output_dir / "encoding_checkpoint.pt"' in content:
+    content = content.replace(
+        'checkpoint_path = self.config.output_dir / "encoding_checkpoint.pt"',
+        'from pathlib import Path\n        checkpoint_path = Path(self.config.output_dir) / "encoding_checkpoint.pt"'
+    )
+    with open('dataset/base_builder.py', 'w') as f:
+        f.write(content)
+    print("✅ Fixed checkpoint path bug")
+
+# 3. Restore checkpoint from Drive
+drive_ckpt = Path('/content/drive/MyDrive/model-dqn-snn/encoding_checkpoint.pt')
+local_ckpt = Path('datasets/vision_unified/encoding_checkpoint.pt')
+if drive_ckpt.exists():
+    local_ckpt.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(drive_ckpt, local_ckpt)
+    try:
+        import torch
+        ckpt = torch.load(local_ckpt, map_location='cpu')
+        progress = ckpt['batch_count'] / ckpt['total_batches'] * 100
+        print(f"✅ Restored checkpoint: {progress:.1f}% complete")
+    except:
+        print("✅ Checkpoint restored")
+else:
+    print("ℹ️  Starting fresh (no checkpoint)")
+
+# 4. Install dependencies (cached after first time)
+!pip install -q --no-cache-dir -r requirements.txt
+
+# 5. Start training
+print("\n" + "="*70)
+print("🚀 Starting training (auto-resumes from checkpoint)...")
+print("   Saves every 2000 batches (~1 hour)")
+print("   Auto-syncs to Google Drive")
+print("="*70 + "\n")
+!python train.py
