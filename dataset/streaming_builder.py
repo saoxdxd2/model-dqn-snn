@@ -63,7 +63,16 @@ class StreamingCacheEncoder:
             # Filter out already-cached samples
             uncached = []
             for sample in batch:
-                text = sample.get('text', '') or sample.get('question', '')
+                # Extract text from DataSample object
+                if hasattr(sample, 'text'):
+                    text = sample.text
+                elif hasattr(sample, 'question'):
+                    text = sample.question
+                elif isinstance(sample, dict):
+                    text = sample.get('text', '') or sample.get('question', '')
+                else:
+                    text = str(sample)
+                
                 if not self.cache.get(text, 224, 224):
                     uncached.append(sample)
                 else:
