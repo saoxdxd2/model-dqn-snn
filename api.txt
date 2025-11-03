@@ -1,7 +1,35 @@
 dab2e42da43bc44934cb07d7973984cad6a4407a
 
 
-# === Complete Colab Setup with Auto-Fix ===
+import shutil
+from pathlib import Path
+import os
+
+# Zip the local cache
+local_cache = Path("datasets/vision_unified/text_cache")
+drive_base = Path("/content/drive/MyDrive/model_checkpoints")
+
+if local_cache.exists():
+    print("📦 Zipping cache...")
+    
+    # Create Drive directory
+    drive_base.mkdir(parents=True, exist_ok=True)
+    
+    # Zip the cache (much faster than copying individual files)
+    zip_file = drive_base / "text_cache_backup"
+    shutil.make_archive(str(zip_file), 'zip', str(local_cache))
+    
+    zip_size = os.path.getsize(str(zip_file) + ".zip") / (1024**3)
+    print(f"✅ Zipped to Drive: text_cache_backup.zip ({zip_size:.2f}GB)")
+    print(f"   Location: {zip_file}.zip")
+    print(f"   Will sync to E:\\ automatically")
+else:
+    print("⚠️ No local cache found")
+
+
+
+
+    # === Complete Colab Setup with Image Cache ===
 import os, shutil
 from pathlib import Path
 
@@ -14,11 +42,11 @@ try:
 except: 
     print("⚠️  Drive mount failed")
 
-# 2. Update existing repo (or clone if missing)
+# 2. Update repo
 %cd /content
 if os.path.exists('model-dqn-snn'):
     %cd model-dqn-snn
-    !git reset --hard HEAD  # Discard local changes
+    !git reset --hard HEAD
     !git pull origin main
     print("✅ Repo updated")
 else:
@@ -26,22 +54,7 @@ else:
     %cd model-dqn-snn
     print("✅ Repo cloned")
 
-# 2.5. Fix Path bug in base_builder.py
-print("🔧 Applying fixes...")
-with open('dataset/base_builder.py', 'r') as f:
-    content = f.read()
-
-# Fix: Convert output_dir string to Path
-if 'checkpoint_path = self.config.output_dir / "encoding_checkpoint.pt"' in content:
-    content = content.replace(
-        'checkpoint_path = self.config.output_dir / "encoding_checkpoint.pt"',
-        'from pathlib import Path\n        checkpoint_path = Path(self.config.output_dir) / "encoding_checkpoint.pt"'
-    )
-    with open('dataset/base_builder.py', 'w') as f:
-        f.write(content)
-    print("✅ Fixed checkpoint path bug")
-
-# 3. Restore checkpoint from Drive
+# 3. Restore encoding checkpoint from Drive
 drive_ckpt = Path('/content/drive/MyDrive/model-dqn-snn/encoding_checkpoint.pt')
 local_ckpt = Path('datasets/vision_unified/encoding_checkpoint.pt')
 if drive_ckpt.exists():
@@ -55,15 +68,26 @@ if drive_ckpt.exists():
     except:
         print("✅ Checkpoint restored")
 else:
-    print("ℹ️  Starting fresh (no checkpoint)")
+    print("ℹ️  Starting fresh")
 
-# 4. Install dependencies (cached after first time)
+# 4. Restore image cache from Drive (critical for speed!)
+drive_cache = Path('/content/drive/MyDrive/model-dqn-snn/text_cache')
+local_cache = Path('datasets/vision_unified/text_cache')
+if drive_cache.exists():
+    print("📦 Restoring image cache from Drive...")
+    shutil.copytree(drive_cache, local_cache, dirs_exist_ok=True)
+    print("✅ Cache restored (encoding will be 10x faster)")
+else:
+    print("ℹ️  No cache yet (first run will populate it)")
+
+# 5. Install dependencies
 !pip install -q --no-cache-dir -r requirements.txt
 
-# 5. Start training
+# 6. Start training
 print("\n" + "="*70)
-print("🚀 Starting training (auto-resumes from checkpoint)...")
-print("   Saves every 2000 batches (~1 hour)")
-print("   Auto-syncs to Google Drive")
+print("🚀 Starting training with cached pipeline")
+print("   First run: ~60 min (populate cache + encode)")
+print("   Later runs: ~45 min (instant cache load)")
+print("   Saves every 2000 batches to Drive")
 print("="*70 + "\n")
 !python train.py
