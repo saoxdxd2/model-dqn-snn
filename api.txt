@@ -1,47 +1,17 @@
 dab2e42da43bc44934cb07d7973984cad6a4407a
 
-
-import shutil
+# === Colab Setup with Local Zip Transfer (No Drive) ===
+import os, shutil, zipfile
 from pathlib import Path
-import os
+from google.colab import files
 
-# Zip the local cache
-local_cache = Path("datasets/vision_unified/text_cache")
-drive_base = Path("/content/drive/MyDrive/model_checkpoints")
+print("="*70)
+print("🛠️  Colab Setup - Local Transfer Mode")
+print("   No Google Drive needed")
+print("   Transfer via zip upload/download")
+print("="*70 + "\n")
 
-if local_cache.exists():
-    print("📦 Zipping cache...")
-    
-    # Create Drive directory
-    drive_base.mkdir(parents=True, exist_ok=True)
-    
-    # Zip the cache (much faster than copying individual files)
-    zip_file = drive_base / "text_cache_backup"
-    shutil.make_archive(str(zip_file), 'zip', str(local_cache))
-    
-    zip_size = os.path.getsize(str(zip_file) + ".zip") / (1024**3)
-    print(f"✅ Zipped to Drive: text_cache_backup.zip ({zip_size:.2f}GB)")
-    print(f"   Location: {zip_file}.zip")
-    print(f"   Will sync to E:\\ automatically")
-else:
-    print("⚠️ No local cache found")
-
-
-
-# === Complete Colab Setup - Syncs with E:\model_checkpoints ===
-import os, shutil
-from pathlib import Path
-
-# 1. Mount Drive (configured to sync to E:\model_checkpoints on your PC)
-try:
-    from google.colab import drive
-    drive.mount('/content/drive', force_remount=False)
-    os.makedirs('/content/drive/MyDrive/model_checkpoints', exist_ok=True)
-    print("✅ Drive mounted (syncs to E:\\model_checkpoints)")
-except: 
-    print("⚠️  Drive mount failed")
-
-# 2. Update repo
+# 1. Clone or update repo
 %cd /content
 if os.path.exists('model-dqn-snn'):
     %cd model-dqn-snn
@@ -53,38 +23,82 @@ else:
     %cd model-dqn-snn
     print("✅ Repo cloned")
 
-# 3. Restore data from Drive (syncs from E:\model_checkpoints)
-print("📦 Checking Drive for cached data (synced from E:\\model_checkpoints)...")
+# 2. Check for existing model_checkpoints/ or upload from local machine
+checkpoints_dir = Path('model_checkpoints')
 
-# Text cache (rendered images)
-drive_cache = Path('/content/drive/MyDrive/model_checkpoints/text_cache')
-local_cache = Path('datasets/vision_unified/text_cache')
-
-if drive_cache.exists():
-    cache_files = list(drive_cache.glob('*.png'))
-    print(f"   Found text cache: {len(cache_files)} images")
-    print("   Restoring to Colab...")
-    local_cache.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(drive_cache, local_cache, dirs_exist_ok=True)
-    print("✅ Cache restored (encoding will be 10x faster)")
+if not checkpoints_dir.exists():
+    print("\n📤 No checkpoints found. Upload zip from your E:\\ drive?")
+    print("   Expected: model-dqn-snn.zip (contains model_checkpoints/)")
+    response = input("Upload zip? (y/n): ").lower()
+    
+    if response == 'y':
+        print("📦 Upload your model-dqn-snn.zip file...")
+        uploaded = files.upload()
+        
+        if uploaded:
+            zip_filename = list(uploaded.keys())[0]
+            print(f"\n📜 Extracting {zip_filename}...")
+            
+            with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
+                zip_ref.extractall('/content/temp_extract')
+            
+            # Find and copy model_checkpoints from extracted content
+            extracted_checkpoints = Path('/content/temp_extract/model-dqn-snn/model_checkpoints')
+            if extracted_checkpoints.exists():
+                shutil.copytree(extracted_checkpoints, checkpoints_dir, dirs_exist_ok=True)
+                
+                # Count restored files
+                cache_files = len(list((checkpoints_dir / 'text_cache').glob('*.png'))) if (checkpoints_dir / 'text_cache').exists() else 0
+                chunks = len(list((checkpoints_dir / 'encoding_progress').glob('*.pt'))) if (checkpoints_dir / 'encoding_progress').exists() else 0
+                
+                print(f"✅ Restored from local machine:")
+                print(f"   Text cache: {cache_files} images")
+                print(f"   Encoding chunks: {chunks} files")
+                
+                # Cleanup
+                shutil.rmtree('/content/temp_extract')
+                os.remove(zip_filename)
+            else:
+                print("⚠️  No model_checkpoints/ found in zip")
+        else:
+            print("ℹ️  No file uploaded, starting fresh")
+    else:
+        print("ℹ️  Skipping upload, starting fresh")
 else:
-    print("ℹ️  No cache yet (first run will populate and sync to E:\\)")
+    print("✅ Found existing model_checkpoints/ (from previous session)")
 
-# Check for encoding chunks
-drive_chunks = Path('/content/drive/MyDrive/model_checkpoints/encoding_progress')
-if drive_chunks.exists():
-    chunks = list(drive_chunks.glob('consolidated_*.pt'))
-    if chunks:
-        print(f"📚 Found {len(chunks)} encoding chunks (synced from E:\\)")
-
-# 4. Install dependencies
+# 3. Install dependencies
+print("\n📦 Installing dependencies...")
 !pip install -q --no-cache-dir -r requirements.txt
 
-# 5. Start training
+# 4. Start training
 print("\n" + "="*70)
-print("🚀 Starting training with Drive↔E:\\ sync")
-print("   First run: Populate cache → Sync to E:\\model_checkpoints")
-print("   Later runs: Load from E:\\ → 10x faster")
-print("   All data auto-syncs: Colab ↔ Drive ↔ E:\\")
+print("🚀 Starting Training")
+print("   First run: ~5.6 hours (cache + encode)")
+print("   Resume: Continues from model_checkpoints/")
+print("   After: Run zip cell to download back to E:\\")
 print("="*70 + "\n")
 !python train.py
+
+
+
+import shutil
+import os
+
+# Define the path to the directory you want to zip
+directory_to_zip = 'model-dqn-snn'
+
+# Define the name for the output zip file
+output_zip_file = 'model-dqn-snn.zip'
+
+# Create a zip archive of the directory
+shutil.make_archive(output_zip_file.replace('.zip', ''), 'zip', directory_to_zip)
+
+print(f'Successfully created {output_zip_file}')
+from google.colab import files
+
+# Define the name of the zip file
+output_zip_file = 'model-dqn-snn.zip'
+
+# Download the file
+files.download(output_zip_file)

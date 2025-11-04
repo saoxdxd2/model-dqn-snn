@@ -250,11 +250,23 @@ class BaseDatasetBuilder(ABC):
         if use_streaming and cache_hit_rate < 0.95:
             print(f"🌊 Using STREAMING mode (cache incomplete)")
             print(f"   Strategy: CPU renders + GPU encodes simultaneously")
-            print(f"   GPU starts after 50k samples cached (~5 min)")
+            if cache_hit_rate * 100 < 5:
+                print(f"   GPU starts immediately (no cache found)")
+            else:
+                print(f"   GPU starts after 50k samples cached")
+            
+            if not getattr(self.config, 'drive_dir', None):
+                print(f"⚠️  Drive not mounted, progress won't be saved to Drive")
             
             from dataset.streaming_builder import StreamingCacheEncoder
-            checkpoint_dir = str(Path(self.config.output_dir) / "stream_checkpoints")
-            Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+            encoder = StreamingCacheEncoder(
+                cache=cache,
+                encoder=self.encoder,
+                batch_size=256,
+                checkpoint_dir=str(Path(self.config.output_dir) / "stream_checkpoints"),
+                drive_dir=getattr(self.config, 'drive_dir', None)
+            )
+            result = encoder.stream_build(samples, self.text_renderer, initial_cache_percent=cache_hit_rate * 100)
             
             # Drive path for progress saves (if available)
             drive_dir = "/content/drive/MyDrive/model_checkpoints/encoding_progress"
