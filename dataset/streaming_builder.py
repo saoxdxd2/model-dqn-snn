@@ -76,10 +76,12 @@ class StreamingCacheEncoder:
             # Always check pause state (returns immediately if not paused)
             # Prevents race condition where pause happens between check and processing
             if not self.consolidation_pause.is_set():
+                pbar.write("🔴 Producer: Pause requested, pausing...")
                 with self.threads_paused_lock:
                     self.threads_paused_count += 1
                 try:
                     self.consolidation_pause.wait()
+                    pbar.write("🟢 Producer: Resuming after pause")
                 finally:
                     with self.threads_paused_lock:
                         self.threads_paused_count -= 1
@@ -99,10 +101,9 @@ class StreamingCacheEncoder:
                 else:
                     text = str(sample)
                 
-                # Check if cache file actually exists (not just metadata)
-                # After consolidation, images are deleted but needed for remaining batches
-                cached_img = self.cache.get(text, 224, 224)
-                if cached_img is None:
+                # Fast metadata check (memory lookup, no disk I/O)
+                # Metadata is preserved and valid since we don't auto-clear cache anymore
+                if not self.cache.has_been_cached(text, 224, 224):
                     uncached.append(sample)
                 else:
                     skipped_count += 1
@@ -212,10 +213,12 @@ class StreamingCacheEncoder:
                 # Always check pause state (returns immediately if not paused)
                 # Prevents race condition where pause happens between check and processing
                 if not self.consolidation_pause.is_set():
+                    pbar.write("🔴 Consumer: Pause requested, pausing...")
                     with self.threads_paused_lock:
                         self.threads_paused_count += 1
                     try:
                         self.consolidation_pause.wait()
+                        pbar.write("🟢 Consumer: Resuming after pause")
                     finally:
                         with self.threads_paused_lock:
                             self.threads_paused_count -= 1
@@ -347,10 +350,17 @@ class StreamingCacheEncoder:
         
         # Wait for both threads to actually pause (no timeout - wait until done)
         import time
+        wait_start = time.time()
         while True:
             with self.threads_paused_lock:
-                if self.threads_paused_count >= 2:
+                paused = self.threads_paused_count
+                if paused >= 2:
                     break
+            
+            # Debug: Show waiting status every 5 seconds
+            elapsed = time.time() - wait_start
+            if int(elapsed) % 5 == 0 and elapsed > 0:
+                print(f"⏳ Waiting for threads to pause... ({paused}/2 paused, {elapsed:.0f}s elapsed)")
             time.sleep(0.1)
         
         print(f"📤 Consolidating batches {start_idx}-{end_idx}...")
