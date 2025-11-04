@@ -331,20 +331,24 @@ class StreamingCacheEncoder:
         torch.save(consolidated, drive_file)
         self.drive_checkpoints.append(drive_file)
         del consolidated
+        gc.collect()
         
-        # Note: Keep on Drive - will sync to C:\Users\sao\Documents\model-engine
-        # Once synced to local machine, user can manually delete from Drive if needed
+        chunk_size_mb = os.path.getsize(drive_file) / 1024 / 1024
+        print(f"✅ Saved consolidated chunk {chunk_idx} to Drive ({chunk_size_mb:.1f}MB)")
         
-        # Keep consolidated chunks on Drive, don't delete from Drive
-        print(f"✅ Saved chunk {chunk_idx} to Drive - will sync to local machine")
+        # Delete individual batch files to free Colab disk space
+        deleted_count = 0
+        freed_mb = 0
+        for batch_file in batch_subset:
+            if os.path.exists(batch_file):
+                batch_size_mb = os.path.getsize(batch_file) / 1024 / 1024
+                os.remove(batch_file)
+                deleted_count += 1
+                freed_mb += batch_size_mb
+        
+        print(f"🧹 Deleted {deleted_count} individual batch files ({freed_mb:.1f}MB freed from Colab)")
         print(f"   Drive location: {self.drive_dir}")
         print(f"   Will sync to: C:\\Users\\sao\\Documents\\model-engine")
-        print(f"   You can delete from Drive after confirming sync completed")
-        
-        gc.collect()
-        chunk_size_mb = os.path.getsize(drive_file) / 1024 / 1024
-        print(f"✅ Saved chunk {chunk_idx} to Drive ({chunk_size_mb:.1f}MB) - will sync to local machine")
-        print(f"   Freed {len(batch_subset)} batch files from Colab")
         
         # Clear text cache for consolidated samples to save disk space
         # Saves ~37GB per chunk, prevents Colab disk overflow
