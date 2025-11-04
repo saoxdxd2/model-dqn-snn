@@ -28,8 +28,12 @@ class ImageCache:
     def _load_metadata(self):
         """Load cache metadata."""
         if self.metadata_file.exists():
-            with open(self.metadata_file, 'rb') as f:
-                return pickle.load(f)
+            try:
+                with open(self.metadata_file, 'rb') as f:
+                    return pickle.load(f)
+            except (EOFError, pickle.UnpicklingError):
+                # Corrupted metadata file, start fresh
+                return {}
         return {}
     
     def _save_metadata(self):
