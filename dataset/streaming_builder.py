@@ -236,12 +236,28 @@ class StreamingCacheEncoder:
                     pbar.update(1)
                     continue
                 
+                # Setup batch file path and check if already exists
+                batch_file = None
+                if self.checkpoint_dir:
+                    os.makedirs(self.checkpoint_dir, exist_ok=True)  # Ensure directory exists
+                    batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_count:05d}.pt")
+                    
+                    if os.path.exists(batch_file):
+                        # Batch already encoded, skip and register
+                        with self.lock:
+                            self.batch_files.append(batch_file)
+                        sample_idx = batch_end
+                        batch_count += 1
+                        pbar.update(1)
+                        pbar.write(f"⏭️  Batch {batch_count-1} already exists, skipping")
+                        continue
+                
+                # Encode batch
                 batch_images = torch.stack(batch_images).to(self.device)
                 result = self.encoder(images=batch_images, return_children=True)
                 
                 # Save this batch immediately to disk (GPU -> Disk)
-                if self.checkpoint_dir:
-                    batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_count:05d}.pt")
+                if batch_file is not None:
                     batch_data = {
                         'sketches': result['sketches'].half().cpu(),
                         'checksums': result['checksums'].half().cpu() if 'checksums' in result else None,
