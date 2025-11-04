@@ -223,6 +223,10 @@ class StreamingCacheEncoder:
                 # Wait until this batch is fully cached
                 batch_end = min(sample_idx + self.batch_size, len(samples))
                 while True:
+                    # Check if consolidation pause requested
+                    if not self.consolidation_pause.is_set():
+                        break  # Exit cache wait to re-check pause at top of loop
+                    
                     with self.lock:
                         if self.cached_count >= batch_end:
                             break
