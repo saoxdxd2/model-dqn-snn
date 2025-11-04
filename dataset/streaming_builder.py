@@ -99,9 +99,10 @@ class StreamingCacheEncoder:
                 else:
                     text = str(sample)
                 
-                # Check metadata - don't re-render if already processed
-                # (even if image file was deleted to save disk space)
-                if not self.cache.has_been_cached(text, 224, 224):
+                # Check if cache file actually exists (not just metadata)
+                # After consolidation, images are deleted but needed for remaining batches
+                cached_img = self.cache.get(text, 224, 224)
+                if cached_img is None:
                     uncached.append(sample)
                 else:
                     skipped_count += 1
@@ -452,10 +453,8 @@ class StreamingCacheEncoder:
         self.consolidation_pause.set()
         print(f"▶️  Resuming encoding and caching...\n")
         
-        # Clear text cache for consolidated samples to save disk space
-        # Saves ~37GB per chunk, prevents Colab disk overflow
-        # Cache will be rebuilt on resume if needed (5-10 min for 256k samples)
-        self._clear_cache_for_consolidated_samples(start_idx * self.batch_size, end_idx * self.batch_size)
+        # Note: Cache clearing is disabled to prevent deadlocks
+        # Manually clear cache if disk space is critical: find datasets/vision_unified/text_cache -name "*.npy" -delete
     
     def _clear_cache_for_consolidated_samples(self, start_idx, end_idx):
         """Clear text cache images for consolidated samples but keep metadata.
