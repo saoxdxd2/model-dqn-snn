@@ -130,8 +130,45 @@ def check_dataset_exists(output_dir: str) -> bool:
     return train_path.exists()
 
 
-def download_and_build_dataset(model_config: dict, force_rebuild: bool = False):
-    """Download dataset and build preprocessed files."""
+def wait_for_consolidated_chunks(output_dir: str, poll_interval: int = 60):
+    """Wait for consolidated chunks and return list of available chunks.
+    
+    Args:
+        output_dir: Dataset output directory
+        poll_interval: Seconds to wait between checks for new chunks
+    
+    Returns:
+        List of available consolidated_*.pt files
+    """
+    import time
+    from pathlib import Path
+    
+    checkpoint_dir = Path(output_dir) / "stream_checkpoints"
+    
+    # Wait for first chunk
+    first_chunk = checkpoint_dir / "consolidated_000.pt"
+    print("\n⏳ Waiting for first consolidated chunk...")
+    print(f"   Watching: {checkpoint_dir}")
+    print(f"   Encoding is running in parallel (check other output)\n")
+    
+    while not first_chunk.exists():
+        time.sleep(30)  # Check every 30 seconds
+    
+    print(f"✅ First chunk ready: {first_chunk.name}")
+    
+    # Return all available chunks
+    chunks = sorted(checkpoint_dir.glob("consolidated_*.pt"))
+    size_gb = sum(c.stat().st_size for c in chunks) / (1024**3)
+    print(f"📦 Found {len(chunks)} chunk(s) ({size_gb:.2f}GB)\n")
+    
+    return chunks
+
+def download_and_build_dataset(model_config: dict, force_rebuild: bool = False, incremental: bool = True):
+    """Download dataset and build preprocessed files.
+    
+    Args:
+        incremental: If True, wait for consolidated chunks and start training early
+    """
     dataset_args = model_config['dataset_args']
     
     # Handle both list and dict formats
@@ -154,14 +191,28 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False):
     
     output_dir = dataset_args.get('output_dir', 'datasets/default')
     
-    # Check if already exists
-    if check_dataset_exists(output_dir):
+    # Check if already exists (fully built)
+    if check_dataset_exists(output_dir) and not incremental:
         if not force_rebuild:
             print(f"\nDataset found at: {output_dir}")
             print("   Skipping dataset building (use --rebuild-dataset to force rebuild)")
             return True
         else:
             print(f"\n🔄 Rebuilding dataset at: {output_dir}")
+    
+    # Incremental mode: Check for consolidated chunks
+    if incremental:
+        checkpoint_dir = Path(output_dir) / "stream_checkpoints"
+        if checkpoint_dir.exists():
+            chunks = list(checkpoint_dir.glob("consolidated_*.pt"))
+            if chunks:
+                print(f"\n⚡ INCREMENTAL MODE: Found {len(chunks)} consolidated chunks")
+                print(f"   Training will start on available data while encoding continues")
+                return True  # Dataset partially ready
+        
+        print(f"\n⚡ INCREMENTAL MODE: Dataset encoding in progress")
+        print(f"   Training will start as soon as first chunk is ready")
+        return True  # Will wait for chunks in training phase
     
     print(f"\n📦 Building dataset: {output_dir}")
     print("-" * 70)
@@ -334,6 +385,11 @@ Auto-Resume:
         action="store_true",
         help="Only build dataset, don't train"
     )
+    parser.add_argument(
+        "--no-incremental",
+        action="store_true",
+        help="Disable incremental training (wait for full dataset)"
+    )
     
     args, unknown_args = parser.parse_known_args()
     
@@ -347,8 +403,9 @@ Auto-Resume:
     selected_model = "vision-unified"
     model_config = MODELS[selected_model]
     
-    # Dataset preparation (auto-skips if exists unless --rebuild-dataset)
-    success = download_and_build_dataset(model_config, force_rebuild=args.rebuild_dataset)
+    # Dataset preparation
+    incremental_mode = not args.no_incremental
+    success = download_and_build_dataset(model_config, force_rebuild=args.rebuild_dataset, incremental=incremental_mode)
     if not success:
         print("\n❌ Cannot proceed without dataset. Exiting.")
         sys.exit(1)
@@ -356,6 +413,20 @@ Auto-Resume:
     if args.dataset_only:
         print("\n✅ Dataset preparation complete. Exiting (--dataset-only).")
         sys.exit(0)
+    
+    # Incremental mode: Wait for consolidated chunks
+    if incremental_mode:
+        dataset_args = model_config.get('dataset_args', [])
+        if isinstance(dataset_args, list):
+            output_dir = _extract_output_dir_from_args(dataset_args)
+        else:
+            output_dir = dataset_args.get('output_dir')
+        
+        if output_dir:
+            chunks = wait_for_consolidated_chunks(output_dir)
+            print(f"🚀 Starting training with {len(chunks)} chunk(s)")
+            print(f"   Encoding continues in background")
+            print(f"   Training will use progressively more data as chunks complete\n")
     
     # Auto-resume from checkpoint if it exists
     checkpoint_info = get_checkpoint_info()
