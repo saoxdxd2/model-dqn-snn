@@ -360,16 +360,13 @@ class StreamingCacheEncoder:
         self.consolidation_pause.clear()
         print(f"⏸️  Pausing encoding and caching...")
         
-        # Wait for both threads to actually pause
+        # Wait for both threads to actually pause (no timeout - wait until done)
         import time
-        max_wait = 10  # seconds
-        waited = 0
-        while waited < max_wait:
+        while True:
             with self.threads_paused_lock:
                 if self.threads_paused_count >= 2:
                     break
             time.sleep(0.1)
-            waited += 0.1
         
         print(f"📤 Consolidating batches {start_idx}-{end_idx}...")
         
