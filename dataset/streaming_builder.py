@@ -50,6 +50,8 @@ class StreamingCacheEncoder:
         self.new_batches_start_idx = 0  # Index where NEW batches start (after resume)
         self.consolidation_pause = threading.Event()  # Pause threads during consolidation
         self.consolidation_pause.set()  # Start unpaused
+        self.threads_paused_count = 0  # Track how many threads are paused
+        self.threads_paused_lock = threading.Lock()  # Lock for paused counter
         
     def producer_thread(self, samples, renderer, start_threshold=50000):
         """
@@ -71,7 +73,12 @@ class StreamingCacheEncoder:
         
         for i in range(0, total, batch_size):
             # Wait if consolidation is in progress
-            self.consolidation_pause.wait()
+            if not self.consolidation_pause.is_set():
+                with self.threads_paused_lock:
+                    self.threads_paused_count += 1
+                self.consolidation_pause.wait()
+                with self.threads_paused_lock:
+                    self.threads_paused_count -= 1
             
             batch = samples[i:i+batch_size]
             
@@ -225,7 +232,12 @@ class StreamingCacheEncoder:
         with torch.no_grad():
             while sample_idx < len(samples):
                 # Wait if consolidation is in progress
-                self.consolidation_pause.wait()
+                if not self.consolidation_pause.is_set():
+                    with self.threads_paused_lock:
+                        self.threads_paused_count += 1
+                    self.consolidation_pause.wait()
+                    with self.threads_paused_lock:
+                        self.threads_paused_count -= 1
                 
                 # Wait until this batch is fully cached
                 batch_end = min(sample_idx + self.batch_size, len(samples))
@@ -347,34 +359,59 @@ class StreamingCacheEncoder:
         # Pause producer and consumer threads during consolidation
         self.consolidation_pause.clear()
         print(f"⏸️  Pausing encoding and caching...")
+        
+        # Wait for both threads to actually pause
         import time
-        time.sleep(0.5)  # Give threads time to pause
+        max_wait = 10  # seconds
+        waited = 0
+        while waited < max_wait:
+            with self.threads_paused_lock:
+                if self.threads_paused_count >= 2:
+                    break
+            time.sleep(0.1)
+            waited += 0.1
         
         print(f"📤 Consolidating batches {start_idx}-{end_idx}...")
         
-        # Load and concatenate this chunk (skip corrupted files gracefully)
-        chunk_data = {'sketches': [], 'checksums': [], 'children': []}
+        # Load and concatenate in smaller chunks to avoid OOM
+        # Process 20 batches at a time instead of all 100+
+        mini_chunk_size = 20
+        all_consolidated = {'sketches': [], 'checksums': [], 'children': []}
         corrupted_files = []
         
-        for batch_file in batch_subset:
-            if os.path.exists(batch_file):
-                try:
-                    batch = torch.load(batch_file, map_location='cpu')
-                    for key in chunk_data:
-                        if key in batch and batch[key] is not None:
-                            chunk_data[key].append(batch[key])
-                    del batch
-                except Exception as e:
-                    # Skip corrupted files from previous sessions
-                    corrupted_files.append(batch_file)
-                    continue
+        for mini_start in range(0, len(batch_subset), mini_chunk_size):
+            mini_end = min(mini_start + mini_chunk_size, len(batch_subset))
+            mini_batch_files = batch_subset[mini_start:mini_end]
+            
+            chunk_data = {'sketches': [], 'checksums': [], 'children': []}
+            
+            for batch_file in mini_batch_files:
+                if os.path.exists(batch_file):
+                    try:
+                        batch = torch.load(batch_file, map_location='cpu')
+                        for key in chunk_data:
+                            if key in batch and batch[key] is not None:
+                                chunk_data[key].append(batch[key])
+                        del batch
+                    except Exception as e:
+                        corrupted_files.append(batch_file)
+                        continue
+            
+            # Concatenate this mini chunk
+            for key in chunk_data:
+                if chunk_data[key]:
+                    mini_concat = torch.cat(chunk_data[key], dim=0)
+                    all_consolidated[key].append(mini_concat)
+                    del mini_concat
+            del chunk_data
+            gc.collect()
         
-        # Concatenate chunk
+        # Final concatenation
         consolidated = {}
-        for key in chunk_data:
-            if chunk_data[key]:
-                consolidated[key] = torch.cat(chunk_data[key], dim=0)
-        del chunk_data
+        for key in all_consolidated:
+            if all_consolidated[key]:
+                consolidated[key] = torch.cat(all_consolidated[key], dim=0)
+        del all_consolidated
         
         # Save to drive_dir if available, otherwise checkpoint_dir
         chunk_idx = len(self.drive_checkpoints)
