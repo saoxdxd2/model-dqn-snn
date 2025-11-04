@@ -48,6 +48,11 @@ class ImageCache:
         subdir = cache_key[:2]
         return self.cache_dir / subdir / f"{cache_key}.npy"
     
+    def has_been_cached(self, text: str, width: int, height: int) -> bool:
+        """Check if sample was cached (even if image file deleted to save space)."""
+        cache_key = self._get_cache_key(text, width, height)
+        return cache_key in self.metadata
+    
     def get(self, text: str, width: int, height: int) -> Optional[np.ndarray]:
         """Get cached image if exists."""
         cache_key = self._get_cache_key(text, width, height)

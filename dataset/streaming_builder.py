@@ -88,8 +88,9 @@ class StreamingCacheEncoder:
                 else:
                     text = str(sample)
                 
-                # Check if cached (returns numpy array if cached, None if not)
-                if self.cache.get(text, 224, 224) is None:
+                # Check metadata - don't re-render if already processed
+                # (even if image file was deleted to save disk space)
+                if not self.cache.has_been_cached(text, 224, 224):
                     uncached.append(sample)
                 else:
                     skipped_count += 1
