@@ -48,6 +48,8 @@ class StreamingCacheEncoder:
         self.cached_count = 0  # Number of samples cached so far
         self.cache_threshold_reached = threading.Event()  # Signal when threshold reached
         self.new_batches_start_idx = 0  # Index where NEW batches start (after resume)
+        self.consolidation_pause = threading.Event()  # Pause threads during consolidation
+        self.consolidation_pause.set()  # Start unpaused
         
     def producer_thread(self, samples, renderer, start_threshold=50000):
         """
@@ -68,6 +70,9 @@ class StreamingCacheEncoder:
         pbar = tqdm(total=total, desc="📦 Caching", unit="samples")
         
         for i in range(0, total, batch_size):
+            # Wait if consolidation is in progress
+            self.consolidation_pause.wait()
+            
             batch = samples[i:i+batch_size]
             
             # Filter out already-cached samples
@@ -218,6 +223,9 @@ class StreamingCacheEncoder:
         
         with torch.no_grad():
             while sample_idx < len(samples):
+                # Wait if consolidation is in progress
+                self.consolidation_pause.wait()
+                
                 # Wait until this batch is fully cached
                 batch_end = min(sample_idx + self.batch_size, len(samples))
                 while True:
@@ -335,6 +343,12 @@ class StreamingCacheEncoder:
         if not batch_subset:
             return
         
+        # Pause producer and consumer threads during consolidation
+        self.consolidation_pause.clear()
+        print(f"⏸️  Pausing encoding and caching...")
+        import time
+        time.sleep(0.5)  # Give threads time to pause
+        
         print(f"📤 Consolidating batches {start_idx}-{end_idx}...")
         
         # Load and concatenate this chunk (skip corrupted files gracefully)
@@ -391,6 +405,10 @@ class StreamingCacheEncoder:
         print(f"🧹 Deleted {deleted_count} individual batch files ({freed_mb:.1f}MB freed from Colab)")
         print(f"   Drive location: {self.drive_dir}")
         print(f"   Will sync to: C:\\Users\\sao\\Documents\\model-engine")
+        
+        # Resume producer and consumer threads
+        self.consolidation_pause.set()
+        print(f"▶️  Resuming encoding and caching...\n")
         
         # Clear text cache for consolidated samples to save disk space
         # Saves ~37GB per chunk, prevents Colab disk overflow
