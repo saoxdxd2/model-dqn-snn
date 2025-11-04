@@ -330,9 +330,36 @@ class StreamingCacheEncoder:
         print(f"✅ Saved chunk {chunk_idx} to Drive ({chunk_size_mb:.1f}MB) - will sync to local machine")
         print(f"   Freed {len(batch_subset)} batch files from Colab")
     
+    def _check_resume_state(self):
+        """Check for existing batch/consolidated files and determine resume point.
+        
+        Returns:
+            (samples_already_encoded, existing_batch_files, existing_consolidated_files)
+        """
+        import os
+        from pathlib import Path
+        
+        checkpoint_dir = Path(self.checkpoint_dir)
+        if not checkpoint_dir.exists():
+            return 0, [], []
+        
+        # Check for consolidated files
+        consolidated_files = sorted(checkpoint_dir.glob("consolidated_*.pt"))
+        
+        # Check for batch files
+        batch_files = sorted(checkpoint_dir.glob("batch_*.pt"))
+        
+        # Calculate samples encoded
+        samples_in_consolidated = len(consolidated_files) * 1000 * self.batch_size  # 1000 batches per consolidated
+        samples_in_batches = len(batch_files) * self.batch_size
+        total_encoded = samples_in_consolidated + samples_in_batches
+        
+        return total_encoded, batch_files, consolidated_files
+    
     def stream_build(self, samples, renderer, start_threshold=50000, initial_cache_percent=0):
         """
         Main entry point: Start both threads and coordinate.
+        Supports resume from existing batch/consolidated files.
         
         Args:
             samples: List of samples to process
@@ -342,11 +369,34 @@ class StreamingCacheEncoder:
         Returns:
             Encoded results dict
         """
+        # Check for existing progress
+        samples_encoded, existing_batches, existing_consolidated = self._check_resume_state()
+        
+        if samples_encoded > 0:
+            print(f"\n🔄 RESUME MODE: Found existing progress")
+            print(f"   Consolidated files: {len(existing_consolidated)} ({len(existing_consolidated) * 1000} batches)")
+            print(f"   Batch files: {len(existing_batches)}")
+            print(f"   Samples already encoded: {samples_encoded:,}/{len(samples):,} ({samples_encoded/len(samples)*100:.1f}%)")
+            print(f"   Resuming from sample {samples_encoded}...\n")
+            
+            # Register existing files
+            self.batch_files.extend(existing_batches)
+            self.drive_checkpoints.extend(existing_consolidated)
+            
+            # Skip already processed samples
+            samples = samples[samples_encoded:]
+            
+            if len(samples) == 0:
+                print("✅ All samples already encoded!")
+                # Load and return existing results
+                return self._load_existing_results()
+        
         # Adjust threshold based on initial cache
         if initial_cache_percent < 5:
             # If cache is empty/minimal, start GPU after just 1 batch
             actual_threshold = self.batch_size
-            print(f"\n⚡ No cache found - using fast start mode")
+            if samples_encoded == 0:
+                print(f"\n⚡ No cache found - using fast start mode")
         else:
             actual_threshold = start_threshold
         
@@ -386,6 +436,13 @@ class StreamingCacheEncoder:
             if remaining_batches > 0:
                 print(f"\n📤 Consolidating final {remaining_batches} batches...")
                 self._consolidate_to_drive(len(self.batch_files))
+        
+        return self._load_existing_results()
+    
+    def _load_existing_results(self):
+        """Load results from existing consolidated files and remaining batches."""
+        import os
+        import gc
         
         # Load from local consolidated files
         print(f"\n📚 Loading {len(self.drive_checkpoints)} consolidated chunks from local disk...")
