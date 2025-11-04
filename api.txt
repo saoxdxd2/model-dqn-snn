@@ -85,6 +85,8 @@ print("="*70 + "\n")
 
 
 
+
+!find datasets/vision_unified/text_cache -name "*.npy" -type f -delete
 import tarfile
 import os
 import shutil
