@@ -72,13 +72,16 @@ class StreamingCacheEncoder:
         pbar = tqdm(total=total, desc="📦 Caching", unit="samples")
         
         for i in range(0, total, batch_size):
-            # Wait if consolidation is in progress
+            # Always check pause state (returns immediately if not paused)
+            # Prevents race condition where pause happens between check and processing
             if not self.consolidation_pause.is_set():
                 with self.threads_paused_lock:
                     self.threads_paused_count += 1
-                self.consolidation_pause.wait()
-                with self.threads_paused_lock:
-                    self.threads_paused_count -= 1
+                try:
+                    self.consolidation_pause.wait()
+                finally:
+                    with self.threads_paused_lock:
+                        self.threads_paused_count -= 1
             
             batch = samples[i:i+batch_size]
             
@@ -231,13 +234,16 @@ class StreamingCacheEncoder:
         
         with torch.no_grad():
             while sample_idx < len(samples):
-                # Wait if consolidation is in progress
+                # Always check pause state (returns immediately if not paused)
+                # Prevents race condition where pause happens between check and processing
                 if not self.consolidation_pause.is_set():
                     with self.threads_paused_lock:
                         self.threads_paused_count += 1
-                    self.consolidation_pause.wait()
-                    with self.threads_paused_lock:
-                        self.threads_paused_count -= 1
+                    try:
+                        self.consolidation_pause.wait()
+                    finally:
+                        with self.threads_paused_lock:
+                            self.threads_paused_count -= 1
                 
                 # Wait until this batch is fully cached
                 batch_end = min(sample_idx + self.batch_size, len(samples))
