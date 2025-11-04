@@ -47,6 +47,7 @@ class StreamingCacheEncoder:
         # Parallel execution tracking
         self.cached_count = 0  # Number of samples cached so far
         self.cache_threshold_reached = threading.Event()  # Signal when threshold reached
+        self.new_batches_start_idx = 0  # Index where NEW batches start (after resume)
         
     def producer_thread(self, samples, renderer, start_threshold=50000):
         """
@@ -204,7 +205,9 @@ class StreamingCacheEncoder:
                             with self.lock:
                                 self.batch_files.append(existing_file)
                     
-                    # Don't update cached_count - producer will handle caching the sliced array
+                    # Mark where new batches start (for consolidation)
+                    with self.lock:
+                        self.new_batches_start_idx = check_batch
                     
                     if check_batch > 0:
                         print(f"⏩ Skipped {check_batch} existing batches (already in checkpoint files)")
@@ -334,15 +337,22 @@ class StreamingCacheEncoder:
         
         print(f"📤 Consolidating batches {start_idx}-{end_idx}...")
         
-        # Load and concatenate this chunk
+        # Load and concatenate this chunk (skip corrupted files gracefully)
         chunk_data = {'sketches': [], 'checksums': [], 'children': []}
+        corrupted_files = []
+        
         for batch_file in batch_subset:
             if os.path.exists(batch_file):
-                batch = torch.load(batch_file, map_location='cpu')
-                for key in chunk_data:
-                    if key in batch and batch[key] is not None:
-                        chunk_data[key].append(batch[key])
-                del batch
+                try:
+                    batch = torch.load(batch_file, map_location='cpu')
+                    for key in chunk_data:
+                        if key in batch and batch[key] is not None:
+                            chunk_data[key].append(batch[key])
+                    del batch
+                except Exception as e:
+                    # Skip corrupted files from previous sessions
+                    corrupted_files.append(batch_file)
+                    continue
         
         # Concatenate chunk
         consolidated = {}
@@ -364,11 +374,15 @@ class StreamingCacheEncoder:
         chunk_size_mb = os.path.getsize(consolidated_file) / 1024 / 1024
         print(f"✅ Saved consolidated chunk {chunk_idx} ({chunk_size_mb:.1f}MB)")
         
+        # Report corrupted files that were skipped
+        if corrupted_files:
+            print(f"⚠️  Skipped {len(corrupted_files)} corrupted batch files from previous session")
+        
         # Delete individual batch files to free Colab disk space
         deleted_count = 0
         freed_mb = 0
         for batch_file in batch_subset:
-            if os.path.exists(batch_file):
+            if os.path.exists(batch_file) and batch_file not in corrupted_files:
                 batch_size_mb = os.path.getsize(batch_file) / 1024 / 1024
                 os.remove(batch_file)
                 deleted_count += 1
