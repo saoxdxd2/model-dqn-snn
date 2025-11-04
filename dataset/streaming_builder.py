@@ -63,7 +63,8 @@ class StreamingCacheEncoder:
         from dataset.image_cache import ImageCache
         
         # Render in batches (skip already cached)
-        batch_size = 1000
+        # Small batches = frequent pause checks (responds to consolidation faster)
+        batch_size = 100
         total = len(samples)
         cached_count = 0
         skipped_count = 0
