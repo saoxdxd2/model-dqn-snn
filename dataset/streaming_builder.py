@@ -280,9 +280,9 @@ class StreamingCacheEncoder:
                 if batch_count % 500 == 0:
                     pbar.write(f"💾 Saved {batch_count} batches to disk")
                 
-                # Consolidate to Drive every 1000 batches (free disk space)
-                if batch_count % 1000 == 0 and self.drive_dir:
-                    pbar.write(f"📤 Consolidating {batch_count} batches...")
+                # Consolidate every 100 batches to prevent disk overflow (critical for Colab)
+                if batch_count % 100 == 0 and self.checkpoint_dir:
+                    pbar.write(f"📤 Consolidating batches to free disk space...")
                     self._consolidate_to_drive(batch_count)
                 
                 # Move to next batch
@@ -293,19 +293,20 @@ class StreamingCacheEncoder:
         print(f"✅ Consumer: Encoding complete")
     
     def _consolidate_to_drive(self, up_to_batch):
-        """Consolidate processed batches to Drive and clean up local files."""
+        """Consolidate processed batches and clean up local files to free disk space."""
         import os
         import gc
         
-        # Find batches we haven't saved to Drive yet
-        start_idx = len(self.drive_checkpoints) * 1000
+        # Find batches we haven't consolidated yet (100 batches per chunk)
+        chunk_size = 100
+        start_idx = len(self.drive_checkpoints) * chunk_size
         end_idx = up_to_batch
         batch_subset = self.batch_files[start_idx:end_idx]
         
         if not batch_subset:
             return
         
-        print(f"📤 Consolidating batches {start_idx}-{end_idx} to Drive...")
+        print(f"📤 Consolidating batches {start_idx}-{end_idx}...")
         
         # Load and concatenate this chunk
         chunk_data = {'sketches': [], 'checksums': [], 'children': []}
@@ -324,17 +325,18 @@ class StreamingCacheEncoder:
                 consolidated[key] = torch.cat(chunk_data[key], dim=0)
         del chunk_data
         
-        # Save to Drive (will sync to user's local machine automatically)
+        # Save to drive_dir if available, otherwise checkpoint_dir
         chunk_idx = len(self.drive_checkpoints)
-        drive_file = os.path.join(self.drive_dir, f"consolidated_{chunk_idx:03d}.pt")
+        save_dir = self.drive_dir if self.drive_dir else self.checkpoint_dir
+        consolidated_file = os.path.join(save_dir, f"consolidated_{chunk_idx:03d}.pt")
         
-        torch.save(consolidated, drive_file)
-        self.drive_checkpoints.append(drive_file)
+        torch.save(consolidated, consolidated_file)
+        self.drive_checkpoints.append(consolidated_file)
         del consolidated
         gc.collect()
         
-        chunk_size_mb = os.path.getsize(drive_file) / 1024 / 1024
-        print(f"✅ Saved consolidated chunk {chunk_idx} to Drive ({chunk_size_mb:.1f}MB)")
+        chunk_size_mb = os.path.getsize(consolidated_file) / 1024 / 1024
+        print(f"✅ Saved consolidated chunk {chunk_idx} ({chunk_size_mb:.1f}MB)")
         
         # Delete individual batch files to free Colab disk space
         deleted_count = 0
@@ -487,8 +489,8 @@ class StreamingCacheEncoder:
         import os
         import gc
         
-        if self.drive_dir:
-            remaining_batches = len(self.batch_files) - (len(self.drive_checkpoints) * 1000)
+        if self.checkpoint_dir:
+            remaining_batches = len(self.batch_files) - (len(self.drive_checkpoints) * 100)
             if remaining_batches > 0:
                 print(f"\n📤 Consolidating final {remaining_batches} batches...")
                 self._consolidate_to_drive(len(self.batch_files))
