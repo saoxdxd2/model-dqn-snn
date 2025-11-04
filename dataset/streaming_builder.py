@@ -120,7 +120,8 @@ class StreamingCacheEncoder:
                 'skipped': skipped_count
             })
             
-            # Update cached count for consumer (only after samples verified in cache)
+            # Update cached count for consumer
+            processed_so_far = i + len(batch)
             with self.lock:
                 self.cached_count = processed_so_far
                 # Signal GPU to start after threshold
