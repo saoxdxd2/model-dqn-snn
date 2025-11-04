@@ -176,6 +176,8 @@ class StreamingCacheEncoder:
                 # Load this batch from cache
                 batch_samples = samples[sample_idx:batch_end]
                 batch_images = []
+                missing_count = 0
+                
                 for sample in batch_samples:
                     if hasattr(sample, 'text'):
                         text = sample.text
@@ -189,9 +191,23 @@ class StreamingCacheEncoder:
                     img = self.cache.get(text, 224, 224)
                     if img is not None:
                         batch_images.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
+                    else:
+                        missing_count += 1
+                
+                # If batch is incomplete, wait a bit longer
+                if missing_count > 0:
+                    if not self.cache_complete.is_set():
+                        pbar.write(f"⏳ Batch {batch_count}: {missing_count}/{len(batch_samples)} samples not cached yet, waiting...")
+                        time.sleep(1)
+                        continue  # Retry this batch
+                    else:
+                        pbar.write(f"⚠️  Batch {batch_count}: {missing_count} samples missing (cache complete)")
                 
                 if not batch_images:
-                    break
+                    # Skip this batch if no images available
+                    sample_idx = batch_end
+                    pbar.update(1)
+                    continue
                 
                 batch_images = torch.stack(batch_images).to(self.device)
                 result = self.encoder(images=batch_images, return_children=True)
