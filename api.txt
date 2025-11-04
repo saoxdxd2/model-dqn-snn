@@ -1,14 +1,14 @@
 dab2e42da43bc44934cb07d7973984cad6a4407a
 
-# === Colab Setup with Local Zip Transfer (No Drive) ===
-import os, shutil, zipfile
+# === Colab Setup with Local Tar Transfer (No Drive) ===
+import os, shutil, tarfile
 from pathlib import Path
 from google.colab import files
 
 print("="*70)
 print("🛠️  Colab Setup - Local Transfer Mode")
 print("   No Google Drive needed")
-print("   Transfer via zip upload/download")
+print("   Transfer via tar upload/download (faster, no compression)")
 print("="*70 + "\n")
 
 # 1. Clone or update repo
@@ -27,20 +27,20 @@ else:
 checkpoints_dir = Path('model_checkpoints')
 
 if not checkpoints_dir.exists():
-    print("\n📤 No checkpoints found. Upload zip from your E:\\ drive?")
-    print("   Expected: model-dqn-snn.zip (contains model_checkpoints/)")
-    response = input("Upload zip? (y/n): ").lower()
+    print("\n📤 No checkpoints found. Upload tar from your E:\\ drive?")
+    print("   Expected: model-dqn-snn.tar (contains model_checkpoints/)")
+    response = input("Upload tar? (y/n): ").lower()
     
     if response == 'y':
-        print("📦 Upload your model-dqn-snn.zip file...")
+        print("📦 Upload your model-dqn-snn.tar file...")
         uploaded = files.upload()
         
         if uploaded:
-            zip_filename = list(uploaded.keys())[0]
-            print(f"\n📜 Extracting {zip_filename}...")
+            tar_filename = list(uploaded.keys())[0]
+            print(f"\n📜 Extracting {tar_filename}...")
             
-            with zipfile.ZipFile(zip_filename, 'r') as zip_ref:
-                zip_ref.extractall('/content/temp_extract')
+            with tarfile.open(tar_filename, 'r') as tar:
+                tar.extractall('/content/temp_extract')
             
             # Find and copy model_checkpoints from extracted content
             extracted_checkpoints = Path('/content/temp_extract/model-dqn-snn/model_checkpoints')
@@ -57,9 +57,9 @@ if not checkpoints_dir.exists():
                 
                 # Cleanup
                 shutil.rmtree('/content/temp_extract')
-                os.remove(zip_filename)
+                os.remove(tar_filename)
             else:
-                print("⚠️  No model_checkpoints/ found in zip")
+                print("⚠️  No model_checkpoints/ found in tar")
         else:
             print("ℹ️  No file uploaded, starting fresh")
     else:
@@ -79,29 +79,74 @@ print("\n" + "="*70)
 print("🚀 Starting Training")
 print("   First run: ~5.6 hours (cache + encode)")
 print("   Resume: Continues from model_checkpoints/")
-print("   After: Run zip cell to download back to E:\\")
+print("   After: Run tar cell to download back to E:\\")
 print("="*70 + "\n")
 !python train.py
 
 
 
-import shutil
+import tarfile
 import os
+import shutil
 
-# Define the path to the directory you want to zip
-directory_to_zip = 'model-dqn-snn'
+os.chdir('/content')
 
-# Define the name for the output zip file
-output_zip_file = 'model-dqn-snn.zip'
+print('📦 Creating tar with recursive space-saving mode...')
+print('   Archives deepest subdirectories first, deletes as it goes\n')
 
-# Create a zip archive of the directory
-shutil.make_archive(output_zip_file.replace('.zip', ''), 'zip', directory_to_zip)
+def get_all_subdirs(base_path):
+    """Get all subdirectories sorted by depth (deepest first)."""
+    all_dirs = []
+    for root, dirs, files in os.walk(base_path):
+        for d in dirs:
+            full_path = os.path.join(root, d)
+            depth = full_path.count(os.sep)
+            all_dirs.append((depth, full_path))
+    # Sort by depth (deepest first) so we delete leaf directories first
+    all_dirs.sort(reverse=True, key=lambda x: x[0])
+    return [path for _, path in all_dirs]
 
-print(f'Successfully created {output_zip_file}')
+def get_dir_size(path):
+    """Get total size of directory in MB."""
+    total = 0
+    for root, dirs, files in os.walk(path):
+        for f in files:
+            fp = os.path.join(root, f)
+            if os.path.exists(fp):
+                total += os.path.getsize(fp)
+    return total / (1024**2)
+
+base_dir = 'model-dqn-snn'
+
+# Get all subdirectories (deepest first)
+all_subdirs = get_all_subdirs(base_dir)
+print(f'Found {len(all_subdirs)} subdirectories to process\n')
+
+with tarfile.open('model-dqn-snn.tar', 'w') as tar:
+    # Archive deepest directories first
+    for i, dir_path in enumerate(all_subdirs, 1):
+        if not os.path.exists(dir_path):  # Skip if already deleted
+            continue
+            
+        rel_path = os.path.relpath(dir_path, '.')
+        dir_size = get_dir_size(dir_path)
+        
+        print(f'{i}/{len(all_subdirs)} {rel_path} (~{dir_size:.0f}MB)')
+        tar.add(dir_path, arcname=rel_path)
+        shutil.rmtree(dir_path)
+        print(f'         ✅ Freed ~{dir_size:.0f}MB\n')
+    
+    # Archive remaining files in base directory
+    print('Adding remaining files...')
+    for item in os.listdir(base_dir):
+        item_path = os.path.join(base_dir, item)
+        if os.path.isfile(item_path):
+            tar.add(item_path, arcname=item_path)
+    print('    ✅ Done\n')
+
+print('✅ Successfully created model-dqn-snn.tar')
+print('   All source directories deleted to save space')
+print('   Downloading...\n')
+
 from google.colab import files
-
-# Define the name of the zip file
-output_zip_file = 'model-dqn-snn.zip'
-
-# Download the file
-files.download(output_zip_file)
+files.download('model-dqn-snn.tar')
