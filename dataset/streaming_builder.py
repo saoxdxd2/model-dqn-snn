@@ -329,6 +329,42 @@ class StreamingCacheEncoder:
         chunk_size_mb = os.path.getsize(drive_file) / 1024 / 1024
         print(f"✅ Saved chunk {chunk_idx} to Drive ({chunk_size_mb:.1f}MB) - will sync to local machine")
         print(f"   Freed {len(batch_subset)} batch files from Colab")
+        
+        # Clear text cache for consolidated samples to save disk space
+        # Saves ~37GB per chunk, prevents Colab disk overflow
+        # Cache will be rebuilt on resume if needed (5-10 min for 256k samples)
+        self._clear_cache_for_consolidated_samples(start_idx * self.batch_size, end_idx * self.batch_size)
+    
+    def _clear_cache_for_consolidated_samples(self, start_idx, end_idx):
+        """Clear text cache for samples that have been consolidated to save disk space.
+        
+        Args:
+            start_idx: Starting sample index
+            end_idx: Ending sample index
+        """
+        import shutil
+        print(f"\n🧹 Clearing text cache for consolidated samples {start_idx:,}-{end_idx:,}...")
+        
+        # The cache is stored in model_checkpoints/text_cache/
+        # We can't easily map sample indices to cache keys, so clear entire cache
+        # This is safe because consolidated samples are already encoded
+        cache_dir = self.cache.cache_dir
+        
+        if cache_dir.exists():
+            # Count files before deletion
+            cache_files = list(cache_dir.rglob('*.npy'))
+            cache_size_gb = sum(f.stat().st_size for f in cache_files) / (1024**3)
+            
+            # Delete cache directory
+            shutil.rmtree(cache_dir)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Recreate metadata
+            self.cache.metadata = {}
+            self.cache._save_metadata()
+            
+            print(f"✅ Cleared {len(cache_files):,} cached images ({cache_size_gb:.2f}GB freed)")
+            print(f"   Cache will rebuild for remaining samples as needed")
     
     def _check_resume_state(self):
         """Check for existing batch/consolidated files and determine resume point.
