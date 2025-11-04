@@ -185,7 +185,29 @@ class StreamingCacheEncoder:
         sample_idx = 0
         total_batches = (len(samples) + self.batch_size - 1) // self.batch_size
         
-        pbar = tqdm(total=total_batches, desc="GPU Encoding")
+        # Fast-forward: find first missing batch to skip checking existing ones
+        if self.checkpoint_dir:
+            print(f"🔍 Fast-forwarding to first unencoded batch...")
+            for check_batch in range(total_batches):
+                batch_file = os.path.join(self.checkpoint_dir, f"batch_{check_batch:05d}.pt")
+                if not os.path.exists(batch_file):
+                    # Found first missing batch
+                    batch_count = check_batch
+                    sample_idx = check_batch * self.batch_size
+                    
+                    # Register all existing batches before this point
+                    for i in range(check_batch):
+                        existing_file = os.path.join(self.checkpoint_dir, f"batch_{i:05d}.pt")
+                        if os.path.exists(existing_file):
+                            with self.lock:
+                                self.batch_files.append(existing_file)
+                    
+                    if check_batch > 0:
+                        print(f"⏩ Skipped {check_batch} existing batches ({check_batch * self.batch_size:,} samples)")
+                        print(f"▶️  Starting encoding from batch {check_batch}")
+                    break
+        
+        pbar = tqdm(total=total_batches, initial=batch_count, desc="GPU Encoding")
         
         with torch.no_grad():
             while sample_idx < len(samples):
