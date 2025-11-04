@@ -63,6 +63,9 @@ class StreamingCacheEncoder:
         cached_count = 0
         skipped_count = 0
         
+        # Progress bar for caching
+        pbar = tqdm(total=total, desc="📦 Caching", unit="samples")
+        
         for i in range(0, total, batch_size):
             batch = samples[i:i+batch_size]
             
@@ -92,29 +95,32 @@ class StreamingCacheEncoder:
             
             processed_so_far = i + len(batch)
             
+            # Update progress bar
+            pbar.update(len(batch))
+            pbar.set_postfix({
+                'cached': cached_count,
+                'skipped': skipped_count
+            })
+            
             # Update cached count for consumer
             with self.lock:
                 self.cached_count = processed_so_far
                 # Signal GPU to start after threshold
                 if processed_so_far >= start_threshold and not self.cache_threshold_reached.is_set():
-                    print(f"✅ Producer: {processed_so_far} samples cached, signaling GPU to start...")
+                    pbar.write(f"✅ GPU starting after {processed_so_far} samples cached")
                     self.cache_threshold_reached.set()
-            
-            # Progress update
-            if processed_so_far % 50000 == 0:
-                print(f"📦 Producer: {processed_so_far}/{total} processed ({skipped_count} skipped, {cached_count} rendered)")
             
             # Periodic metadata save
             if (i // batch_size) % 5 == 0:
                 self.cache._save_metadata()
         
         # Signal completion
+        pbar.close()
         self.cache_complete.set()
         self.ready_queue.put(None)  # Sentinel to stop consumer
-        print(f"✅ Producer: Complete! {total} samples processed")
+        print(f"✅ Caching complete! {total} samples processed")
         print(f"   {skipped_count} already cached (skipped)")
         print(f"   {cached_count} newly rendered")
-        print(f"   Cache is now 100% complete")
     
     def consumer_thread(self, samples):
         """
@@ -213,10 +219,11 @@ class StreamingCacheEncoder:
                 
                 # Progress update every 500 batches
                 if batch_count % 500 == 0:
-                    print(f"💾 Saved {batch_count} batches to disk (RAM usage: minimal)")
+                    pbar.write(f"💾 Saved {batch_count} batches to disk")
                 
                 # Consolidate to Drive every 1000 batches (free disk space)
                 if batch_count % 1000 == 0 and self.drive_dir:
+                    pbar.write(f"📤 Consolidating {batch_count} batches...")
                     self._consolidate_to_drive(batch_count)
                 
                 # Move to next batch

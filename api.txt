@@ -68,8 +68,11 @@ else:
     print("✅ Found existing model_checkpoints/ (from previous session)")
 
 # 3. Install dependencies
-print("\n📦 Installing dependencies...")
-!pip install -q --no-cache-dir -r requirements.txt
+print("\n📦 Installing dependencies from requirements.txt...")
+print("   This may take 2-3 minutes on first run\n")
+%cd /content/model-dqn-snn
+!pip install --no-cache-dir -r requirements.txt
+print("\n✅ Dependencies installed")
 
 # 4. Start training
 print("\n" + "="*70)

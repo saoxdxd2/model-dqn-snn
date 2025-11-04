@@ -259,9 +259,11 @@ class BaseDatasetBuilder(ABC):
                 print(f"⚠️  Drive not mounted, progress won't be saved to Drive")
             
             from dataset.streaming_builder import StreamingCacheEncoder
+            device = next(self.encoder.parameters()).device
             encoder = StreamingCacheEncoder(
                 cache=cache,
                 encoder=self.encoder,
+                device=device,
                 batch_size=256,
                 checkpoint_dir=str(Path(self.config.output_dir) / "stream_checkpoints"),
                 drive_dir=getattr(self.config, 'drive_dir', None)
