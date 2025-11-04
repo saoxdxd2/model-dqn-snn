@@ -727,12 +727,15 @@ def build(config: MultimodalDatasetConfig):
     """Unified dataset builder - all formats, all modalities."""
     print(f"\n{'='*70}\n🌐 Building: {', '.join(config.source_paths)}\n{'='*70}")
     
-    # Check if dataset already exists and is complete
+    # Check if dataset already exists (final or in-progress)
     import os
+    from pathlib import Path
     train_path = os.path.join(config.output_dir, 'capsule_dataset.pt')
     test_path = os.path.join(config.output_dir, 'capsule_dataset_test.pt')
     info_path = os.path.join(config.output_dir, 'dataset_info.json')
+    checkpoint_dir = os.path.join(config.output_dir, 'stream_checkpoints')
     
+    # Check for completed dataset
     if os.path.exists(train_path) and os.path.exists(test_path) and os.path.exists(info_path):
         print(f"\n✅ Dataset already exists at {config.output_dir}")
         print(f"   Skipping re-encoding to save time")
@@ -746,6 +749,21 @@ def build(config: MultimodalDatasetConfig):
         print(f"   Capsules per sample: {info.get('num_capsules', 'unknown')}")
         print(f"   Hidden size: {info.get('hidden_size', 'unknown')}")
         return
+    
+    # Check for partial progress from streaming builder
+    if os.path.exists(checkpoint_dir):
+        batch_files = list(Path(checkpoint_dir).glob('batch_*.pt'))
+        consolidated_files = list(Path(checkpoint_dir).glob('consolidated_*.pt'))
+        
+        if batch_files or consolidated_files:
+            print(f"\n♻️  Resuming from existing progress")
+            print(f"   Found {len(batch_files)} batch files + {len(consolidated_files)} consolidated chunks")
+            print(f"   Encoding will continue from where it left off")
+            print(f"   Skipping data loading/preprocessing to save time\n")
+            
+            # Skip to encoding step - data already preprocessed
+            # Just need to continue GPU encoding from checkpoints
+            return
     
     # Build pipeline
     builder = MultimodalDatasetBuilder(config)
