@@ -53,6 +53,8 @@ class StreamingCacheEncoder:
         CPU thread: Render samples and add to cache.
         Signals GPU thread once threshold is reached.
         """
+        print(f"📦 Producer: Rendering samples (parallel CPUs)...")
+        
         from dataset.image_cache import ImageCache
         
         # Render in batches (skip already cached)
@@ -60,9 +62,6 @@ class StreamingCacheEncoder:
         total = len(samples)
         cached_count = 0
         skipped_count = 0
-        
-        from tqdm import tqdm
-        pbar = tqdm(total=total, desc="📦 Caching", unit="samples")
         
         for i in range(0, total, batch_size):
             batch = samples[i:i+batch_size]
@@ -98,24 +97,24 @@ class StreamingCacheEncoder:
                 self.cached_count = processed_so_far
                 # Signal GPU to start after threshold
                 if processed_so_far >= start_threshold and not self.cache_threshold_reached.is_set():
-                    pbar.write(f"✅ GPU threshold reached - signaling encoding to start")
+                    print(f"✅ Producer: {processed_so_far} samples cached, signaling GPU to start...")
                     self.cache_threshold_reached.set()
             
-            # Update progress bar
-            pbar.update(len(batch))
-            pbar.set_postfix({'cached': cached_count, 'skipped': skipped_count})
+            # Progress update
+            if processed_so_far % 50000 == 0:
+                print(f"📦 Producer: {processed_so_far}/{total} processed ({skipped_count} skipped, {cached_count} rendered)")
             
             # Periodic metadata save
             if (i // batch_size) % 5 == 0:
                 self.cache._save_metadata()
         
         # Signal completion
-        pbar.close()
         self.cache_complete.set()
         self.ready_queue.put(None)  # Sentinel to stop consumer
-        print(f"\n✅ Caching complete: {total} samples")
-        print(f"   Already cached: {skipped_count}")
-        print(f"   Newly rendered: {cached_count}")
+        print(f"✅ Producer: Complete! {total} samples processed")
+        print(f"   {skipped_count} already cached (skipped)")
+        print(f"   {cached_count} newly rendered")
+        print(f"   Cache is now 100% complete")
     
     def consumer_thread(self, samples):
         """
@@ -123,9 +122,9 @@ class StreamingCacheEncoder:
         Saves each batch immediately to disk.
         """
         # Wait for threshold to be reached
-        print(f"⏳ GPU: Waiting for cache threshold...")
+        print(f"⏳ Consumer: Waiting for initial cache threshold...")
         self.cache_threshold_reached.wait()
-        print(f"🚀 GPU: Starting encoding (caching continues in parallel)...") 
+        print(f"🚀 Consumer: Starting GPU encoding (caching continues in parallel)...") 
         
         # Custom dataset that loads from cache
         class CachedDataset(torch.utils.data.Dataset):
@@ -213,12 +212,11 @@ class StreamingCacheEncoder:
                     torch.cuda.empty_cache()
                 
                 # Progress update every 500 batches
-                if batch_count % 500 == 0 and batch_count > 0:
-                    pbar.write(f"💾 Checkpoint: {batch_count} batches encoded")
+                if batch_count % 500 == 0:
+                    print(f"💾 Saved {batch_count} batches to disk (RAM usage: minimal)")
                 
                 # Consolidate to Drive every 1000 batches (free disk space)
-                if batch_count % 1000 == 0 and batch_count > 0 and self.drive_dir:
-                    pbar.write(f"📤 Consolidating batches to storage...")
+                if batch_count % 1000 == 0 and self.drive_dir:
                     self._consolidate_to_drive(batch_count)
                 
                 # Move to next batch
