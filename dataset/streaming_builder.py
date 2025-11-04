@@ -202,6 +202,11 @@ class StreamingCacheEncoder:
                             with self.lock:
                                 self.batch_files.append(existing_file)
                     
+                    # CRITICAL: Update cached_count to reflect skipped samples
+                    # Consumer needs to know these samples are "available" (already encoded)
+                    with self.lock:
+                        self.cached_count = sample_idx
+                    
                     if check_batch > 0:
                         print(f"⏩ Skipped {check_batch} existing batches ({check_batch * self.batch_size:,} samples)")
                         print(f"▶️  Starting encoding from batch {check_batch}")
