@@ -112,6 +112,11 @@ class ImageCache:
         with Pool(num_workers) as pool:
             results = pool.map(self._render_sample, args_list)
         
+        # CRITICAL: Save rendered images to cache
+        for img_array, text in results:
+            if img_array is not None:  # None means already cached
+                self.put(text, 224, 224, img_array)
+        
         return results
     
     def populate_cache(self, samples, renderer=None, batch_size=1000, save_every=5, num_workers=None):

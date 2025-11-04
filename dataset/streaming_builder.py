@@ -92,6 +92,33 @@ class StreamingCacheEncoder:
             if uncached:
                 self.cache._render_samples_parallel(uncached, num_workers=2)
                 cached_count += len(uncached)
+                
+                # CRITICAL: Verify samples are actually in cache after rendering
+                # Parallel rendering may take time to write to disk
+                import time
+                max_retries = 10
+                for retry in range(max_retries):
+                    missing = []
+                    for sample in uncached[:10]:  # Check first 10 samples
+                        if hasattr(sample, 'text'):
+                            text = sample.text
+                        elif hasattr(sample, 'question'):
+                            text = sample.question
+                        elif isinstance(sample, dict):
+                            text = sample.get('text', '') or sample.get('question', '')
+                        else:
+                            text = str(sample)
+                        
+                        if self.cache.get(text, 224, 224) is None:
+                            missing.append(text[:30])
+                    
+                    if not missing:
+                        break  # All samples verified in cache
+                    
+                    if retry < max_retries - 1:
+                        time.sleep(0.1)  # Wait for parallel workers to finish writing
+                    else:
+                        pbar.write(f"⚠️  Warning: {len(missing)} samples still not in cache after rendering")
             
             processed_so_far = i + len(batch)
             
@@ -102,7 +129,7 @@ class StreamingCacheEncoder:
                 'skipped': skipped_count
             })
             
-            # Update cached count for consumer
+            # Update cached count for consumer (only after samples verified in cache)
             with self.lock:
                 self.cached_count = processed_so_far
                 # Signal GPU to start after threshold
