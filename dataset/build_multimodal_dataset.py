@@ -751,19 +751,17 @@ def build(config: MultimodalDatasetConfig):
         return
     
     # Check for partial progress from streaming builder
-    resume_mode = False
+    # Note: We don't return early - the streaming builder has its own resume logic
+    # in _check_resume_state() that will skip already-encoded samples
     if os.path.exists(checkpoint_dir):
         batch_files = list(Path(checkpoint_dir).glob('batch_*.pt'))
         consolidated_files = list(Path(checkpoint_dir).glob('consolidated_*.pt'))
         
         if batch_files or consolidated_files:
-            print(f"\n♻️  Resuming from existing progress")
-            print(f"   Found {len(batch_files)} batch files + {len(consolidated_files)} consolidated chunks")
-            print(f"   GPU encoding will continue from batch {len(batch_files)}")
-            print(f"   Skipping data loading/preprocessing to save time\n")
-            resume_mode = True
+            print(f"\n♻️  Found existing progress: {len(batch_files)} batches + {len(consolidated_files)} chunks")
+            print(f"   Streaming encoder will resume from where it left off\n")
     
-    # Build pipeline
+    # Build pipeline (only if not resuming)
     builder = MultimodalDatasetBuilder(config)
     dataset = builder.build_dataset()
     
