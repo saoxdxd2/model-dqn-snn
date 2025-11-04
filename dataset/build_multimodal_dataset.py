@@ -727,6 +727,26 @@ def build(config: MultimodalDatasetConfig):
     """Unified dataset builder - all formats, all modalities."""
     print(f"\n{'='*70}\n🌐 Building: {', '.join(config.source_paths)}\n{'='*70}")
     
+    # Check if dataset already exists and is complete
+    import os
+    train_path = os.path.join(config.output_dir, 'capsule_dataset.pt')
+    test_path = os.path.join(config.output_dir, 'capsule_dataset_test.pt')
+    info_path = os.path.join(config.output_dir, 'dataset_info.json')
+    
+    if os.path.exists(train_path) and os.path.exists(test_path) and os.path.exists(info_path):
+        print(f"\n✅ Dataset already exists at {config.output_dir}")
+        print(f"   Skipping re-encoding to save time")
+        print(f"   To rebuild: delete {config.output_dir} and re-run\n")
+        
+        # Load and display info
+        import json
+        with open(info_path) as f:
+            info = json.load(f)
+        print(f"   Train samples: {info.get('num_samples', 'unknown')}")
+        print(f"   Capsules per sample: {info.get('num_capsules', 'unknown')}")
+        print(f"   Hidden size: {info.get('hidden_size', 'unknown')}")
+        return
+    
     # Build pipeline
     builder = MultimodalDatasetBuilder(config)
     dataset = builder.build_dataset()

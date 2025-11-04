@@ -54,7 +54,23 @@ class ImageCache:
         cache_path = self._get_cache_path(cache_key)
         
         if cache_path.exists():
-            return np.load(cache_path)
+            try:
+                img = np.load(cache_path)
+                # Validate shape matches expected dimensions
+                expected_shape = (height, width, 3)
+                if img.shape != expected_shape:
+                    # Corrupted cache, delete and return None
+                    cache_path.unlink()
+                    if cache_key in self.metadata:
+                        del self.metadata[cache_key]
+                    return None
+                return img
+            except Exception as e:
+                # Corrupted file, delete and return None
+                cache_path.unlink()
+                if cache_key in self.metadata:
+                    del self.metadata[cache_key]
+                return None
         return None
     
     def put(self, text: str, width: int, height: int, image: np.ndarray):
