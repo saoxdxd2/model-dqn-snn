@@ -210,9 +210,10 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False, 
                 print(f"   Training will start on available data while encoding continues")
                 return True  # Dataset partially ready
         
-        print(f"\n⚡ INCREMENTAL MODE: Dataset encoding in progress")
-        print(f"   Training will start as soon as first chunk is ready")
-        return True  # Will wait for chunks in training phase
+        # No chunks yet - need to start dataset building
+        print(f"\n⚡ INCREMENTAL MODE: Starting dataset encoding...")
+        print(f"   Training will wait for first chunk, then start on partial data")
+        # Fall through to normal dataset building below
     
     print(f"\n📦 Building dataset: {output_dir}")
     print("-" * 70)
