@@ -193,7 +193,9 @@ class StreamingCacheEncoder:
                 if not os.path.exists(batch_file):
                     # Found first missing batch
                     batch_count = check_batch
-                    sample_idx = check_batch * self.batch_size
+                    # CRITICAL: sample_idx stays at 0 because samples array is already sliced
+                    # The slicing happened in stream_build() before threading
+                    sample_idx = 0
                     
                     # Register all existing batches before this point
                     for i in range(check_batch):
@@ -202,14 +204,11 @@ class StreamingCacheEncoder:
                             with self.lock:
                                 self.batch_files.append(existing_file)
                     
-                    # CRITICAL: Update cached_count to reflect skipped samples
-                    # Consumer needs to know these samples are "available" (already encoded)
-                    with self.lock:
-                        self.cached_count = sample_idx
+                    # Don't update cached_count - producer will handle caching the sliced array
                     
                     if check_batch > 0:
-                        print(f"⏩ Skipped {check_batch} existing batches ({check_batch * self.batch_size:,} samples)")
-                        print(f"▶️  Starting encoding from batch {check_batch}")
+                        print(f"⏩ Skipped {check_batch} existing batches (already in checkpoint files)")
+                        print(f"▶️  Starting encoding from beginning of remaining {len(samples):,} samples")
                     break
         
         pbar = tqdm(total=total_batches, initial=batch_count, desc="GPU Encoding")
