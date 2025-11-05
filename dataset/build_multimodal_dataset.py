@@ -167,9 +167,19 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         if "raven" in path_lower and not "craven" in path_lower:
             return "raven"
         
-        # ARC JSON format
-        if "arc" in path_lower and path_lower.endswith(".json"):
-            return "arc_json"
+        # ARC JSON format - check both files and directories containing ARC files
+        if "arc" in path_lower:
+            if path_lower.endswith(".json"):
+                return "arc_json"
+            # Check if directory contains ARC challenge files
+            if Path(path).is_dir():
+                import glob
+                # Check for training2 or training challenges
+                arc_files = (glob.glob(str(Path(path) / "*training2_challenges.json")) or 
+                           glob.glob(str(Path(path) / "*training_challenges.json")) or
+                           glob.glob(str(Path(path) / "*challenges.json")))
+                if arc_files:
+                    return "arc_json"
         
         # Maze CSV format
         if "maze" in path_lower and path_lower.endswith(".csv"):
@@ -280,12 +290,14 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
             def json_load(f):
                 return json.load(f)
         
-        # If exact path exists, use it
-        if Path(json_path).exists():
+        # If exact file path exists, use it
+        if Path(json_path).is_file():
             return self._parse_json_format(json_path, 'arc')
         
         # Try to find ARC files with pattern matching
-        base_dir = Path(json_path).parent
+        # If json_path is a directory, use it; otherwise use parent
+        base_dir = Path(json_path) if Path(json_path).is_dir() else Path(json_path).parent
+        print(f"🔍 Searching for ARC files in: {base_dir}")
         if base_dir.exists():
             # Look for ARC challenge files (training2 or training)
             patterns = [
@@ -294,7 +306,9 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
             ]
             
             for pattern in patterns:
+                print(f"   Pattern: {pattern}")
                 matches = glob.glob(pattern)
+                print(f"   Matches: {matches}")
                 if matches:
                     challenges_file = matches[0]
                     # Find corresponding solutions file
