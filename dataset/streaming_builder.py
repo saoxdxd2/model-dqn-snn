@@ -238,6 +238,10 @@ class StreamingCacheEncoder:
                         break
                     time.sleep(0.1)
                 
+                # Check pause before expensive batch loading
+                if not self.consolidation_pause.is_set():
+                    continue  # Exit to top of loop to pause
+                
                 # Load this batch from cache
                 batch_samples = samples[sample_idx:batch_end]
                 batch_images = []
@@ -261,6 +265,10 @@ class StreamingCacheEncoder:
                 
                 # If batch is incomplete, wait a bit longer
                 if missing_count > 0:
+                    # Check if pause requested before retrying
+                    if not self.consolidation_pause.is_set():
+                        continue  # Exit to top of loop to pause
+                    
                     if not self.cache_complete.is_set():
                         pbar.write(f"⏳ Batch {batch_count}: {missing_count}/{len(batch_samples)} samples not cached yet, waiting...")
                         time.sleep(1)
