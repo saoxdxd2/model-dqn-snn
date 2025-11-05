@@ -411,11 +411,13 @@ class StreamingCacheEncoder:
         if corrupted_files:
             print(f"⚠️  Skipped {len(corrupted_files)} corrupted batch files from previous session")
         
-        # Delete individual batch files to free Colab disk space
+        # Delete individual batch files by batch NUMBER, not list index
+        # batch_files list may have gaps from previous consolidations
         deleted_count = 0
         freed_mb = 0
-        for batch_file in batch_subset:
-            if os.path.exists(batch_file) and batch_file not in corrupted_files:
+        for batch_num in range(start_idx, end_idx):
+            batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_num:05d}.pt")
+            if os.path.exists(batch_file):
                 batch_size_mb = os.path.getsize(batch_file) / 1024 / 1024
                 os.remove(batch_file)
                 deleted_count += 1
