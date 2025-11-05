@@ -238,22 +238,12 @@ class StreamingCacheEncoder:
                         break
                     time.sleep(0.1)
                 
-                # Check pause before expensive batch loading
-                if not self.consolidation_pause.is_set():
-                    continue  # Exit to top of loop to pause
-                
                 # Load this batch from cache
                 batch_samples = samples[sample_idx:batch_end]
                 batch_images = []
                 missing_count = 0
-                paused_during_load = False
                 
-                for idx, sample in enumerate(batch_samples):
-                    # Check pause every iteration for immediate response
-                    if not self.consolidation_pause.is_set():
-                        paused_during_load = True
-                        break
-                    
+                for sample in batch_samples:
                     if hasattr(sample, 'text'):
                         text = sample.text
                     elif hasattr(sample, 'question'):
@@ -269,16 +259,8 @@ class StreamingCacheEncoder:
                     else:
                         missing_count += 1
                 
-                # If paused during loading, exit to top of loop to pause properly
-                if paused_during_load:
-                    continue
-                
                 # If batch is incomplete, wait a bit longer
                 if missing_count > 0:
-                    # Check if pause requested before retrying
-                    if not self.consolidation_pause.is_set():
-                        continue  # Exit to top of loop to pause
-                    
                     if not self.cache_complete.is_set():
                         pbar.write(f"⏳ Batch {batch_count}: {missing_count}/{len(batch_samples)} samples not cached yet, waiting...")
                         time.sleep(1)
@@ -362,24 +344,23 @@ class StreamingCacheEncoder:
         if not batch_subset:
             return
         
-        # Pause producer thread during consolidation
-        # Consumer is already here (calling this), so only wait for producer
+        # Pause producer and consumer threads during consolidation
         self.consolidation_pause.clear()
-        print(f"⏸️  Pausing caching (producer thread)...")
+        print(f"⏸️  Pausing encoding and caching...")
         
-        # Wait for producer to pause (consumer is executing this, so count >= 1)
+        # Wait for both threads to actually pause (no timeout - wait until done)
         import time
         wait_start = time.time()
         while True:
             with self.threads_paused_lock:
                 paused = self.threads_paused_count
-                if paused >= 1:  # Only need producer to pause
+                if paused >= 2:
                     break
             
             # Debug: Show waiting status every 5 seconds
             elapsed = time.time() - wait_start
             if int(elapsed) % 5 == 0 and elapsed > 0:
-                print(f"⏳ Waiting for producer to pause... ({paused}/1 paused, {elapsed:.0f}s elapsed)")
+                print(f"⏳ Waiting for threads to pause... ({paused}/2 paused, {elapsed:.0f}s elapsed)")
             time.sleep(0.1)
         
         print(f"📤 Consolidating batches {start_idx}-{end_idx}...")
@@ -453,15 +434,11 @@ class StreamingCacheEncoder:
         
         print(f"🧹 Deleted {deleted_count} individual batch files ({freed_mb:.1f}MB freed from Colab)")
         print(f"   Drive location: {self.drive_dir}")
-        print(f"   Consolidated: batches {start_idx}-{end_idx-1} (files deleted, paths kept for tracking)")
+        print(f"   Will sync to: C:\\Users\\sao\\Documents\\model-engine")
         
-        # IMPORTANT: Do NOT remove entries from batch_files
-        # The list indices must match batch numbers for consolidation math to work
-        # Files are deleted but paths remain for tracking purposes
-        
-        # Resume producer thread (consumer will continue after this returns)
+        # Resume producer and consumer threads
         self.consolidation_pause.set()
-        print(f"▶️  Resuming caching...\n")
+        print(f"▶️  Resuming encoding and caching...\n")
         
         # Note: Cache clearing is disabled to prevent deadlocks
         # Manually clear cache if disk space is critical: find datasets/vision_unified/text_cache -name "*.npy" -delete
