@@ -175,12 +175,18 @@ class PuzzleDataset(IterableDataset):
                         labels = np.concatenate(all_labels, axis=0)
                         num_samples = inputs.shape[0]
                         
+                        # group_indices are boundary markers: [0, 1, 2, ..., N]
+                        # Each sample is its own group (1 sample per puzzle)
+                        # puzzle_indices also boundaries: [0, 1, 2, ..., N]
+                        group_indices = np.arange(num_samples + 1, dtype=np.int32)
+                        puzzle_indices = np.arange(num_samples + 1, dtype=np.int32)
+                        
                         self._data[set_name_] = {
                             "inputs": inputs,
                             "labels": labels,
-                            "puzzle_identifiers": np.arange(num_samples),
-                            "puzzle_indices": np.arange(num_samples),
-                            "group_indices": np.zeros(num_samples, dtype=np.int32)
+                            "puzzle_identifiers": np.arange(num_samples, dtype=np.int32),
+                            "puzzle_indices": puzzle_indices,
+                            "group_indices": group_indices
                         }
                         continue
                 
