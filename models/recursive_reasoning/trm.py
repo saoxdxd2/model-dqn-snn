@@ -434,9 +434,11 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             # Check if input is pre-encoded (from streaming encoder)
             if input.dim() == 3 and input.shape[-1] != self.config.hidden_size:
                 # Pre-encoded capsules need projection: [batch, num_capsules, encoder_hidden] → [batch, num_capsules, model_hidden]
+                # Convert to float if needed (consolidated chunks may be int32)
+                input_float = input.to(self.forward_dtype) if input.dtype in [torch.int32, torch.int64] else input
                 if not hasattr(self, 'capsule_projection'):
-                    self.capsule_projection = torch.nn.Linear(input.shape[-1], self.config.hidden_size, bias=False).to(input.device, input.dtype)
-                embedding = self.capsule_projection(input)
+                    self.capsule_projection = torch.nn.Linear(input_float.shape[-1], self.config.hidden_size, bias=False).to(input_float.device, dtype=self.forward_dtype)
+                embedding = self.capsule_projection(input_float)
             else:
                 embedding = input
         else:
