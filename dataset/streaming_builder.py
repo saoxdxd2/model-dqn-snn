@@ -39,6 +39,10 @@ class StreamingCacheEncoder:
         self.stop_flag = threading.Event()
         self.cache_complete = threading.Event()
         
+        # Thread tracking for deadlock prevention
+        self.producer_thread_ref = None
+        self.consumer_thread_ref = None
+        
         # Direct-to-disk mode (no RAM accumulation)
         self.batch_files = []  # Track individual batch files
         self.drive_checkpoints = []  # Track Drive-saved chunks
@@ -113,6 +117,19 @@ class StreamingCacheEncoder:
                 self.cache._render_samples_parallel(uncached, num_workers=10)
                 cached_count += len(uncached)
                 # Parallel rendering handles disk writes - no verification needed
+            
+            # Check pause AFTER expensive rendering (can take 30-60s for large batches)
+            # Critical: pause may have been requested DURING rendering
+            if not self.consolidation_pause.is_set():
+                pbar.write("🔴 Producer: Pause requested (after rendering), pausing...")
+                with self.threads_paused_lock:
+                    self.threads_paused_count += 1
+                try:
+                    self.consolidation_pause.wait()
+                    pbar.write("🟢 Producer: Resuming after pause")
+                finally:
+                    with self.threads_paused_lock:
+                        self.threads_paused_count -= 1
             
             # Update progress bar
             pbar.update(len(batch))
@@ -370,16 +387,31 @@ class StreamingCacheEncoder:
         # Wait for producer to pause (consumer is executing this, so count >= 1)
         import time
         wait_start = time.time()
+        timeout = 60  # Abort after 60s to prevent infinite deadlock
+        
         while True:
             with self.threads_paused_lock:
                 paused = self.threads_paused_count
                 if paused >= 1:  # Only need producer to pause
                     break
             
+            # Check if producer thread is dead (crashed before pausing)
+            if self.producer_thread_ref and not self.producer_thread_ref.is_alive():
+                print(f"⚠️  WARNING: Producer thread died before pausing (likely crashed)")
+                print(f"   Proceeding with consolidation anyway (files may be incomplete)")
+                break
+            
             # Debug: Show waiting status every 5 seconds
             elapsed = time.time() - wait_start
             if int(elapsed) % 5 == 0 and elapsed > 0:
                 print(f"⏳ Waiting for producer to pause... ({paused}/1 paused, {elapsed:.0f}s elapsed)")
+            
+            # Timeout protection: producer may have crashed
+            if elapsed > timeout:
+                print(f"⚠️  WARNING: Producer did not pause after {timeout}s - may have crashed")
+                print(f"   Proceeding with consolidation anyway (risky but prevents deadlock)")
+                break
+            
             time.sleep(0.1)
         
         print(f"📤 Consolidating batches {start_idx}-{end_idx}...")
@@ -583,13 +615,16 @@ class StreamingCacheEncoder:
             target=self.producer_thread,
             args=(samples, renderer, actual_threshold)
         )
-        producer.start()
-        
-        # Start consumer thread
         consumer = threading.Thread(
             target=self.consumer_thread,
             args=(samples,)
         )
+        
+        # Store thread references for deadlock detection
+        self.producer_thread_ref = producer
+        self.consumer_thread_ref = consumer
+        
+        producer.start()
         consumer.start()
         
         # Wait for both to complete
