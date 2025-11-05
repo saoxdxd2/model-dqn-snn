@@ -288,15 +288,13 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False, 
     print(f"Running: {' '.join(cmd)}\n")
     
     try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(result.stdout)
+        # Stream output in real-time so tqdm progress bars are visible
+        subprocess.run(cmd, check=True)
         print("\n✅ Dataset built successfully!")
         return True
         
     except subprocess.CalledProcessError as e:
         print(f"\n❌ Dataset building failed: {e}")
-        if e.stderr:
-            print(f"Error output: {e.stderr}")
         
         # FALLBACK: Check if partial data exists
         print(f"\n🔍 Checking for usable data...")
