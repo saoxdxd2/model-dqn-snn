@@ -246,8 +246,14 @@ class StreamingCacheEncoder:
                 batch_samples = samples[sample_idx:batch_end]
                 batch_images = []
                 missing_count = 0
+                paused_during_load = False
                 
-                for sample in batch_samples:
+                for idx, sample in enumerate(batch_samples):
+                    # Check pause every iteration for immediate response
+                    if not self.consolidation_pause.is_set():
+                        paused_during_load = True
+                        break
+                    
                     if hasattr(sample, 'text'):
                         text = sample.text
                     elif hasattr(sample, 'question'):
@@ -262,6 +268,10 @@ class StreamingCacheEncoder:
                         batch_images.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
                     else:
                         missing_count += 1
+                
+                # If paused during loading, exit to top of loop to pause properly
+                if paused_during_load:
+                    continue
                 
                 # If batch is incomplete, wait a bit longer
                 if missing_count > 0:
@@ -352,23 +362,24 @@ class StreamingCacheEncoder:
         if not batch_subset:
             return
         
-        # Pause producer and consumer threads during consolidation
+        # Pause producer thread during consolidation
+        # Consumer is already here (calling this), so only wait for producer
         self.consolidation_pause.clear()
-        print(f"⏸️  Pausing encoding and caching...")
+        print(f"⏸️  Pausing caching (producer thread)...")
         
-        # Wait for both threads to actually pause (no timeout - wait until done)
+        # Wait for producer to pause (consumer is executing this, so count >= 1)
         import time
         wait_start = time.time()
         while True:
             with self.threads_paused_lock:
                 paused = self.threads_paused_count
-                if paused >= 2:
+                if paused >= 1:  # Only need producer to pause
                     break
             
             # Debug: Show waiting status every 5 seconds
             elapsed = time.time() - wait_start
             if int(elapsed) % 5 == 0 and elapsed > 0:
-                print(f"⏳ Waiting for threads to pause... ({paused}/2 paused, {elapsed:.0f}s elapsed)")
+                print(f"⏳ Waiting for producer to pause... ({paused}/1 paused, {elapsed:.0f}s elapsed)")
             time.sleep(0.1)
         
         print(f"📤 Consolidating batches {start_idx}-{end_idx}...")
