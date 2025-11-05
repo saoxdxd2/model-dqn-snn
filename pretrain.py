@@ -414,7 +414,7 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             # Use NEW multimodal builder with text rendering support
             build_cmd = [
                 "python", "dataset/build_multimodal_dataset.py",
-                "build-composite",  # Subcommand required
+                "build_composite",  # Subcommand (argdantic uses underscores)
                 "--sources", "kaggle/combined/arc-agi",
                 "--output-dir", "datasets/vision_unified",
                 "--target-capsules", "12",
