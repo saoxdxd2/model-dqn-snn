@@ -514,10 +514,16 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             # Max block size is 4096, not 8192
             try:
                 import torch._inductor.config as inductor_config
+                # Disable aggressive optimizations that require more SMs
                 inductor_config.max_autotune = False
-                inductor_config.triton.max_block = {"X": 4096, "Y": 4096, "Z": 4096}
-            except:
-                pass
+                inductor_config.max_autotune_gemm = False
+                # Set max block size globally (must be set before compilation)
+                inductor_config.triton.max_block = {"X": 4096, "Y": 4096, "Z": 4096, "R": 4096}
+                # Also set the maximum tiles per dimension
+                inductor_config.triton.max_tiles = 4
+                print(f"🔧 Triton config: max_block={inductor_config.triton.max_block}")
+            except Exception as e:
+                print(f"⚠️  Could not configure Triton: {e}")
             model = torch.compile(model)  # type: ignore
 
         # Load checkpoint
