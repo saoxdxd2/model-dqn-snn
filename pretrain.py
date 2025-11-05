@@ -510,6 +510,14 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         print(model)
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
         if "DISABLE_COMPILE" not in os.environ:
+            # Configure Triton for GPU compute capability 7.5 (Tesla T4)
+            # Max block size is 4096, not 8192
+            try:
+                import torch._inductor.config as inductor_config
+                inductor_config.max_autotune = False
+                inductor_config.triton.max_block = {"X": 4096, "Y": 4096, "Z": 4096}
+            except:
+                pass
             model = torch.compile(model)  # type: ignore
 
         # Load checkpoint
