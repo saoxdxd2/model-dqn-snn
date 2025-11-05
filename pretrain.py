@@ -414,10 +414,11 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             # Use NEW multimodal builder with text rendering support
             build_cmd = [
                 "python", "dataset/build_multimodal_dataset.py",
-                "--sources", "kaggle/combined",
-                "--output-dir", "datasets/vision_unified",
-                "--target-capsules", "12",
-                "--num-concepts", "2048"
+                "--source-paths", "kaggle/combined/arc-agi",
+                "--output-dir", "data/arc-aug-5000",
+                "--render-text-to-image", "True",
+                "--use-capsules", "True",
+                "--seed", "42"
             ]
             
             print(f"Running: {' '.join(build_cmd)}\n")

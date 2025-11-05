@@ -112,6 +112,7 @@ def consolidate_batches(checkpoint_dir, drive_dir=None, chunk_size=100):
                         del batch
                     except Exception as e:
                         print(f"⚠️  Corrupted file: {batch_file.name}")
+                        python consolidate_batches.py --checkpoint-dir datasets/vision_unified/stream_checkpoints
                         corrupted_files.append(batch_file)
                         continue
             
