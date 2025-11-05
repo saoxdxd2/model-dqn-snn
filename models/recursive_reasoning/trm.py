@@ -502,30 +502,32 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         )
         
         # Hierarchical attention: compute spatial bias for capsule parent-child structure
+        # Skip for pre-encoded capsules (already have structure from vision encoder)
         spatial_bias = None
-        if getattr(self.config, 'enable_hierarchical_attention', False):
+        if getattr(self.config, 'enable_hierarchical_attention', False) and not is_pre_encoded:
             # Create attention bias that encourages parent-child and sibling attention
             batch_size, seq_len, _ = carry.z_H.shape
             children_per_capsule = getattr(self.config, 'children_per_capsule', 4)
             
             # Build hierarchical structure: position i attends strongly to positions [i*m, (i+1)*m)
-            spatial_bias = torch.zeros(batch_size, seq_len, seq_len, device=carry.z_H.device)
+            # Shape: [batch, 1, seq, seq] for multi-head attention broadcasting
+            spatial_bias = torch.zeros(batch_size, 1, seq_len, seq_len, device=carry.z_H.device)
             for i in range(seq_len):
                 # Parent to children
                 child_start = i * children_per_capsule
                 child_end = min((i + 1) * children_per_capsule, seq_len)
                 if child_start < seq_len:
-                    spatial_bias[:, i, child_start:child_end] = 2.0  # Strong parent→child bias
+                    spatial_bias[:, :, i, child_start:child_end] = 2.0  # Strong parent→child bias
                 
                 # Children to parent
                 parent_idx = i // children_per_capsule
                 if parent_idx < seq_len:
-                    spatial_bias[:, i, parent_idx] = 1.5  # Strong child→parent bias
+                    spatial_bias[:, :, i, parent_idx] = 1.5  # Strong child→parent bias
                 
                 # Siblings (same parent)
                 sibling_start = (i // children_per_capsule) * children_per_capsule
                 sibling_end = min(sibling_start + children_per_capsule, seq_len)
-                spatial_bias[:, i, sibling_start:sibling_end] = 0.5  # Moderate sibling bias
+                spatial_bias[:, :, i, sibling_start:sibling_end] = 0.5  # Moderate sibling bias
 
         # Input encoding
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
