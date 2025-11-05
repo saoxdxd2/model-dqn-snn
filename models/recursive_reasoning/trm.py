@@ -490,9 +490,15 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], 
                 enable_deep_supervision: bool = False, supervision_steps: int = 4) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Detect pre-encoded capsules (already have 2D positional embeddings)
+        is_pre_encoded = (batch["inputs"].dim() == 3 and 
+                         self.capsule_encoder is not None and 
+                         batch["inputs"].shape[-1] != self.config.hidden_size)
+        
         # Prepare positional encodings and hierarchical attention bias
+        # Skip RoPE for pre-encoded capsules (memory: RoPE is ONLY for 1D decoder, NOT for vision encoder)
         seq_info = dict(
-            cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
+            cos_sin=None if is_pre_encoded else (self.rotary_emb() if hasattr(self, "rotary_emb") else None),
         )
         
         # Hierarchical attention: compute spatial bias for capsule parent-child structure
