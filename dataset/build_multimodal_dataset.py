@@ -796,6 +796,14 @@ def build(config: MultimodalDatasetConfig):
         import time
         from tqdm import tqdm
         
+        # Handle empty samples
+        if not samples or len(samples) == 0:
+            return {
+                'sketches': torch.empty(0, 12, 512),
+                'checksums': torch.empty(0, 12, 512),
+                'children': torch.empty(0, 12, 512)
+            }
+        
         all_sketches = []
         all_checksums = []
         all_children = []

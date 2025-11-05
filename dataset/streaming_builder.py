@@ -685,4 +685,60 @@ class StreamingCacheEncoder:
         print(f"   You can delete from Drive after confirming sync completed")
         
         print(f"✅ Complete! Final shape: {result['sketches'].shape}")
+        
+        # Create dataset.json metadata for PuzzleDataset compatibility
+        self._create_dataset_metadata(result)
+        
         return result
+    
+    def _create_dataset_metadata(self, result):
+        """Create train/dataset.json and test/dataset.json for PuzzleDataset."""
+        import json
+        import os
+        from pathlib import Path
+        
+        # Determine output directory (parent of checkpoint_dir)
+        output_dir = Path(self.checkpoint_dir).parent
+        
+        # Create train and test directories
+        train_dir = output_dir / 'train'
+        test_dir = output_dir / 'test'
+        train_dir.mkdir(exist_ok=True)
+        test_dir.mkdir(exist_ok=True)
+        
+        # Calculate metadata from consolidated results
+        num_samples = result['sketches'].shape[0]
+        seq_len = result['sketches'].shape[1]  # num_capsules
+        hidden_size = result['sketches'].shape[2]  # capsule dimension
+        
+        # Create metadata dict (PuzzleDatasetMetadata format)
+        metadata = {
+            'sets': ['default'],
+            'total_groups': num_samples,
+            'seq_len': seq_len,
+            'vocab_size': 2052,  # Standard: 2048 concepts + 4 control tokens
+            'pad_id': 0,
+            'has_labels': False,
+            'num_puzzle_identifiers': 1,
+            'difficulty_weights': [1.0] * num_samples
+        }
+        
+        # Save to train/dataset.json
+        train_metadata_path = train_dir / 'dataset.json'
+        with open(train_metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        # Copy to test/dataset.json (same metadata)
+        test_metadata_path = test_dir / 'dataset.json'
+        with open(test_metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        # Also save capsule_dataset.pt in root for direct loading
+        capsule_path = output_dir / 'capsule_dataset.pt'
+        torch.save(result, capsule_path)
+        
+        print(f"\n📋 Created dataset metadata:")
+        print(f"   ✓ {train_metadata_path}")
+        print(f"   ✓ {test_metadata_path}")
+        print(f"   ✓ {capsule_path}")
+        print(f"   Samples: {num_samples}, Capsules: {seq_len}, Dim: {hidden_size}")
