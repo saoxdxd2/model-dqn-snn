@@ -1,6 +1,7 @@
 import os
 import json
 from typing import Tuple, List, Dict, Optional
+from pathlib import Path
 import numpy as np
 import pydantic
 
@@ -113,22 +114,37 @@ class PuzzleDataset(IterableDataset):
         self._iters = 0
 
     def _load_metadata(self, dataset_path) -> PuzzleDatasetMetadata:
+        # Check if streaming format (consolidated_*.pt files)
+        stream_dir = os.path.join(dataset_path, "stream_checkpoints")
+        if os.path.exists(stream_dir):
+            consolidated_files = sorted(Path(stream_dir).glob("consolidated_*.pt"))
+            if consolidated_files:
+                # Load streaming format metadata from first chunk
+                chunk = torch.load(consolidated_files[0], map_location='cpu')
+                num_samples = sum(torch.load(f, map_location='cpu')['sketches'].shape[0] 
+                                 for f in consolidated_files)
+                
+                # Create metadata for streaming format
+                return PuzzleDatasetMetadata(
+                    seq_len=chunk['sketches'].shape[1],  # Assuming capsule format
+                    vocab_size=0,  # Not applicable for vision
+                    pad_id=0,
+                    ignore_label_id=-100,
+                    blank_identifier_id=0,
+                    num_puzzle_identifiers=num_samples,
+                    total_groups=1,
+                    mean_puzzle_examples=1.0,
+                    total_puzzles=num_samples,
+                    sets=["default"]
+                )
+        
+        # Standard format
         with open(os.path.join(dataset_path, self.split, "dataset.json"), "r") as f:
             return PuzzleDatasetMetadata(**json.load(f))
 
     def _lazy_load_dataset(self):
         if self._data is not None:
             return
-
-        field_mmap_modes = {
-            "inputs": "r",
-            "labels": "r",
-
-            # Keep indices in memory
-            "puzzle_identifiers": None,
-            "puzzle_indices": None,
-            "group_indices": None
-        }
 
         # Load data
         self._data = {}
@@ -138,6 +154,45 @@ class PuzzleDataset(IterableDataset):
                     set_name_ = set_name + str(i)
                 else:
                     set_name_ = set_name
+                
+                # Check if streaming format
+                stream_dir = os.path.join(dataset_path, "stream_checkpoints")
+                if os.path.exists(stream_dir):
+                    consolidated_files = sorted(Path(stream_dir).glob("consolidated_*.pt"))
+                    if consolidated_files:
+                        # Load and concatenate consolidated chunks
+                        all_inputs = []
+                        all_labels = []
+                        
+                        for chunk_file in consolidated_files:
+                            chunk = torch.load(chunk_file, map_location='cpu')
+                            if 'sketches' in chunk:
+                                all_inputs.append(chunk['sketches'].numpy())
+                            if 'checksums' in chunk:
+                                all_labels.append(chunk['checksums'].numpy())
+                        
+                        inputs = np.concatenate(all_inputs, axis=0)
+                        labels = np.concatenate(all_labels, axis=0)
+                        num_samples = inputs.shape[0]
+                        
+                        self._data[set_name_] = {
+                            "inputs": inputs,
+                            "labels": labels,
+                            "puzzle_identifiers": np.arange(num_samples),
+                            "puzzle_indices": np.arange(num_samples),
+                            "group_indices": np.zeros(num_samples, dtype=np.int32)
+                        }
+                        continue
+                
+                # Standard format with .npy files
+                field_mmap_modes = {
+                    "inputs": "r",
+                    "labels": "r",
+                    "puzzle_identifiers": None,
+                    "puzzle_indices": None,
+                    "group_indices": None
+                }
+                
                 self._data[set_name_] = {
                     field_name: np.load(os.path.join(dataset_path, self.split, f"{set_name}__{field_name}.npy"), mmap_mode=mmap_mode)
                     for field_name, mmap_mode in field_mmap_modes.items()
