@@ -127,6 +127,8 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         
         for source_path in self.config.source_paths:
             detected_type = self._detect_source_type(source_path)
+            print(f"🔍 Source: {source_path}")
+            print(f"   Detected type: {detected_type}")
             
             # Tier 1 datasets
             if detected_type == "puzzlevqa":
@@ -167,19 +169,9 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         if "raven" in path_lower and not "craven" in path_lower:
             return "raven"
         
-        # ARC JSON format - check both files and directories containing ARC files
-        if "arc" in path_lower:
-            if path_lower.endswith(".json"):
-                return "arc_json"
-            # Check if directory contains ARC challenge files
-            if Path(path).is_dir():
-                import glob
-                # Check for training2 or training challenges
-                arc_files = (glob.glob(str(Path(path) / "*training2_challenges.json")) or 
-                           glob.glob(str(Path(path) / "*training_challenges.json")) or
-                           glob.glob(str(Path(path) / "*challenges.json")))
-                if arc_files:
-                    return "arc_json"
+        # ARC JSON format - check files ending in .json with 'arc' in name
+        if "arc" in path_lower and path_lower.endswith(".json"):
+            return "arc_json"
         
         # Maze CSV format
         if "maze" in path_lower and path_lower.endswith(".csv"):
@@ -193,7 +185,19 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         if path_lower.endswith((".txt", ".md")) or "text" in path_lower or "wikitext" in path_lower or "tinystories" in path_lower:
             return "text_file"
         
-        # Image datasets
+        # Check if ANY directory contains ARC challenge files (before image_dir check)
+        if Path(path).is_dir():
+            import glob
+            arc_patterns = [
+                "*arc*challenges.json",
+                "*training*challenges.json"
+            ]
+            for pattern in arc_patterns:
+                if glob.glob(str(Path(path) / pattern)):
+                    print(f"   ✓ Found ARC files with pattern: {pattern}")
+                    return "arc_json"
+        
+        # Image datasets (fallback for directories)
         if "cifar" in path_lower or "imagenet" in path_lower or Path(path).is_dir():
             return "image_dir"
         
