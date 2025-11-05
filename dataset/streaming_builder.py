@@ -453,11 +453,15 @@ class StreamingCacheEncoder:
         
         print(f"🧹 Deleted {deleted_count} individual batch files ({freed_mb:.1f}MB freed from Colab)")
         print(f"   Drive location: {self.drive_dir}")
-        print(f"   Will sync to: C:\\Users\\sao\\Documents\\model-engine")
+        print(f"   Consolidated: batches {start_idx}-{end_idx-1} (files deleted, paths kept for tracking)")
         
-        # Resume producer and consumer threads
+        # IMPORTANT: Do NOT remove entries from batch_files
+        # The list indices must match batch numbers for consolidation math to work
+        # Files are deleted but paths remain for tracking purposes
+        
+        # Resume producer thread (consumer will continue after this returns)
         self.consolidation_pause.set()
-        print(f"▶️  Resuming encoding and caching...\n")
+        print(f"▶️  Resuming caching...\n")
         
         # Note: Cache clearing is disabled to prevent deadlocks
         # Manually clear cache if disk space is critical: find datasets/vision_unified/text_cache -name "*.npy" -delete
