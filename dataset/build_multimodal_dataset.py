@@ -127,8 +127,6 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         
         for source_path in self.config.source_paths:
             detected_type = self._detect_source_type(source_path)
-            print(f"🔍 Source: {source_path}")
-            print(f"   Detected type: {detected_type}")
             
             # Tier 1 datasets
             if detected_type == "puzzlevqa":
@@ -169,7 +167,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         if "raven" in path_lower and not "craven" in path_lower:
             return "raven"
         
-        # ARC JSON format - check files ending in .json with 'arc' in name
+        # ARC JSON format
         if "arc" in path_lower and path_lower.endswith(".json"):
             return "arc_json"
         
@@ -185,19 +183,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         if path_lower.endswith((".txt", ".md")) or "text" in path_lower or "wikitext" in path_lower or "tinystories" in path_lower:
             return "text_file"
         
-        # Check if ANY directory contains ARC challenge files (before image_dir check)
-        if Path(path).is_dir():
-            import glob
-            arc_patterns = [
-                "*arc*challenges.json",
-                "*training*challenges.json"
-            ]
-            for pattern in arc_patterns:
-                if glob.glob(str(Path(path) / pattern)):
-                    print(f"   ✓ Found ARC files with pattern: {pattern}")
-                    return "arc_json"
-        
-        # Image datasets (fallback for directories)
+        # Image datasets
         if "cifar" in path_lower or "imagenet" in path_lower or Path(path).is_dir():
             return "image_dir"
         
@@ -294,14 +280,12 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
             def json_load(f):
                 return json.load(f)
         
-        # If exact file path exists, use it
-        if Path(json_path).is_file():
+        # If exact path exists, use it
+        if Path(json_path).exists():
             return self._parse_json_format(json_path, 'arc')
         
         # Try to find ARC files with pattern matching
-        # If json_path is a directory, use it; otherwise use parent
-        base_dir = Path(json_path) if Path(json_path).is_dir() else Path(json_path).parent
-        print(f"🔍 Searching for ARC files in: {base_dir}")
+        base_dir = Path(json_path).parent
         if base_dir.exists():
             # Look for ARC challenge files (training2 or training)
             patterns = [
@@ -310,9 +294,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
             ]
             
             for pattern in patterns:
-                print(f"   Pattern: {pattern}")
                 matches = glob.glob(pattern)
-                print(f"   Matches: {matches}")
                 if matches:
                     challenges_file = matches[0]
                     # Find corresponding solutions file
@@ -813,14 +795,6 @@ def build(config: MultimodalDatasetConfig):
         """Encode samples to capsule format (optimized)."""
         import time
         from tqdm import tqdm
-        
-        # Handle empty samples
-        if not samples or len(samples) == 0:
-            return {
-                'sketches': torch.empty(0, 12, 512),
-                'checksums': torch.empty(0, 12, 512),
-                'children': torch.empty(0, 12, 512)
-            }
         
         all_sketches = []
         all_checksums = []

@@ -412,15 +412,13 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             
             import subprocess
             # Use NEW multimodal builder with text rendering support
-            # Pass directory - builder will auto-detect ARC challenge+solution files
             build_cmd = [
                 "python", "dataset/build_multimodal_dataset.py",
-                "--sources", "kaggle/combined",  # Builder auto-detects ARC files
-                "--output-dir", "datasets/vision_unified",
-                "--augment",
-                "--num-concepts", "2048",
-                "--target-capsules", "12",
-                "--enable-quality-scoring"
+                "--source-paths", "kaggle/combined/arc-agi",
+                "--output-dir", "data/arc-aug-5000",
+                "--render-text-to-image", "True",
+                "--use-capsules", "True",
+                "--seed", "42"
             ]
             
             print(f"Running: {' '.join(build_cmd)}\n")
