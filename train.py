@@ -164,10 +164,13 @@ def wait_for_consolidated_chunks(output_dir: str, poll_interval: int = 60):
     return chunks
 
 def download_and_build_dataset(model_config: dict, force_rebuild: bool = False, incremental: bool = True):
-    """Download dataset and build preprocessed files.
+    """Download dataset and build preprocessed files with robust error handling.
     
     Args:
         incremental: If True, wait for consolidated chunks and start training early
+    
+    Returns:
+        bool: True if dataset is ready (exists or built), False if cannot proceed
     """
     dataset_args = model_config['dataset_args']
     
@@ -190,38 +193,56 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False, 
         dataset_args = args_dict
     
     output_dir = dataset_args.get('output_dir', 'datasets/default')
+    checkpoint_dir = Path(output_dir) / "stream_checkpoints"
     
-    # Check if already exists (fully built)
+    # PRIORITY 1: Check for existing consolidated chunks (already encoded data)
+    if checkpoint_dir.exists():
+        chunks = list(checkpoint_dir.glob("consolidated_*.pt"))
+        if chunks:
+            size_gb = sum(c.stat().st_size for c in chunks) / (1024**3)
+            print(f"\n✅ Found {len(chunks)} pre-encoded chunk(s) ({size_gb:.2f}GB)")
+            print(f"   Location: {checkpoint_dir}")
+            print(f"   {'Skipping dataset build' if not force_rebuild else 'Will rebuild despite existing chunks'}")
+            
+            if not force_rebuild:
+                return True  # Use existing chunks
+    
+    # PRIORITY 2: Check if fully built dataset exists
     if check_dataset_exists(output_dir) and not incremental:
         if not force_rebuild:
-            print(f"\nDataset found at: {output_dir}")
+            print(f"\n✅ Dataset found at: {output_dir}")
             print("   Skipping dataset building (use --rebuild-dataset to force rebuild)")
             return True
         else:
-            print(f"\n🔄 Rebuilding dataset at: {output_dir}")
+            print(f"\n🔄 Force rebuilding dataset at: {output_dir}")
     
-    # Incremental mode: Check for consolidated chunks
-    if incremental:
-        checkpoint_dir = Path(output_dir) / "stream_checkpoints"
-        if checkpoint_dir.exists():
-            chunks = list(checkpoint_dir.glob("consolidated_*.pt"))
-            if chunks:
-                print(f"\n⚡ INCREMENTAL MODE: Found {len(chunks)} consolidated chunks")
-                print(f"   Training will start on available data while encoding continues")
-                return True  # Dataset partially ready
-        
-        # No chunks yet - need to start dataset building
-        print(f"\n⚡ INCREMENTAL MODE: Starting dataset encoding...")
-        print(f"   Training will wait for first chunk, then start on partial data")
-        # Fall through to normal dataset building below
-    
+    # PRIORITY 3: Need to build dataset
     print(f"\n📦 Building dataset: {output_dir}")
     print("-" * 70)
     
-    # Build command
+    # Validate builder script exists
     builder_script = model_config['dataset_builder']
-    args = model_config['dataset_args']
+    builder_path = Path(builder_script)
     
+    if not builder_path.exists():
+        print(f"❌ Builder script not found: {builder_script}")
+        print(f"\n⚠️  Troubleshooting:")
+        print(f"   1. Check if 'dataset/' directory exists in repo")
+        print(f"   2. Ensure all files are committed to git")
+        print(f"   3. Try pulling latest changes: git pull")
+        
+        # Check if we can still proceed with existing data
+        if checkpoint_dir.exists():
+            chunks = list(checkpoint_dir.glob("consolidated_*.pt"))
+            if chunks:
+                print(f"\n💡 FALLBACK: Using {len(chunks)} existing chunk(s)")
+                return True
+        
+        print(f"\n❌ Cannot proceed without dataset. Exiting.")
+        return False
+    
+    # Build command
+    args = model_config['dataset_args']
     cmd = ["python", builder_script]
     
     # Add subcommand if using unified builder
@@ -267,18 +288,37 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False, 
     print(f"Running: {' '.join(cmd)}\n")
     
     try:
-        result = subprocess.run(cmd, check=True)
-        if result.returncode == 0:
-            print("\n✅ Dataset built successfully!")
-            return True
-        else:
-            print(f"\n❌ Dataset building failed with code {result.returncode}")
-            return False
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print(result.stdout)
+        print("\n✅ Dataset built successfully!")
+        return True
+        
     except subprocess.CalledProcessError as e:
         print(f"\n❌ Dataset building failed: {e}")
+        if e.stderr:
+            print(f"Error output: {e.stderr}")
+        
+        # FALLBACK: Check if partial data exists
+        print(f"\n🔍 Checking for usable data...")
+        
+        if checkpoint_dir.exists():
+            chunks = list(checkpoint_dir.glob("consolidated_*.pt"))
+            if chunks:
+                print(f"💡 FALLBACK: Found {len(chunks)} chunk(s) from previous run")
+                print(f"   Training can continue with existing data")
+                return True
+        
+        print(f"\n❌ No usable data found. Cannot proceed.")
+        print(f"\n⚠️  Possible fixes:")
+        print(f"   1. Ensure source data exists (kaggle/combined/, etc.)")
+        print(f"   2. Check dataset builder script for errors")
+        print(f"   3. Manually run: {' '.join(cmd)}")
+        print(f"   4. Upload pre-encoded chunks to {checkpoint_dir}")
         return False
-    except FileNotFoundError:
-        print(f"\n❌ Dataset builder not found: {builder_script}")
+        
+    except FileNotFoundError as e:
+        print(f"\n❌ File not found: {e}")
+        print(f"   Check that Python and required scripts are available")
         return False
 
 

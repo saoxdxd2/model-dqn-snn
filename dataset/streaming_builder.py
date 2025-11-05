@@ -210,26 +210,13 @@ class StreamingCacheEncoder:
         
         with torch.no_grad():
             while sample_idx < len(samples):
-                # Always check pause state (returns immediately if not paused)
-                # Prevents race condition where pause happens between check and processing
-                if not self.consolidation_pause.is_set():
-                    pbar.write("🔴 Consumer: Pause requested, pausing...")
-                    with self.threads_paused_lock:
-                        self.threads_paused_count += 1
-                    try:
-                        self.consolidation_pause.wait()
-                        pbar.write("🟢 Consumer: Resuming after pause")
-                    finally:
-                        with self.threads_paused_lock:
-                            self.threads_paused_count -= 1
+                # NOTE: Consumer does NOT pause - it's the one calling consolidation!
+                # Only the producer (caching) thread pauses during consolidation.
                 
                 # Wait until this batch is fully cached
                 batch_end = min(sample_idx + self.batch_size, len(samples))
                 while True:
-                    # Check if consolidation pause requested
-                    if not self.consolidation_pause.is_set():
-                        break  # Exit cache wait to re-check pause at top of loop
-                    
+                    # Consumer never pauses - just wait for cache
                     with self.lock:
                         if self.cached_count >= batch_end:
                             break
@@ -344,23 +331,25 @@ class StreamingCacheEncoder:
         if not batch_subset:
             return
         
-        # Pause producer and consumer threads during consolidation
+        # Pause producer thread during consolidation
+        # NOTE: Consumer (GPU) thread is the one calling this, so it can't pause itself!
+        # Only pause the producer (caching) thread
         self.consolidation_pause.clear()
-        print(f"⏸️  Pausing encoding and caching...")
+        print(f"⏸️  Pausing caching thread...")
         
-        # Wait for both threads to actually pause (no timeout - wait until done)
+        # Wait for producer thread to pause (NOT consumer - it's calling this!)
         import time
         wait_start = time.time()
         while True:
             with self.threads_paused_lock:
                 paused = self.threads_paused_count
-                if paused >= 2:
+                if paused >= 1:  # Only wait for 1 thread (producer)
                     break
             
             # Debug: Show waiting status every 5 seconds
             elapsed = time.time() - wait_start
             if int(elapsed) % 5 == 0 and elapsed > 0:
-                print(f"⏳ Waiting for threads to pause... ({paused}/2 paused, {elapsed:.0f}s elapsed)")
+                print(f"⏳ Waiting for producer to pause... ({paused}/1 paused, {elapsed:.0f}s elapsed)")
             time.sleep(0.1)
         
         print(f"📤 Consolidating batches {start_idx}-{end_idx}...")
