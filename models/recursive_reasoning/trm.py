@@ -431,12 +431,22 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # HESC capsules or CNN/token embedding
         if self.capsule_encoder is not None:
             # Vision-unified mode: input already encoded as capsules
-            embedding = input
+            # Check if input is pre-encoded (from streaming encoder)
+            if input.dim() == 3 and input.shape[-1] != self.config.hidden_size:
+                # Pre-encoded capsules need projection: [batch, num_capsules, encoder_hidden] → [batch, num_capsules, model_hidden]
+                if not hasattr(self, 'capsule_projection'):
+                    self.capsule_projection = torch.nn.Linear(input.shape[-1], self.config.hidden_size, bias=False).to(input.device, input.dtype)
+                embedding = self.capsule_projection(input)
+            else:
+                embedding = input
         else:
             # Legacy token mode: standard token embedding
             embedding = self.embed_tokens(input.to(torch.int32))
 
         # Puzzle embeddings (skip for capsule mode - not needed for multimodal inputs)
+        is_pre_encoded = (input.dim() == 3 and self.capsule_encoder is not None and 
+                         input.shape[-1] != self.config.hidden_size)
+        
         if self.config.puzzle_emb_ndim > 0 and self.capsule_encoder is None and self.config.num_puzzle_identifiers > 0:
             puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
             
@@ -446,21 +456,23 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
             embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
 
-        # Position embeddings
-        if self.config.pos_encodings == "learned":
+        # Position embeddings (skip for pre-encoded capsules - already have positional info)
+        if self.config.pos_encodings == "learned" and not is_pre_encoded:
             # scale by 1/sqrt(2) to maintain forward variance
             embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
 
         # Scale
         return self.embed_scale * embedding
 
-    def empty_carry(self, batch_size: int, seq_len: int = None):
+    def empty_carry(self, batch_size: int, seq_len: int = None, skip_puzzle_emb: bool = False):
         # Use provided seq_len or fall back to config
         if seq_len is None:
             seq_len = self.config.seq_len
+        # For pre-encoded capsules, skip puzzle_emb_len addition
+        puzzle_offset = 0 if skip_puzzle_emb else self.puzzle_emb_len
         return TinyRecursiveReasoningModel_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
+            z_H=torch.empty(batch_size, seq_len + puzzle_offset, self.config.hidden_size, dtype=self.forward_dtype),
+            z_L=torch.empty(batch_size, seq_len + puzzle_offset, self.config.hidden_size, dtype=self.forward_dtype),
         )
         
     def reset_carry(self, reset_flag: torch.Tensor, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry):
@@ -708,9 +720,14 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         batch_size = batch["inputs"].shape[0]
         seq_len = batch["inputs"].shape[1]  # Get actual sequence length from input
         device = batch["inputs"].device
+        
+        # Detect pre-encoded capsules: if hidden dim != model hidden_size, inputs are pre-encoded
+        is_pre_encoded = (batch["inputs"].dim() == 3 and 
+                          batch["inputs"].shape[-1] != self.config.hidden_size and
+                          hasattr(self.inner, 'capsule_encoder') and self.inner.capsule_encoder is not None)
 
         return TinyRecursiveReasoningModel_ACTV1Carry(
-            inner_carry=self.inner.empty_carry(batch_size, seq_len=seq_len),  # Use dynamic seq_len
+            inner_carry=self.inner.empty_carry(batch_size, seq_len=seq_len, skip_puzzle_emb=is_pre_encoded),  # Skip puzzle_emb for pre-encoded
             
             steps=torch.zeros((batch_size, ), dtype=torch.int32, device=device),
             halted=torch.ones((batch_size, ), dtype=torch.bool, device=device),  # Default to halted
