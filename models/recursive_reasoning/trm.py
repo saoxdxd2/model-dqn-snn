@@ -452,9 +452,13 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         if self.capsule_encoder is not None:
             # Vision-unified mode: handle raw images or pre-encoded capsules
             if input.dim() == 4:  # Raw images [B, C, H, W]
-                # Encode raw images to capsules
-                result = self.capsule_encoder(images=input)  # Returns dict with 'sketches'
+                # Encode raw images to capsules via VTRM (returns dict with sketches/checksums/children)
+                result = self.capsule_encoder(images=input)  # Returns dict
                 embedding = result['sketches']  # [B, k, D]
+                
+                # Store VTRM metadata for downstream use (N2N adapter, hierarchical children)
+                self._last_vtrm_checksums = result.get('checksums')  # [B, k, checksum_dim]
+                self._last_vtrm_children = result.get('children')    # [B, k, m, D]
             elif input.dim() == 3 and input.shape[-1] != self.config.hidden_size:
                 # Pre-encoded capsules need projection: [batch, num_capsules, encoder_hidden] → [batch, num_capsules, model_hidden]
                 # Convert to float if needed (consolidated chunks may be int32)
@@ -554,6 +558,12 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # Input encoding
         input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+        
+        # Store VTRM metadata in batch for downstream use (N2N, hierarchical children, checksum gating)
+        if hasattr(self, '_last_vtrm_checksums') and self._last_vtrm_checksums is not None:
+            batch['capsule_checksums'] = self._last_vtrm_checksums
+        if hasattr(self, '_last_vtrm_children') and self._last_vtrm_children is not None:
+            batch['capsule_children'] = self._last_vtrm_children
 
         # Forward iterations
         z_H, z_L = carry.z_H, carry.z_L
@@ -766,16 +776,30 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
         batch_size = batch["inputs"].shape[0]
-        seq_len = batch["inputs"].shape[1]  # Get actual sequence length from input
         device = batch["inputs"].device
+        
+        # Determine sequence length based on input type
+        is_raw_image = batch["inputs"].dim() == 4  # Raw images [B, C, H, W]
+        if is_raw_image:
+            # Images will be encoded to capsules - use target capsule count
+            if hasattr(self.inner, 'capsule_encoder') and self.inner.capsule_encoder is not None:
+                seq_len = self.inner.capsule_encoder.encoder.target_capsules  # e.g., 12
+            else:
+                seq_len = self.config.seq_len
+        else:
+            # Already encoded - use actual sequence length
+            seq_len = batch["inputs"].shape[1]
         
         # Detect pre-encoded capsules: if hidden dim != model hidden_size, inputs are pre-encoded
         is_pre_encoded = (batch["inputs"].dim() == 3 and 
                           batch["inputs"].shape[-1] != self.config.hidden_size and
                           hasattr(self.inner, 'capsule_encoder') and self.inner.capsule_encoder is not None)
+        
+        # Skip puzzle embeddings for both raw images and pre-encoded capsules (vision-unified mode)
+        skip_puzzle = is_raw_image or is_pre_encoded
 
         return TinyRecursiveReasoningModel_ACTV1Carry(
-            inner_carry=self.inner.empty_carry(batch_size, seq_len=seq_len, skip_puzzle_emb=is_pre_encoded),  # Skip puzzle_emb for pre-encoded
+            inner_carry=self.inner.empty_carry(batch_size, seq_len=seq_len, skip_puzzle_emb=skip_puzzle),
             
             steps=torch.zeros((batch_size, ), dtype=torch.int32, device=device),
             halted=torch.ones((batch_size, ), dtype=torch.bool, device=device),  # Default to halted
