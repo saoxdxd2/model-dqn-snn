@@ -1212,7 +1212,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     # Init carry if it is None
     if train_state.carry is None:
         with torch.device("cuda"):
-            train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
+            train_state.carry = train_state.original_model.initial_carry(batch)  # type: ignore
 
     # Mixed precision training (fp16 for 2x speedup on T4)
     use_amp = getattr(config, 'use_mixed_precision', True)
@@ -1474,7 +1474,7 @@ def evaluate(
                         )
                         batch['capsule_state'] = capsule_state
             with torch.device("cuda"):
-                carry = train_state.model.initial_carry(batch)  # type: ignore
+                carry = train_state.original_model.initial_carry(batch)  # type: ignore
 
             # Forward
             inference_steps = 0
