@@ -1,6 +1,91 @@
-# Hybrid Architecture: ALWAYS ENABLED (Mandatory)
-# Pretrained + Trainable + N2N - No downsides, only benefits
+# Hybrid Pretrained Pipeline - Complete Training Config
+# Architecture: CLIP + Custom ViT + N2N + TRM + COCONUT
+# Optimizations: fp16 + torch.compile + batch=192
 
+hydra:
+  output_subdir: null
+
+# Architecture name (for model loading)
+arch: hybrid_pretrained
+
+# Data paths
+data_paths: ['datasets/vision_unified']
+data_paths_test: []
+
+evaluators:
+  - name: arc@ARC
+
+# Training hyperparameters (T4 GPU optimized)
+global_batch_size: 192  # 6x larger! Use 12GB of 15GB VRAM
+epochs: 50
+eval_interval: 5
+checkpoint_every_eval: true
+
+# Learning rates
+lr: 3e-4
+lr_min_ratio: 1.0
+lr_warmup_steps: 1000
+
+# Optimizer
+beta1: 0.9
+beta2: 0.95
+weight_decay: 0.1
+puzzle_emb_weight_decay: 0.1
+puzzle_emb_lr: 1e-2
+
+seed: 0
+min_eval_interval: 0
+
+checkpoint_path: checkpoints/hybrid_pretrained
+load_checkpoint: null
+
+ema: false
+ema_rate: 0.999
+freeze_weights: false
+
+# TRM Features
+enable_dqn: true
+enable_entropy_regularization: true
+entropy_regularization_weight: 0.01
+enable_memory: true
+enable_mtp: true
+enable_adaptive_hcycles: true
+hcycle_confidence_threshold: 2.0
+enable_hierarchical_attention: true
+q_head_num_actions: 3
+q_head_type: "mlp"
+
+# DQN Stability
+dqn_warmup_ratio: 0.1
+dqn_warmup_steps: 5000
+freeze_representation_during_warmup: true
+
+# Optimizer Stability
+optimizer_type: "adamatan2"
+enable_optimizer_fallback: true
+nan_threshold_for_fallback: 3
+
+# Expansion Penalty Annealing
+expansion_penalty_schedule: "cosine"
+expansion_penalty_start: 0.1
+expansion_penalty_end: 0.001
+expansion_anneal_ratio: 0.5
+
+# Replay Buffer
+replay_recent_fraction: 0.25
+replay_max_age: 100000
+
+# Q-Head Temperature Annealing
+enable_q_temperature_annealing: true
+q_temperature_start: 1.0
+q_temperature_end: 0.1
+q_temperature_anneal_ratio: 1.0
+q_temperature_schedule: "exponential"
+
+# Per-Layer Gradient Normalization
+enable_per_layer_grad_norm: true
+
+# Model architecture
 model:
   # Vision Encoder (Hybrid - Always Active)
   vision_encoder:
