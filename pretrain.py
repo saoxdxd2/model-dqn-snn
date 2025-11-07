@@ -447,10 +447,13 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
         if world_size > 1:
             dist.barrier()
         
-        # Retry loading dataset
+        # Retry loading dataset with ALL original kwargs
         dataset = PuzzleDataset(PuzzleDatasetConfig(
             seed=config.seed,
             dataset_paths=dataset_paths,
+            global_batch_size=config.global_batch_size,
+            test_set_mode=(split != 'train'),
+            epochs_per_iter=epochs_per_iter,
             rank=rank,
             num_replicas=world_size,
             **kwargs

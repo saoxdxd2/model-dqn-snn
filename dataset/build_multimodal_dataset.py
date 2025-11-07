@@ -171,8 +171,8 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         if "raven" in path_lower and not "craven" in path_lower:
             return "raven"
         
-        # ARC JSON format
-        if "arc" in path_lower and path_lower.endswith(".json"):
+        # ARC JSON format (file or directory)
+        if "arc" in path_lower:
             return "arc_json"
         
         # Maze CSV format
