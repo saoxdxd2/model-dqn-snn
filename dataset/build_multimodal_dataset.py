@@ -1159,17 +1159,61 @@ def build(config: MultimodalDatasetConfig):
     builder = MultimodalDatasetBuilder(config)
     dataset = builder.build_dataset()
     
-    # Save dataset with proper train/test structure
+    # Handle streaming format (new) vs old dict format
     import os
     import json
     
-    # Create train/test subdirectories
+    if 'shard_files' in dataset:
+        # Streaming format - shards already saved, just create metadata
+        print("✅ Streaming dataset built successfully")
+        print(f"   Total samples: {dataset['metadata']['num_samples']:,}")
+        print(f"   Shards: {dataset['metadata']['num_shards']}")
+        
+        # Create train/test subdirectories for PuzzleDataset compatibility
+        train_dir = os.path.join(config.output_dir, 'train')
+        test_dir = os.path.join(config.output_dir, 'test')
+        os.makedirs(train_dir, exist_ok=True)
+        os.makedirs(test_dir, exist_ok=True)
+        
+        # Create metadata for PuzzleDataset
+        num_concepts = config.num_concepts
+        vocab_size = num_concepts + 4
+        
+        train_metadata = {
+            'pad_id': 0,
+            'ignore_label_id': -100,
+            'blank_identifier_id': 0,
+            'vocab_size': vocab_size,
+            'seq_len': 512,
+            'num_puzzle_identifiers': 0,
+            'total_groups': dataset['metadata']['num_samples'],
+            'mean_puzzle_examples': 1.0,
+            'total_puzzles': dataset['metadata']['num_samples'],
+            'sets': ['train'],
+            'streaming_mode': True,
+            'shard_index': 'shard_index.json'
+        }
+        
+        # Save train metadata
+        with open(os.path.join(train_dir, 'dataset.json'), 'w') as f:
+            json.dump(train_metadata, f, indent=2)
+        
+        # Create minimal test metadata (empty for now)
+        test_metadata = {**train_metadata, 'total_groups': 0, 'total_puzzles': 0, 'sets': ['test']}
+        with open(os.path.join(test_dir, 'dataset.json'), 'w') as f:
+            json.dump(test_metadata, f, indent=2)
+        
+        print(f"✅ Dataset ready: {dataset['metadata']['num_samples']:,} samples")
+        print(f"   Format: Streaming shards (memory-efficient)")
+        print(f"   Metadata: {train_dir}/dataset.json")
+        return
+    
+    # Old format (dict with train/test keys) - legacy support
     train_dir = os.path.join(config.output_dir, 'train')
     test_dir = os.path.join(config.output_dir, 'test')
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(test_dir, exist_ok=True)
     
-    # Get raw samples (no pre-encoding - TRM will encode during training)
     train_samples = dataset['train']
     test_samples = dataset.get('test', [])
     
