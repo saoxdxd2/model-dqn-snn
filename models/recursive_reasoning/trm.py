@@ -412,12 +412,16 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             
             def forward(self, h_prev, next_token_ids, **seq_info):
                 # Embed next tokens/concepts
-                if self.embedding is not None:
-                    # Token mode: use embed_tokens
+                if self.embedding is not None and next_token_ids.ndim <= 2:
+                    # Token mode: use embed_tokens (discrete token IDs)
                     token_emb = self.embedding(next_token_ids.to(torch.int32))
-                elif self.use_concept_vocab:
-                    # Vision-unified mode: use concept codebook
+                elif self.use_concept_vocab and next_token_ids.ndim <= 2:
+                    # Concept vocab mode: embed discrete concept IDs
                     token_emb = self.output_head.codebook.embeddings(next_token_ids.to(torch.int32))
+                elif next_token_ids.ndim > 3:
+                    # Vision-unified mode: inputs are continuous (images/capsules), not discrete IDs
+                    # Use h_prev as the "future" context (autoregressive in continuous space)
+                    token_emb = h_prev
                 else:
                     # Fallback: zero embedding
                     token_emb = torch.zeros_like(h_prev)

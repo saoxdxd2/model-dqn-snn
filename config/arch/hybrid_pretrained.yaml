@@ -93,7 +93,7 @@ arch:
   enable_prioritized_replay: false
   per_alpha: 0.6
   per_beta: 0.4
-  enable_mtp: true
+  enable_mtp: true  # Fixed for vision-unified: detects continuous vs discrete inputs automatically
   mtp_num_depths: 3
   mtp_loss_weight: 0.5
   mtp_share_embeddings: true
