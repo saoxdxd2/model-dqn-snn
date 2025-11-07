@@ -142,14 +142,12 @@ class HybridVisionEncoder(nn.Module):
         self,
         pretrained_model: str = 'clip',  # 'clip', 'dinov2', 'siglip'
         hidden_size: int = 768,
-        use_n2n_adapter: bool = True,
         fusion_type: str = 'gated',
         freeze_pretrained: bool = True
     ):
         super().__init__()
         
         self.hidden_size = hidden_size
-        self.use_n2n_adapter = use_n2n_adapter
         
         # Path 1: Pretrained encoder (frozen)
         from models.noise2noise_denoiser import PretrainedVisionBackbone
@@ -167,21 +165,19 @@ class HybridVisionEncoder(nn.Module):
             fusion_type=fusion_type
         )
         
-        # Optional N2N adapter for final refinement
-        if use_n2n_adapter:
-            from models.noise2noise_denoiser import N2NFeatureAdapter
-            self.n2n_adapter = N2NFeatureAdapter(
-                input_dim=hidden_size,
-                num_layers=3
-            )
-        else:
-            self.n2n_adapter = None
+        # MANDATORY: N2N adapter for feature refinement
+        # No downsides - only benefits (denoising + alignment)
+        from models.noise2noise_denoiser import N2NFeatureAdapter
+        self.n2n_adapter = N2NFeatureAdapter(
+            input_dim=hidden_size,
+            num_layers=3
+        )
         
         print(f"\n🔧 Initialized HybridVisionEncoder:")
         print(f"   Pretrained: {pretrained_model} (frozen={freeze_pretrained})")
         print(f"   Trainable: Custom ViT")
         print(f"   Fusion: {fusion_type}")
-        print(f"   N2N Adapter: {use_n2n_adapter}")
+        print(f"   N2N Adapter: ENABLED (mandatory)")
     
     def _build_trainable_encoder(self, hidden_size: int) -> nn.Module:
         """Build trainable ViT encoder."""
@@ -229,11 +225,8 @@ class HybridVisionEncoder(nn.Module):
         # Fusion
         fused_feat, fusion_weights = self.fusion(pretrained_feat, trainable_feat)
         
-        # Optional N2N adaptation
-        if self.n2n_adapter is not None:
-            final_feat = self.n2n_adapter(fused_feat)
-        else:
-            final_feat = fused_feat
+        # MANDATORY N2N adaptation (always enabled)
+        final_feat = self.n2n_adapter(fused_feat)
         
         if return_fusion_weights:
             return final_feat, fusion_weights

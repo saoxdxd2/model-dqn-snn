@@ -137,12 +137,11 @@ class TRMVisionEncoder(nn.Module):
         self.hybrid_encoder = HybridVisionEncoder(
             pretrained_model=pretrained_model,
             hidden_size=hidden_size,
-            use_n2n_adapter=True,
             fusion_type=fusion_type,
             freeze_pretrained=True
         )
-        print(f"   Hybrid encoder initialized (pretrained + trainable)")
-        print(f"   TRM recursive cycles will refine pretrained features iteratively")
+        print(f"   Hybrid encoder: CLIP + ViT + N2N adapter (all mandatory)")
+        print(f"   TRM cycles: {H_cycles}H × {L_cycles}L = iterative refinement")
         
         # Create TRM config for encoder
         encoder_config = TinyRecursiveReasoningModel_ACTV1Config(

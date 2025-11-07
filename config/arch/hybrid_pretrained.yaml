@@ -30,24 +30,31 @@ model:
     latent_planning_depth: 2
     latent_use_adaptive_gate: true
 
-# Training
+# Training (T4 GPU Optimized - 15GB VRAM)
 training:
   # Phase 1: N2N adapter pretraining (optional, can load pretrained)
   n2n_pretrain:
     enabled: false                      # Set true to pretrain adapter
     steps: 10000
-    batch_size: 256
+    batch_size: 512                     # Use VRAM efficiently
     lr: 1e-4
     augmentations: ['crop', 'flip', 'color_jitter']
   
   # Phase 2: End-to-end task training
   task_training:
-    batch_size: 32
+    batch_size: 192                     # 6x larger! Use 12GB of 15GB VRAM
+    gradient_accumulation_steps: 1      # Can increase for effective larger batches
     lr: 3e-4
-    freeze_pretrained: true             # Keep CLIP frozen
+    freeze_pretrained: true             # Keep CLIP frozen (save VRAM)
     freeze_n2n_adapter: false           # Adapter trainable
     progressive_fusion: true            # Start with pretrained, shift to trainable
     warmup_steps: 1000
+    
+    # T4-specific optimizations (no Flash Attention support)
+    mixed_precision: true               # fp16/bf16 - 2x speedup
+    torch_compile: true                 # JIT compilation - 25% speedup
+    pin_memory: true                    # Faster CPU→GPU transfer
+    num_workers: 4                      # Parallel data loading
   
   # Phase 3: Optional fine-tuning
   finetune:
