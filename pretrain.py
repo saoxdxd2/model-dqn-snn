@@ -424,10 +424,12 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             
             import subprocess
             # Use NEW multimodal builder with text rendering support
+            # Build to the FIRST dataset path that training expects
+            output_dir = dataset_paths[0] if dataset_paths else "datasets/vision_unified"
             build_cmd = [
                 "python", "dataset/build_multimodal_dataset.py",
                 "--config.source-paths", "kaggle/combined/arc-agi",
-                "--config.output-dir", "data/arc-aug-5000",
+                "--config.output-dir", output_dir,
                 "--config.render-text-to-image",
                 "--config.use-capsules",
                 "--config.seed", "42"
