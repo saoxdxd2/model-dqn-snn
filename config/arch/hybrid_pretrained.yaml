@@ -122,7 +122,7 @@ evaluators:
 # Training hyperparameters (Winner Strategy - Streaming + Large Batch)
 global_batch_size: 128  # Increased from 48 (winner used 128-256)
 gradient_accumulation_steps: 4  # Effective batch = 128*4 = 512
-epochs: 0  # Infinite streaming (no epoch limit)
+epochs: 1000000  # Very large epoch count for continuous streaming
 eval_interval: 5
 checkpoint_every_eval: true
 
