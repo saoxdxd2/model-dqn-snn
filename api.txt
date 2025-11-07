@@ -93,10 +93,11 @@ print("\n✅ Dependencies installed")
 
 # 4. Start training
 print("\n" + "="*70)
-print("🚀 Starting Training")
-print("   First run: ~5.6 hours (cache + encode)")
-print("   Resume: Continues from model_checkpoints/")
-print("   After: Run tar cell to download back to E:\\")
+print("🚀 Starting Training - Hybrid Pretrained Pipeline")
+print("   Config: hybrid_pretrained.yaml (CLIP+ViT+N2N+TRM+COCONUT)")
+print("   Optimizations: fp16 + torch.compile + batch=192")
+print("   Time: ~1h (100k samples) or ~10h (1M samples)")
+print("   Resume: Auto-continues from model_checkpoints/")
 print("="*70 + "\n")
 !python train.py
 
