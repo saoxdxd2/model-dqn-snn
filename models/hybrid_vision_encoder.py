@@ -183,10 +183,13 @@ class HybridVisionEncoder(nn.Module):
         """Build trainable ViT encoder."""
         from transformers import ViTModel, ViTConfig
         
+        # Calculate compatible num_heads: 64 dims per head (ViT standard)
+        num_heads = hidden_size // 64
+        
         config = ViTConfig(
             hidden_size=hidden_size,
             num_hidden_layers=6,  # Lighter than CLIP (12 layers)
-            num_attention_heads=12,
+            num_attention_heads=num_heads,  # Auto-calculated for compatibility
             intermediate_size=hidden_size * 4,
             image_size=224,
             patch_size=16,
