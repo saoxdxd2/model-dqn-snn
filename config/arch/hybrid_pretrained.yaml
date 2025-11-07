@@ -120,7 +120,7 @@ evaluators:
   - name: arc@ARC
 
 # Training hyperparameters (T4 GPU optimized)
-global_batch_size: 192  # 6x larger! Use 12GB of 15GB VRAM
+global_batch_size: 48  # Reduced from 192 to avoid OOM (398M params + CLIP + ViT + COCONUT)
 epochs: 50
 eval_interval: 5
 checkpoint_every_eval: true
