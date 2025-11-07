@@ -190,6 +190,27 @@ class PuzzleDataset(IterableDataset):
                         }
                         continue
                 
+                # Check for raw_samples.pt format (vision-unified pipeline)
+                raw_samples_path = os.path.join(dataset_path, self.split, 'raw_samples.pt')
+                if os.path.exists(raw_samples_path):
+                    # Load raw samples (images + metadata)
+                    raw_samples = torch.load(raw_samples_path, map_location='cpu')
+                    num_samples = len(raw_samples)
+                    
+                    # Convert to expected format
+                    # Each sample is a dict with 'input_image', 'output_image', 'task_id'
+                    # Store as list of dicts - will be processed on-the-fly during training
+                    group_indices = np.arange(num_samples + 1, dtype=np.int32)
+                    puzzle_indices = np.arange(num_samples + 1, dtype=np.int32)
+                    
+                    self._data[set_name_] = {
+                        "raw_samples": raw_samples,  # List of dicts
+                        "puzzle_identifiers": np.arange(num_samples, dtype=np.int32),
+                        "puzzle_indices": puzzle_indices,
+                        "group_indices": group_indices
+                    }
+                    continue
+                
                 # Standard format with .npy files
                 field_mmap_modes = {
                     "inputs": "r",
@@ -228,7 +249,11 @@ class PuzzleDataset(IterableDataset):
     
     def _iter_test(self):
         for set_i, (set_name, dataset) in enumerate(self._data.items()):  # type: ignore
-            total_examples = len(dataset["inputs"])
+            # Handle raw_samples format
+            if "raw_samples" in dataset:
+                total_examples = len(dataset["raw_samples"])
+            else:
+                total_examples = len(dataset["inputs"])
 
             # Load examples one by one
             start_index = 0
@@ -248,11 +273,19 @@ class PuzzleDataset(IterableDataset):
 
                     puzzle_indices.append(puzzle_index)
                 
-                batch = self._collate_batch({
-                    "inputs": dataset["inputs"][local_start: local_end],
-                    "labels": dataset["labels"][local_start: local_end],
-                    "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
-                })
+                # Handle raw_samples format (vision-unified)
+                if "raw_samples" in dataset:
+                    batch_samples = [dataset["raw_samples"][idx] for idx in range(local_start, local_end)]
+                    batch = {
+                        "raw_samples": batch_samples,
+                        "puzzle_identifiers": torch.from_numpy(dataset["puzzle_identifiers"][puzzle_indices].astype(np.int32))
+                    }
+                else:
+                    batch = self._collate_batch({
+                        "inputs": dataset["inputs"][local_start: local_end],
+                        "labels": dataset["labels"][local_start: local_end],
+                        "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
+                    })
 
                 yield set_name, batch, end_index - start_index
                 
@@ -289,11 +322,22 @@ class PuzzleDataset(IterableDataset):
 
                 batch_indices        = batch_indices       [self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
                 batch_puzzle_indices = batch_puzzle_indices[self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
-                batch = self._collate_batch({
-                    "inputs": dataset["inputs"][batch_indices],
-                    "labels": dataset["labels"][batch_indices],
-                    "puzzle_identifiers": dataset["puzzle_identifiers"][batch_puzzle_indices]
-                })
+                
+                # Handle raw_samples format (vision-unified)
+                if "raw_samples" in dataset:
+                    # Extract raw samples and return as-is (will be processed by model)
+                    batch_samples = [dataset["raw_samples"][idx] for idx in batch_indices]
+                    batch = {
+                        "raw_samples": batch_samples,
+                        "puzzle_identifiers": torch.from_numpy(dataset["puzzle_identifiers"][batch_puzzle_indices].astype(np.int32))
+                    }
+                else:
+                    # Standard format with pre-encoded inputs
+                    batch = self._collate_batch({
+                        "inputs": dataset["inputs"][batch_indices],
+                        "labels": dataset["labels"][batch_indices],
+                        "puzzle_identifiers": dataset["puzzle_identifiers"][batch_puzzle_indices]
+                    })
 
                 yield set_name, batch, global_effective_batch_size
                 

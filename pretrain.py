@@ -1061,8 +1061,45 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             
             train_state.representation_frozen = False
 
+    # Handle raw_samples format (vision-unified pipeline)
+    if isinstance(batch, dict) and 'raw_samples' in batch:
+        import torchvision.transforms as transforms
+        from PIL import Image
+        import numpy as np
+        
+        # Extract images from raw samples
+        raw_samples = batch['raw_samples']
+        batch_size = len(raw_samples)
+        
+        # Stack input and output images
+        # Each sample: {'input_image': PIL.Image, 'output_image': PIL.Image, 'task_id': str}
+        input_images = []
+        output_images = []
+        
+        # Convert PIL images to tensors (normalized to [0, 1])
+        to_tensor = transforms.ToTensor()
+        
+        for sample in raw_samples:
+            # Input and output are PIL Images
+            input_img = to_tensor(sample['input_image'])  # [3, H, W]
+            output_img = to_tensor(sample['output_image'])
+            
+            input_images.append(input_img)
+            output_images.append(output_img)
+        
+        # Stack into batches [B, 3, H, W]
+        input_batch = torch.stack(input_images).cuda()
+        output_batch = torch.stack(output_images).cuda()
+        
+        # Create batch dict in expected format
+        batch = {
+            'images': input_batch,  # Vision-unified mode uses 'images' key
+            'target_images': output_batch,
+            'puzzle_identifiers': batch['puzzle_identifiers'].cuda(),
+            'labels': torch.zeros(batch_size, dtype=torch.long).cuda()  # Placeholder
+        }
     # Handle HESC capsules (tuple) vs dict batches
-    if isinstance(batch, tuple):
+    elif isinstance(batch, tuple):
         # HESC mode: batch from TensorDataset
         if len(batch) == 3:
             # Capsules with children: (sketches, checksums, children)
