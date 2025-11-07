@@ -47,11 +47,6 @@ except ImportError:
 
 cli = ArgParser()
 
-@cli.command()
-def build_dataset(config: MultimodalDatasetConfig):
-    """Build multimodal dataset from source files."""
-    build(config)
-
 
 class MultimodalDatasetConfig(BaseModel):
     """Unified configuration for all dataset types."""
@@ -98,6 +93,13 @@ class MultimodalDatasetConfig(BaseModel):
     
     # Maze-specific
     maze_augment_dihedral: bool = True
+    cache_images: bool = True
+
+
+@cli.command()
+def build_dataset(config: MultimodalDatasetConfig):
+    """Build multimodal dataset from source files."""
+    build(config)
 
 
 class MultimodalDatasetBuilder(BaseDatasetBuilder):
