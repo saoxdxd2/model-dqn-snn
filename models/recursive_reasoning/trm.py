@@ -791,7 +791,8 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor], global_step: int = 0) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
         # CRITICAL: Store global_step for annealing schedules (Q-temperature, expansion penalty)
         # This synchronizes all annealing with actual training progress, not local counters
-        self.config.global_step = global_step
+        # Store on model instance (not Pydantic config which is immutable)
+        self.global_step = global_step
 
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
