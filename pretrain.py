@@ -554,6 +554,17 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         loss_kwargs = dict(config.arch.loss.__pydantic_extra__)
         loss_kwargs['total_steps'] = total_steps
         model = loss_head_cls(model, **loss_kwargs)  # type: ignore
+        
+        # Enable CPU activation offloading if configured
+        cpu_offload_enabled = getattr(config.arch, 'cpu_offload', False) or \
+                             (hasattr(config.arch, '__pydantic_extra__') and \
+                              config.arch.__pydantic_extra__.get('cpu_offload', False))
+        
+        if cpu_offload_enabled:
+            from utils.cpu_offload import enable_cpu_offload_for_module
+            if rank == 0:
+                print("\n🔧 Enabling CPU Activation Offloading (saves 3-4GB GPU memory)...")
+            model = enable_cpu_offload_for_module(model)
         if "DISABLE_COMPILE" not in os.environ:
             # Configure Triton for GPU compute capability 7.5 (Tesla T4)
             # Max block size is 4096, not 8192

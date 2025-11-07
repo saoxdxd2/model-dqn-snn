@@ -120,8 +120,8 @@ evaluators:
   - name: arc@ARC
 
 # Training hyperparameters (Winner Strategy - Streaming + Large Batch)
-global_batch_size: 64  # Balanced: memory optimizations + reasonable batch size
-gradient_accumulation_steps: 8  # Effective batch = 64*8 = 512 (same total)
+global_batch_size: 128  # Full batch with CPU offloading
+gradient_accumulation_steps: 4  # Effective batch = 128*4 = 512
 epochs: 1000000  # Very large epoch count for continuous streaming
 eval_interval: 5
 checkpoint_every_eval: true
@@ -248,6 +248,7 @@ training:
     mixed_precision: true               # fp16/bf16 - 2x speedup
     torch_compile: true                 # JIT compilation - 25% speedup
     pin_memory: true                    # Faster CPU→GPU transfer
+    cpu_offload: true                   # Offload activations to CPU (saves 3-4GB GPU)
     num_workers: 4                      # Parallel data loading
   
   # Phase 3: Optional fine-tuning
