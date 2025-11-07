@@ -549,13 +549,18 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 # Disable aggressive optimizations that require more SMs
                 inductor_config.max_autotune = False
                 inductor_config.max_autotune_gemm = False
-                # Set max block size globally (must be set before compilation)
-                inductor_config.triton.max_block = {"X": 4096, "Y": 4096, "Z": 4096, "R": 4096}
-                # Also set the maximum tiles per dimension
-                inductor_config.triton.max_tiles = 4
-                print(f"🔧 Triton config: max_block={inductor_config.triton.max_block}")
+                # Try to set Triton configs if available (API changed in newer PyTorch)
+                try:
+                    if hasattr(inductor_config, 'triton') and hasattr(inductor_config.triton, 'max_block'):
+                        inductor_config.triton.max_block = {"X": 4096, "Y": 4096, "Z": 4096, "R": 4096}
+                        inductor_config.triton.max_tiles = 4
+                        print(f"🔧 Triton config: max_block={inductor_config.triton.max_block}")
+                    else:
+                        print("ℹ️  Triton max_block config not available (newer PyTorch API)")
+                except AttributeError:
+                    pass  # Triton config API changed, skip
             except Exception as e:
-                print(f"⚠️  Could not configure Triton: {e}")
+                print(f"⚠️  Could not configure inductor: {e}")
             model = torch.compile(model)  # type: ignore
 
         # Load checkpoint
