@@ -450,9 +450,11 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
         # HESC capsules or CNN/token embedding
         if self.capsule_encoder is not None:
-            # Vision-unified mode: input already encoded as capsules
-            # Check if input is pre-encoded (from streaming encoder)
-            if input.dim() == 3 and input.shape[-1] != self.config.hidden_size:
+            # Vision-unified mode: handle raw images or pre-encoded capsules
+            if input.dim() == 4:  # Raw images [B, C, H, W]
+                # Encode raw images to capsules
+                embedding = self.capsule_encoder(input)  # [B, k, D]
+            elif input.dim() == 3 and input.shape[-1] != self.config.hidden_size:
                 # Pre-encoded capsules need projection: [batch, num_capsules, encoder_hidden] → [batch, num_capsules, model_hidden]
                 # Convert to float if needed (consolidated chunks may be int32)
                 input_float = input.to(self.forward_dtype) if input.dtype in [torch.int32, torch.int64] else input
