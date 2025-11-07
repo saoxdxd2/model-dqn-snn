@@ -156,6 +156,9 @@ class HybridVisionEncoder(nn.Module):
             freeze=freeze_pretrained
         )
         
+        # Project CLIP features (768) to match ViT dimension (1024)
+        self.pretrained_projection = nn.Linear(768, hidden_size)
+        
         # Path 2: Trainable encoder (custom ViT)
         self.trainable_path = self._build_trainable_encoder(hidden_size)
         
@@ -219,13 +222,16 @@ class HybridVisionEncoder(nn.Module):
         """
         # Path 1: Frozen pretrained features
         with torch.no_grad():
-            pretrained_feat = self.pretrained_path(images)  # [B, 196, 768]
+            pretrained_feat_768 = self.pretrained_path(images)  # [B, 196, 768]
+        
+        # Project CLIP 768 -> hidden_size (1024)
+        pretrained_feat = self.pretrained_projection(pretrained_feat_768)  # [B, 196, 1024]
         
         # Path 2: Trainable features
         trainable_output = self.trainable_path(pixel_values=images)
-        trainable_feat = trainable_output.last_hidden_state[:, 1:, :]  # Remove CLS, [B, 196, 768]
+        trainable_feat = trainable_output.last_hidden_state[:, 1:, :]  # Remove CLS, [B, 196, 1024]
         
-        # Fusion
+        # Fusion (both now 1024D)
         fused_feat, fusion_weights = self.fusion(pretrained_feat, trainable_feat)
         
         # MANDATORY N2N adaptation (always enabled)

@@ -186,7 +186,7 @@ model:
   vision_encoder:
     pretrained_model: 'clip'            # 'clip', 'dinov2', 'siglip'
     fusion_type: 'gated'                # 'gated', 'attention', 'learned_avg'
-    hidden_size: 768                    # Match CLIP/DINOv2 dimension
+    hidden_size: 1024                   # CLIP 768 projected to 1024 to match ViT
     num_layers: 2
     H_cycles: 2                         # TRM iteratively refines pretrained features
     L_cycles: 3                         # Each cycle corrects and improves
@@ -195,8 +195,8 @@ model:
   
   # TRM Recursive Reasoning
   reasoning:
-    hidden_size: 768
-    num_heads: 12
+    hidden_size: 1024
+    num_heads: 16
     H_layers: 3
     L_layers: 4
     H_cycles: 2
