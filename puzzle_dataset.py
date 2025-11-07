@@ -190,7 +190,8 @@ class PuzzleDataset(IterableDataset):
                     # Load all shards and extract samples
                     all_samples = []
                     for shard_file in shard_info['shard_files']:
-                        shard = torch.load(shard_file, map_location='cpu')
+                        # weights_only=False needed for custom DataSample objects
+                        shard = torch.load(shard_file, map_location='cpu', weights_only=False)
                         all_samples.extend(shard['samples'])
                     
                     # Convert samples to input/label format
