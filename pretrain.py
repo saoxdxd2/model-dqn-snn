@@ -427,11 +427,11 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             build_cmd = [
                 "python", "dataset/build_multimodal_dataset.py",
                 "build_dataset",  # argdantic command name
-                "--source-paths", "kaggle/combined/arc-agi",
-                "--output-dir", "data/arc-aug-5000",
-                "--render-text-to-image", "True",
-                "--use-capsules", "True",
-                "--seed", "42"
+                "--config.source-paths", "kaggle/combined/arc-agi",
+                "--config.output-dir", "data/arc-aug-5000",
+                "--config.render-text-to-image",
+                "--config.use-capsules",
+                "--config.seed", "42"
             ]
             
             print(f"Running: {' '.join(build_cmd)}\n")
