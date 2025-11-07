@@ -25,8 +25,8 @@ num_heads: 8
 num_key_value_heads: 2  # GQA optimization
 expansion: 4
 
-puzzle_emb_ndim: ${.hidden_size}
-puzzle_emb_len: 16  # For multi-class vision
+puzzle_emb_ndim: 0
+puzzle_emb_len: 0
 
 pos_encodings: rope
 forward_dtype: float16

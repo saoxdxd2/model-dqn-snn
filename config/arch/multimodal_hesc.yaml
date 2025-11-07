@@ -71,6 +71,13 @@ q_head_type: mlp
 q_head_hidden_size: 128
 q_head_num_layers: 1
 
+# ===== COCONUT Latent Planning (Meta AI) =====
+# Enables multi-path reasoning in latent space (no language decoding)
+enable_latent_planning: true
+latent_num_paths: 4  # Explore 4 reasoning paths simultaneously
+latent_planning_depth: 2  # 2 planning steps per path
+latent_use_adaptive_gate: true  # Only use planning for complex inputs
+
 # ===== Memory Bank (T4 GPU Training) =====
 enable_memory: True
 memory_capacity: 16384  # Maximum capacity for training

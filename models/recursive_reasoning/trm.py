@@ -115,6 +115,12 @@ class TinyRecursiveReasoningModel_ACTV1Config(BaseModel):
     dqn_epsilon_end: float = 0.05
     dqn_epsilon_decay_steps: int = 100000
     
+    # COCONUT-style Latent Planning
+    enable_latent_planning: bool = False  # Enable latent reasoning paths (COCONUT)
+    latent_num_paths: int = 4  # Number of parallel reasoning paths
+    latent_planning_depth: int = 2  # Planning steps per path
+    latent_use_adaptive_gate: bool = True  # Adaptive complexity gating
+    
     # Simplified Reward Shaping (3 parameters)
     reward_step_penalty: float = 0.01
     reward_terminal_correct: float = 1.0
@@ -354,6 +360,18 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # Reasoning Layers
         self.L_level = TinyRecursiveReasoningModel_ACTV1ReasoningModule(layers=[TinyRecursiveReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
+
+        # COCONUT-style Latent Planning (optional)
+        self.latent_planner = None
+        if self.config.enable_latent_planning:
+            from models.latent_planning import AdaptiveLatentPlanning
+            self.latent_planner = AdaptiveLatentPlanning(
+                hidden_size=self.config.hidden_size,
+                num_paths=self.config.latent_num_paths,
+                planning_depth=self.config.latent_planning_depth,
+                use_adaptive_gate=self.config.latent_use_adaptive_gate
+            )
+            print(f"🧠 COCONUT Latent Planning enabled")
 
         # Memory Bank (optional)
         self.memory = None
@@ -600,17 +618,24 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 z_H = z_H.detach()
                 z_L = z_L.detach()
 
+        # Apply COCONUT latent planning if enabled
+        # This happens AFTER recursive reasoning, BEFORE output generation
+        if self.latent_planner is not None:
+            z_H_planned = self.latent_planner(z_H)
+        else:
+            z_H_planned = z_H
+        
         # Final outputs
-        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())
+        new_carry = TinyRecursiveReasoningModel_ACTV1InnerCarry(z_H=z_H_planned.detach(), z_L=z_L.detach())
         
         # Get output from lm_head (may include VQ loss for concept vocab)
         vq_loss = None
         if hasattr(self.lm_head, 'use_vq') and self.lm_head.use_vq and self.training:
             # Quantize hidden states to get VQ loss
-            _, vq_loss = self.lm_head.quantize_hidden(z_H[:, self.puzzle_emb_len:])
+            _, vq_loss = self.lm_head.quantize_hidden(z_H_planned[:, self.puzzle_emb_len:])
         
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)  # [batch, num_actions]
+        output = self.lm_head(z_H_planned)[:, self.puzzle_emb_len:]
+        q_logits = self.q_head(z_H_planned[:, 0]).to(torch.float32)  # [batch, num_actions]
         
         # Parse Q-values: [HALT, CONTINUE, EXPAND] or legacy [HALT, CONTINUE]
         if q_logits.shape[-1] >= 3:
@@ -629,6 +654,7 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         updated_z_H = z_H  # Will be modified if expansion happens
         
         if self.enable_capsule_expansion and q_expand_logits is not None and 'capsule_state' in batch:
+            # Use z_H_planned for expansion decisions
             with torch.no_grad():
                 # Compute q_action decision (argmax of Q-values)
                 q_stacked = torch.stack([q_continue_logits, q_halt_logits, q_expand_logits], dim=-1)  # [B, 3]

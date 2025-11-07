@@ -59,18 +59,21 @@ class ConceptCodebook(nn.Module):
         # Flatten batch and sequence
         z_flat = z.reshape(-1, self.concept_dim)  # [B*seq_len, D]
         
+        # Cast codebook to match input dtype (for float16 support)
+        codebook_weight = self.embeddings.weight.to(z_flat.dtype)
+        
         # Compute distances to all codebook vectors
         distances = (
             torch.sum(z_flat ** 2, dim=1, keepdim=True)
-            + torch.sum(self.embeddings.weight ** 2, dim=1)
-            - 2 * torch.matmul(z_flat, self.embeddings.weight.t())
+            + torch.sum(codebook_weight ** 2, dim=1)
+            - 2 * torch.matmul(z_flat, codebook_weight.t())
         )  # [B*seq_len, num_concepts]
         
-        # Nearest neighbor lookup
-        concept_ids_flat = torch.argmin(distances, dim=1)  # [B*seq_len]
+        # Nearest neighbor lookup (explicitly Long for embedding)
+        concept_ids_flat = torch.argmin(distances, dim=1).long()  # [B*seq_len]
         
-        # Get quantized embeddings
-        z_q_flat = self.embeddings(concept_ids_flat)  # [B*seq_len, D]
+        # Get quantized embeddings and cast to input dtype
+        z_q_flat = self.embeddings(concept_ids_flat).to(z.dtype)  # [B*seq_len, D]
         
         # Reshape back
         z_q = z_q_flat.view(z.shape)
@@ -267,7 +270,8 @@ class HybridOutputHead(nn.Module):
             raise RuntimeError("VQ not enabled")
         
         z_q, concept_ids, vq_loss = self.codebook(hidden)
-        return concept_ids, vq_loss
+        # Ensure concept_ids is Long type for embedding lookup
+        return concept_ids.long(), vq_loss
     
     def get_control_id(self, control_type: str) -> int:
         """Get token ID for control symbol."""

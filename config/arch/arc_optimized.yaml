@@ -33,8 +33,8 @@ encoder_H_cycles: 3
 encoder_L_cycles: 4
 # Total encoder passes: 3×4 = 12 (more spatial reasoning)
 
-puzzle_emb_ndim: ${.hidden_size}
-puzzle_emb_len: 16
+puzzle_emb_ndim: 0
+puzzle_emb_len: 0
 
 pos_encodings: rope
 forward_dtype: float16

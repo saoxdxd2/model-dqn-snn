@@ -18,6 +18,9 @@ H_cycles: 3  # High-level reasoning
 L_cycles: 6  # Low-level processing
 # Total: 3×6 = 18 passes for reasoning
 
+halt_exploration_prob: 0.1
+halt_max_steps: 64
+
 # Unified: Same block architecture!
 H_layers: 0
 L_layers: 2  # Same 2 layers used in both encoder and reasoner

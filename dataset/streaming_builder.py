@@ -174,24 +174,27 @@ class StreamingCacheEncoder:
         # Process samples in order, only encoding what's been cached
         import gc
         import os
-        batch_count = 0
-        sample_idx = 0
+        
+        # Calculate starting batch number accounting for consolidated files
+        # CRITICAL: Batch numbers must be ABSOLUTE, not relative to sliced array
+        num_consolidated_batches = len(self.drive_checkpoints) * 100
+        batch_count = num_consolidated_batches  # Start from first unconsolidated batch
+        sample_idx = 0  # But sample_idx=0 in the SLICED array
         total_batches = (len(samples) + self.batch_size - 1) // self.batch_size
         
-        # Fast-forward: find first missing batch to skip checking existing ones
+        # Fast-forward: find first missing batch AFTER consolidated batches
         if self.checkpoint_dir:
             print(f"🔍 Fast-forwarding to first unencoded batch...")
-            for check_batch in range(total_batches):
+            # Start checking from first unconsolidated batch number
+            for check_batch in range(num_consolidated_batches, num_consolidated_batches + total_batches):
                 batch_file = os.path.join(self.checkpoint_dir, f"batch_{check_batch:05d}.pt")
                 if not os.path.exists(batch_file):
                     # Found first missing batch
                     batch_count = check_batch
-                    # CRITICAL: sample_idx stays at 0 because samples array is already sliced
-                    # The slicing happened in stream_build() before threading
-                    sample_idx = 0
+                    sample_idx = 0  # Start of sliced array
                     
-                    # Register all existing batches before this point
-                    for i in range(check_batch):
+                    # Register existing batch files in the unconsolidated range
+                    for i in range(num_consolidated_batches, check_batch):
                         existing_file = os.path.join(self.checkpoint_dir, f"batch_{i:05d}.pt")
                         if os.path.exists(existing_file):
                             with self.lock:
@@ -201,9 +204,10 @@ class StreamingCacheEncoder:
                     with self.lock:
                         self.new_batches_start_idx = check_batch
                     
-                    if check_batch > 0:
-                        print(f"⏩ Skipped {check_batch} existing batches (already in checkpoint files)")
-                        print(f"▶️  Starting encoding from beginning of remaining {len(samples):,} samples")
+                    skipped = check_batch - num_consolidated_batches
+                    if skipped > 0:
+                        print(f"⏩ Skipped {skipped} existing batches (already in checkpoint files)")
+                    print(f"▶️  Starting encoding from batch {batch_count} (sample 0 of remaining {len(samples):,})")
                     break
         
         pbar = tqdm(total=total_batches, initial=batch_count, desc="GPU Encoding")
@@ -324,9 +328,16 @@ class StreamingCacheEncoder:
         
         # Find batches we haven't consolidated yet (100 batches per chunk)
         chunk_size = 100
-        start_idx = len(self.drive_checkpoints) * chunk_size
+        start_idx = len(self.drive_checkpoints) * chunk_size  # Batch NUMBER range
         end_idx = up_to_batch
-        batch_subset = self.batch_files[start_idx:end_idx]
+        
+        # Build list of batch files by NUMBER, not by list index
+        # batch_files list may have gaps from previous consolidations
+        batch_subset = []
+        for batch_num in range(start_idx, end_idx):
+            batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_num:05d}.pt")
+            if os.path.exists(batch_file):
+                batch_subset.append(batch_file)
         
         if not batch_subset:
             return
@@ -487,7 +498,8 @@ class StreamingCacheEncoder:
         batch_files = sorted(checkpoint_dir.glob("batch_*.pt"))
         
         # Calculate samples encoded
-        samples_in_consolidated = len(consolidated_files) * 1000 * self.batch_size  # 1000 batches per consolidated
+        # IMPORTANT: Each consolidated file contains 100 batches (chunk_size in _consolidate_to_drive)
+        samples_in_consolidated = len(consolidated_files) * 100 * self.batch_size  # 100 batches per consolidated
         samples_in_batches = len(batch_files) * self.batch_size
         total_encoded = samples_in_consolidated + samples_in_batches
         
@@ -511,7 +523,7 @@ class StreamingCacheEncoder:
         
         if samples_encoded > 0:
             print(f"\n🔄 RESUME MODE: Found existing progress")
-            print(f"   Consolidated files: {len(existing_consolidated)} ({len(existing_consolidated) * 1000} batches)")
+            print(f"   Consolidated files: {len(existing_consolidated)} ({len(existing_consolidated) * 100} batches)")
             print(f"   Batch files: {len(existing_batches)}")
             print(f"   Samples already encoded: {samples_encoded:,}/{len(samples):,} ({samples_encoded/len(samples)*100:.1f}%)")
             print(f"   Resuming from sample {samples_encoded}...\n")
