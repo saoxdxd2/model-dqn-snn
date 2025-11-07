@@ -105,11 +105,11 @@ class AssociativeMemoryBank(nn.Module):
         # Attention-based retrieval (dropout respects training mode)
         query_expanded = query.unsqueeze(1)  # [batch, 1, hidden]
         
-        # Add batch dimension to keys/values (will broadcast across batch)
-        # Don't expand! MultiheadAttention handles broadcasting efficiently
-        # Expanding creates [batch, capacity, hidden] = huge memory (e.g., 576×16384×1024 = 18GB)
-        keys = self.memory_keys.unsqueeze(0)  # [1, capacity, hidden]
-        values = self.memory_values.unsqueeze(0)  # [1, capacity, hidden]
+        # Repeat keys/values for batch dimension
+        # NOTE: expand() creates a view but MHA's internal reshape breaks with torch.compile
+        # Must use repeat() which copies data, but batch_size is small (48) so acceptable
+        keys = self.memory_keys.unsqueeze(0).repeat(batch_size, 1, 1)  # [batch, capacity, hidden]
+        values = self.memory_values.unsqueeze(0).repeat(batch_size, 1, 1)  # [batch, capacity, hidden]
         
         # Cast to float32 for attention (nn.MultiheadAttention uses float32 weights)
         query_expanded = query_expanded.float()
