@@ -1080,18 +1080,54 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         to_tensor = transforms.ToTensor()
         
         for sample in raw_samples:
-            # DataSample is a Pydantic model - use dot notation
-            # sample.image is the main image, sample.label could be target
-            input_img = to_tensor(sample.image)  # [3, H, W]
+            # DataSample has different fields based on modality: text, image, grid
+            img = None
             
-            # For output, check if label is an image or if metadata has target
-            if hasattr(sample.label, 'convert'):  # PIL Image
-                output_img = to_tensor(sample.label)
-            elif 'target_image' in sample.metadata:
-                output_img = to_tensor(sample.metadata['target_image'])
+            # 1. If image field is populated (direct image)
+            if sample.image is not None:
+                if isinstance(sample.image, np.ndarray):
+                    img = Image.fromarray(sample.image.astype(np.uint8))
+                else:
+                    img = sample.image  # Already PIL Image
+            
+            # 2. If grid field (ARC/maze) - visualize as image
+            elif sample.grid is not None:
+                # Convert grid to RGB image (simple colormap)
+                grid = sample.grid
+                if grid.dtype == np.int32 or grid.dtype == np.int64:
+                    # Normalize to 0-255 range
+                    grid_norm = ((grid - grid.min()) / (grid.max() - grid.min() + 1e-8) * 255).astype(np.uint8)
+                    # Create RGB by repeating grayscale
+                    img = Image.fromarray(grid_norm).convert('RGB')
+                else:
+                    img = Image.fromarray((grid * 255).astype(np.uint8)).convert('RGB')
+            
+            # 3. If text field - skip for now (would need text_renderer.py)
+            elif sample.text is not None:
+                # Create blank placeholder for text samples
+                img = Image.new('RGB', (224, 224), color=(128, 128, 128))
+            
             else:
-                # Default: use same as input (for now)
-                output_img = input_img.clone()
+                # Empty sample - create blank
+                img = Image.new('RGB', (224, 224), color=(0, 0, 0))
+            
+            # Convert to tensor
+            input_img = to_tensor(img)
+            
+            # For output: check label field
+            if sample.label is not None:
+                if isinstance(sample.label, np.ndarray):
+                    if sample.label.ndim == 2:  # Grid
+                        label_grid = ((sample.label - sample.label.min()) / (sample.label.max() - sample.label.min() + 1e-8) * 255).astype(np.uint8)
+                        output_img = to_tensor(Image.fromarray(label_grid).convert('RGB'))
+                    else:
+                        output_img = to_tensor(Image.fromarray(sample.label.astype(np.uint8)))
+                elif hasattr(sample.label, 'convert'):  # PIL Image
+                    output_img = to_tensor(sample.label)
+                else:
+                    output_img = input_img.clone()  # Fallback
+            else:
+                output_img = input_img.clone()  # Same as input
             
             input_images.append(input_img)
             output_images.append(output_img)
