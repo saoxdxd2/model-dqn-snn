@@ -21,14 +21,16 @@ epochs: 50
 eval_interval: 5
 checkpoint_every_eval: true
 
-# Learning rates
-lr: 3e-4
-lr_min_ratio: 1.0
-lr_warmup_steps: 1000
+# Learning rates (CORRECTED for stability)
+lr: 1e-4                # Reduced from 3e-4 (only 82M trainable params, CLIP frozen)
+lr_min_ratio: 0.1       # Allow decay to 1e-5
+lr_warmup_steps: 3000   # Increased from 1000 (~5-6 epochs for stability)
+lr_scheduler: "cosine"  # Better than linear decay
+max_grad_norm: 1.0      # Prevent gradient explosions
 
-# Optimizer
+# Optimizer (IMPROVED for DQN stability)
 beta1: 0.9
-beta2: 0.95
+beta2: 0.98             # Increased from 0.95 for value function stability
 weight_decay: 0.1
 puzzle_emb_weight_decay: 0.1
 puzzle_emb_lr: 1e-2
@@ -39,7 +41,7 @@ min_eval_interval: 0
 checkpoint_path: checkpoints/hybrid_pretrained
 load_checkpoint: null
 
-ema: false
+ema: true               # Enable for smoother training
 ema_rate: 0.999
 freeze_weights: false
 
@@ -55,8 +57,8 @@ enable_hierarchical_attention: true
 q_head_num_actions: 3
 q_head_type: "mlp"
 
-# DQN Stability
-dqn_warmup_ratio: 0.1
+# DQN Stability (SAFER)
+dqn_warmup_ratio: 0.2   # Increased from 0.1 (need more time for TRM+COCONUT stabilization)
 dqn_warmup_steps: 5000
 freeze_representation_during_warmup: true
 
@@ -153,9 +155,16 @@ dataset:
   denoiser_path: 'models/checkpoints/n2n_denoiser.pt'
   cache_images: true                    # Cache rendered text images
   
-# Expected Benefits
-# - Pretrained: +25% accuracy (CLIP knowledge)
-# - N2N Adapter: +12% alignment (denoise + adapt)
-# - TRM: +18% reasoning (H/L cycles)
-# - COCONUT: +10% planning (4 paths)
-# - Total: ~65% improvement over baseline
+# Expected Benefits (REALISTIC ESTIMATES - not yet measured)
+# These are aspirational targets, not empirical results
+# Actual benefits require ablation studies to verify
+#
+# Conservative estimate: +30-40% over baseline
+# - CLIP frozen: +10-20% (proven in literature)
+# - N2N Adapter: +3-8% (speculative, helps with text rendering)
+# - TRM cycles: +5-15% (iterative refinement)
+# - COCONUT: +2-8% (latent planning, very speculative)
+#
+# Optimistic estimate: +50-60% over baseline
+# Note: Benefits compound multiplicatively, not additively
+# Run ablation study to measure actual contributions
