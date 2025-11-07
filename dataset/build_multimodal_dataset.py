@@ -786,23 +786,34 @@ def build(config: MultimodalDatasetConfig):
     # Save raw samples with PuzzleDataset-compatible structure
     print("💾 Saving raw samples...")
     
-    # Save train split
+    # Create proper metadata with all required fields
+    num_concepts = config.num_concepts
+    vocab_size = num_concepts + 4  # Concept vocab + control symbols
+    
     train_metadata = {
-        'num_samples': len(train_samples),
-        'format': 'raw_samples',
-        'note': 'Images cached, TRM encodes during training'
+        'pad_id': 0,
+        'ignore_label_id': -100,
+        'blank_identifier_id': 0,
+        'vocab_size': vocab_size,
+        'seq_len': 512,  # Will be set by model during training
+        'num_puzzle_identifiers': 0,
+        'total_groups': len(train_samples),
+        'mean_puzzle_examples': 1.0,
+        'total_puzzles': len(train_samples),
+        'sets': ['train']
     }
+    
     with open(os.path.join(train_dir, 'dataset.json'), 'w') as f:
         json.dump(train_metadata, f, indent=2)
     torch.save(train_samples, os.path.join(train_dir, 'raw_samples.pt'))
     
-    # Save test split
+    # Save test split (optional - only if test samples exist)
     if test_samples:
-        test_metadata = {
-            'num_samples': len(test_samples),
-            'format': 'raw_samples',
-            'note': 'Images cached, TRM encodes during training'
-        }
+        test_metadata = train_metadata.copy()
+        test_metadata['total_groups'] = len(test_samples)
+        test_metadata['total_puzzles'] = len(test_samples)
+        test_metadata['sets'] = ['test']
+        
         with open(os.path.join(test_dir, 'dataset.json'), 'w') as f:
             json.dump(test_metadata, f, indent=2)
         torch.save(test_samples, os.path.join(test_dir, 'raw_samples.pt'))
