@@ -120,7 +120,7 @@ evaluators:
   - name: arc@ARC
 
 # Training hyperparameters (Winner Strategy - Streaming + Large Batch)
-global_batch_size: 128  # Increased from 48 (winner used 128-256)
+global_batch_size: 128  # Using advanced memory techniques (no batch reduction needed)
 gradient_accumulation_steps: 4  # Effective batch = 128*4 = 512
 epochs: 1000000  # Very large epoch count for continuous streaming
 eval_interval: 5
@@ -236,8 +236,8 @@ training:
   
   # Phase 2: End-to-end task training
   task_training:
-    batch_size: 192                     # 6x larger! Use 12GB of 15GB VRAM
-    gradient_accumulation_steps: 1      # Can increase for effective larger batches
+    batch_size: 96                      # Using selective checkpointing + SDPA
+    gradient_accumulation_steps: 2      # Effective batch = 96*2 = 192
     lr: 3e-4
     freeze_pretrained: true             # Keep CLIP frozen (save VRAM)
     freeze_n2n_adapter: false           # Adapter trainable

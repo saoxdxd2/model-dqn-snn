@@ -3,6 +3,9 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import sys
+
+# Memory optimization: Prevent fragmentation and enable expandable segments
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:128'
 import math
 import yaml
 import shutil
@@ -15,6 +18,16 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader
+
+# Enable memory-efficient attention backend (40-60% memory reduction for attention)
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    # Force memory-efficient backend (works on T4, doesn't require Ampere)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_flash_sdp(False)  # T4 doesn't support Flash
+    torch.backends.cuda.enable_math_sdp(False)   # Math is slower and uses more memory
+except (ImportError, AttributeError):
+    pass  # Older PyTorch versions
 
 import tqdm
 import wandb
@@ -1234,11 +1247,11 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     for think_step in range(max_thinking_steps):
         if use_amp:
             if not hasattr(train_state, 'scaler'):
-                from torch.cuda.amp import GradScaler
-                train_state.scaler = GradScaler()
+                from torch.amp import GradScaler
+                train_state.scaler = GradScaler('cuda')
             
-            from torch.cuda.amp import autocast
-            with autocast():
+            from torch.amp import autocast
+            with autocast('cuda'):
                 train_state.carry, step_loss, step_metrics, _, _ = train_state.model(
                     carry=train_state.carry, 
                     batch=batch, 
