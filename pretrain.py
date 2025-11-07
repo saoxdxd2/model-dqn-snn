@@ -1101,6 +1101,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                     img = Image.fromarray(grid_norm).convert('RGB')
                 else:
                     img = Image.fromarray((grid * 255).astype(np.uint8)).convert('RGB')
+                # Resize to standard 224x224 (ARC grids have variable sizes)
+                img = img.resize((224, 224), Image.NEAREST)
             
             # 3. If text field - skip for now (would need text_renderer.py)
             elif sample.text is not None:
@@ -1111,6 +1113,10 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 # Empty sample - create blank
                 img = Image.new('RGB', (224, 224), color=(0, 0, 0))
             
+            # Resize to standard 224x224 for consistency
+            if img.size != (224, 224):
+                img = img.resize((224, 224), Image.BILINEAR)
+            
             # Convert to tensor
             input_img = to_tensor(img)
             
@@ -1119,11 +1125,16 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 if isinstance(sample.label, np.ndarray):
                     if sample.label.ndim == 2:  # Grid
                         label_grid = ((sample.label - sample.label.min()) / (sample.label.max() - sample.label.min() + 1e-8) * 255).astype(np.uint8)
-                        output_img = to_tensor(Image.fromarray(label_grid).convert('RGB'))
+                        output_img_pil = Image.fromarray(label_grid).convert('RGB')
+                        output_img_pil = output_img_pil.resize((224, 224), Image.NEAREST)
+                        output_img = to_tensor(output_img_pil)
                     else:
-                        output_img = to_tensor(Image.fromarray(sample.label.astype(np.uint8)))
+                        output_img_pil = Image.fromarray(sample.label.astype(np.uint8))
+                        output_img_pil = output_img_pil.resize((224, 224), Image.BILINEAR)
+                        output_img = to_tensor(output_img_pil)
                 elif hasattr(sample.label, 'convert'):  # PIL Image
-                    output_img = to_tensor(sample.label)
+                    output_img_pil = sample.label.resize((224, 224), Image.BILINEAR)
+                    output_img = to_tensor(output_img_pil)
                 else:
                     output_img = input_img.clone()  # Fallback
             else:
