@@ -769,25 +769,49 @@ def build(config: MultimodalDatasetConfig):
     builder = MultimodalDatasetBuilder(config)
     dataset = builder.build_dataset()
     
-    # Save dataset (simplified for raw text mode)
+    # Save dataset with proper train/test structure
     import os
     import json
-    os.makedirs(config.output_dir, exist_ok=True)
+    
+    # Create train/test subdirectories
+    train_dir = os.path.join(config.output_dir, 'train')
+    test_dir = os.path.join(config.output_dir, 'test')
+    os.makedirs(train_dir, exist_ok=True)
+    os.makedirs(test_dir, exist_ok=True)
     
     # Get raw samples (no pre-encoding - TRM will encode during training)
     train_samples = dataset['train']
+    test_samples = dataset.get('test', [])
     
-    # Save raw samples instead of capsules (avoid double encoding)
+    # Save raw samples with PuzzleDataset-compatible structure
     print("💾 Saving raw samples...")
-    torch.save({
-        'samples': train_samples,
-        'num_samples': len(train_samples)
-    }, os.path.join(config.output_dir, 'raw_samples.pt'))
     
-    # Save metadata
+    # Save train split
+    train_metadata = {
+        'num_samples': len(train_samples),
+        'format': 'raw_samples',
+        'note': 'Images cached, TRM encodes during training'
+    }
+    with open(os.path.join(train_dir, 'dataset.json'), 'w') as f:
+        json.dump(train_metadata, f, indent=2)
+    torch.save(train_samples, os.path.join(train_dir, 'raw_samples.pt'))
+    
+    # Save test split
+    if test_samples:
+        test_metadata = {
+            'num_samples': len(test_samples),
+            'format': 'raw_samples',
+            'note': 'Images cached, TRM encodes during training'
+        }
+        with open(os.path.join(test_dir, 'dataset.json'), 'w') as f:
+            json.dump(test_metadata, f, indent=2)
+        torch.save(test_samples, os.path.join(test_dir, 'raw_samples.pt'))
+    
+    # Save overall metadata
     with open(info_path, 'w') as f:
         json.dump({
-            'num_samples': len(train_samples),
+            'num_train_samples': len(train_samples),
+            'num_test_samples': len(test_samples),
             'format': 'raw_samples',
             'note': 'Images cached, TRM encodes during training'
         }, f, indent=2)
