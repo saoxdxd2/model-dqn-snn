@@ -426,7 +426,6 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             # Use NEW multimodal builder with text rendering support
             build_cmd = [
                 "python", "dataset/build_multimodal_dataset.py",
-                "build_dataset",  # argdantic command name
                 "--config.source-paths", "kaggle/combined/arc-agi",
                 "--config.output-dir", "data/arc-aug-5000",
                 "--config.render-text-to-image",
