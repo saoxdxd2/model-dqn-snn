@@ -200,7 +200,7 @@ class PuzzleDataset(IterableDataset):
                     # Create placeholder arrays (actual data loaded on-demand)
                     # Store samples directly for streaming access
                     self._data[set_name_] = {
-                        "samples": all_samples,  # Raw DataSample objects
+                        "raw_samples": all_samples,  # Raw DataSample objects
                         "num_samples": num_samples,
                         "puzzle_identifiers": np.arange(num_samples, dtype=np.int32),
                         "puzzle_indices": np.arange(num_samples + 1, dtype=np.int32),
