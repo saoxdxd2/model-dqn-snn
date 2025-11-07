@@ -102,12 +102,14 @@ class AssociativeMemoryBank(nn.Module):
         # Store original dtype
         original_dtype = query.dtype
         
-        # Expand keys/values for batch
-        keys = self.memory_keys.unsqueeze(0).expand(batch_size, -1, -1)
-        values = self.memory_values.unsqueeze(0).expand(batch_size, -1, -1)
-        
         # Attention-based retrieval (dropout respects training mode)
         query_expanded = query.unsqueeze(1)  # [batch, 1, hidden]
+        
+        # Add batch dimension to keys/values (will broadcast across batch)
+        # Don't expand! MultiheadAttention handles broadcasting efficiently
+        # Expanding creates [batch, capacity, hidden] = huge memory (e.g., 576×16384×1024 = 18GB)
+        keys = self.memory_keys.unsqueeze(0)  # [1, capacity, hidden]
+        values = self.memory_values.unsqueeze(0)  # [1, capacity, hidden]
         
         # Cast to float32 for attention (nn.MultiheadAttention uses float32 weights)
         query_expanded = query_expanded.float()
