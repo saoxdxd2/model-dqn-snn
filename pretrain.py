@@ -45,6 +45,8 @@ from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 from utils.gradient_monitor import GradientFlowMonitor
+from utils.annealing import compute_expansion_penalty, compute_q_temperature, compute_warmup_progress
+from dataset.training_progress import TrainingProgressTracker, get_training_manifest
 
 
 class LossConfig(pydantic.BaseModel):
@@ -106,7 +108,8 @@ class PretrainConfig(pydantic.BaseModel):
     freeze_weights: bool = False # If True, freeze weights and only learn the embeddings
     
     # DQN Stability Features
-    dqn_warmup_steps: int = 5000  # Steps before DQN affects representation
+    dqn_warmup_ratio: float = 0.1  # Ratio of training for DQN warmup (0.1 = first 10%)
+    dqn_warmup_steps: int = 5000  # Deprecated: use dqn_warmup_ratio
     freeze_representation_during_warmup: bool = True  # Freeze h_blocks/l_blocks during warmup
     
     # Optimizer Stability
@@ -118,11 +121,19 @@ class PretrainConfig(pydantic.BaseModel):
     expansion_penalty_schedule: str = "cosine"  # "cosine", "linear", or "fixed"
     expansion_penalty_start: float = 0.1  # Initial penalty
     expansion_penalty_end: float = 0.001  # Final penalty
-    expansion_anneal_steps: int = 50000  # Steps to anneal over
+    expansion_anneal_ratio: float = 0.5  # Ratio of total training (0.5 = first 50%)
+    expansion_anneal_steps: int = 50000  # Deprecated: use expansion_anneal_ratio
     
     # Replay Buffer Sampling
     replay_recent_fraction: float = 0.25  # Fraction from recent transitions
     replay_max_age: int = 100000  # Discard transitions older than this
+    
+    # Q-Head Temperature Annealing (Exploration -> Exploitation)
+    enable_q_temperature_annealing: bool = True
+    q_temperature_start: float = 1.0  # High temp = exploration
+    q_temperature_end: float = 0.1  # Low temp = exploitation
+    q_temperature_anneal_ratio: float = 1.0  # Ratio of total training (1.0 = 100%)
+    q_temperature_schedule: str = "exponential"  # "linear", "exponential", "cosine"
 
 def per_layer_gradient_normalization(model: nn.Module, config) -> dict:
     """
@@ -455,7 +466,12 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
     return dataloader, dataset.metadata
 
 
-def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
+def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, rank: int, world_size: int, total_steps: int = 100000):
+    """Create model with loss head.
+    
+    Args:
+        total_steps: Total training steps for annealing schedules
+    """
     # Build model config: merge YAML arch config with dataset metadata
     # __pydantic_extra__ contains all extra YAML fields (causal, input_vocab_size, etc.)
     # Dataset metadata overrides seq_len/vocab_size/num_puzzle_identifiers
@@ -494,12 +510,18 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
     )
     
-    # Debug: Check critical parameters
-    print(f"\n🔍 Model Config Debug:")
-    print(f"   vocab_size: {model_cfg.get('vocab_size')}")
-    print(f"   input_vocab_size: {model_cfg.get('input_vocab_size', 'NOT SET')}")
-    print(f"   hidden_size: {model_cfg.get('hidden_size', 'NOT SET')}")
-    print(f"   seq_len: {model_cfg.get('seq_len')}")
+    model_cfg['semantic_mode'] = semantic_mode
+    model_cfg['enable_capsule_expansion'] = enable_capsule_expansion
+    model_cfg['total_steps'] = total_steps  # For annealing schedules
+    
+    if rank == 0:
+        print(f"\n📐 Model Config:")
+        print(f"   arch: {config.arch.name}")
+        print(f"   input_vocab_size: {model_cfg.get('input_vocab_size', 'NOT SET')}")
+        print(f"   output_vocab_size: {model_cfg.get('output_vocab_size', 'NOT SET')}")
+        print(f"   hidden_size: {model_cfg.get('hidden_size', 'NOT SET')}")
+        print(f"   seq_len: {model_cfg.get('seq_len')}")
+        print(f"   total_steps: {total_steps:,}")
 
     # Instantiate model with loss head
     model_cls = load_model_class(config.arch.name)
@@ -508,7 +530,10 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
         print(model)
-        model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+        # Pass total_steps to loss head for annealing schedules
+        loss_kwargs = dict(config.arch.loss.__pydantic_extra__)
+        loss_kwargs['total_steps'] = total_steps
+        model = loss_head_cls(model, **loss_kwargs)  # type: ignore
         if "DISABLE_COMPILE" not in os.environ:
             # Configure Triton for GPU compute capability 7.5 (Tesla T4)
             # Max block size is 4096, not 8192
@@ -658,14 +683,20 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     # Store adjusted hyperparameters
     config.lr = adjusted_lr
     
-    # Estimated total training steps
-    total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
+    # Calculate total training steps correctly
+    # Steps per epoch = (total samples) / batch_size
+    # Total steps = steps_per_epoch * epochs
+    samples_per_epoch = train_metadata.total_groups * train_metadata.mean_puzzle_examples
+    steps_per_epoch = max(1, int(samples_per_epoch / config.global_batch_size))
+    total_steps = steps_per_epoch * config.epochs
     
     if rank == 0:
-        print(f"   Total training steps: {total_steps:,}")
+        print(f"   Samples per epoch: {samples_per_epoch:,}")
+        print(f"   Steps per epoch: {steps_per_epoch:,}")
+        print(f"   Total training steps: {total_steps:,} ({config.epochs} epochs)")
 
-    # Model
-    model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size)
+    # Model (pass total_steps for annealing)
+    model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size, total_steps=total_steps)
 
     return TrainState(
         step=0,
@@ -796,7 +827,7 @@ def save_checkpoint_atomic(checkpoint: dict, filepath: str):
         raise e
 
 
-def save_train_state(config: PretrainConfig, train_state: TrainState):
+def save_train_state(config: PretrainConfig, train_state: TrainState, progress_tracker: Optional[TrainingProgressTracker] = None):
     """Save complete training state with corruption protection and backup.
     
     Features:
@@ -804,6 +835,7 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
     - SHA256 checksum verification
     - Safe for compression/transfer
     - Creates backup of previous checkpoint for rollback.
+    - Saves training progress through consolidated chunks
     """
     if config.checkpoint_path is None:
         return
@@ -824,6 +856,11 @@ def save_train_state(config: PretrainConfig, train_state: TrainState):
         'total_steps': train_state.total_steps,
         'dataset': config.data_paths[0] if config.data_paths else 'unknown',
     }
+    
+    # Save training progress through consolidated chunks
+    if progress_tracker is not None:
+        progress_tracker.save()
+        checkpoint['has_training_progress'] = True
     
     # Save DQN-specific state if enabled
     if hasattr(train_state.model, 'replay_buffer'):
@@ -969,14 +1006,22 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         return
     
     # DQN Warmup: Freeze representation layers during early training
-    if hasattr(config, 'dqn_warmup_steps') and config.freeze_representation_during_warmup:
-        if train_state.step < config.dqn_warmup_steps and not train_state.representation_frozen:
+    if config.freeze_representation_during_warmup:
+        # Calculate warmup steps from ratio
+        if hasattr(config, 'dqn_warmup_ratio'):
+            dqn_warmup_steps = int(train_state.total_steps * config.dqn_warmup_ratio)
+        else:
+            # Fallback to deprecated steps
+            dqn_warmup_steps = config.dqn_warmup_steps
+        
+        if train_state.step < dqn_warmup_steps and not train_state.representation_frozen:
             # Freeze representation layers (h_blocks, l_blocks)
             if rank == 0:
                 print(f"\n{'='*70}")
                 print(f"  🔒 DQN WARMUP: Freezing representation layers")
-                print(f"  Steps 0-{config.dqn_warmup_steps}: Supervised learning only")
-                print(f"  Step {config.dqn_warmup_steps}+: Full DQN training")
+                print(f"  Steps 0-{dqn_warmup_steps}: Supervised learning only")
+                print(f"  Step {dqn_warmup_steps}+: Full DQN training")
+                print(f"  Warmup ratio: {config.dqn_warmup_ratio*100:.1f}% of training")
                 print(f"{'='*70}\n")
             
             for name, param in train_state.model.named_parameters():
@@ -985,7 +1030,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             
             train_state.representation_frozen = True
         
-        elif train_state.step == config.dqn_warmup_steps and train_state.representation_frozen:
+        elif train_state.step == dqn_warmup_steps and train_state.representation_frozen:
             # Unfreeze after warmup
             if rank == 0:
                 print(f"\n{'='*70}")
@@ -1058,8 +1103,13 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         with torch.device("cuda"):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
-    # Forward
-    train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    # Forward - CRITICAL: Pass global step for annealing schedules
+    train_state.carry, loss, metrics, _, _ = train_state.model(
+        carry=train_state.carry, 
+        batch=batch, 
+        return_keys=[],
+        global_step=train_state.step  # Synchronize annealing with global training time
+    )
     
     # NaN Detection and Optimizer Fallback
     if torch.isnan(loss) or torch.isinf(loss):
@@ -1492,6 +1542,30 @@ def launch(hydra_config: DictConfig):
                 print(f"{'='*70}\n")
             config.load_checkpoint = checkpoint_file
     
+    # Initialize training progress tracker for consolidated dataset chunks
+    progress_tracker = None
+    if config.checkpoint_path is not None and RANK == 0:
+        dataset_name = get_checkpoint_name(config.data_paths[0] if config.data_paths else 'model').replace('.pt', '')
+        progress_tracker = TrainingProgressTracker(
+            checkpoint_dir=Path(config.checkpoint_path),
+            dataset_name=dataset_name
+        )
+        
+        # Load existing progress if resuming
+        if progress_tracker.has_progress():
+            progress_tracker.load()
+            
+            # Show dataset manifest
+            if config.data_paths:
+                # Extract checkpoint directory from data path
+                data_path = Path(config.data_paths[0])
+                checkpoint_dir = data_path.parent / 'stream_checkpoints'
+                if checkpoint_dir.exists():
+                    manifest = get_training_manifest(checkpoint_dir)
+                    print(f"\n📦 Dataset Manifest:")
+                    print(f"   Available chunks: {len(manifest['available_chunks'])}")
+                    print(f"   Chunks IDs: {manifest['available_chunks'][:10]}..." if len(manifest['available_chunks']) > 10 else f"   Chunk IDs: {manifest['available_chunks']}")
+    
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
 
@@ -1562,7 +1636,7 @@ def launch(hydra_config: DictConfig):
                     print("  💾 GRACEFUL SHUTDOWN IN PROGRESS")
                     print("="*70)
                     print(f"\n  Saving checkpoint at step {train_state.step}...")
-                    save_train_state(config, train_state)
+                    save_train_state(config, train_state, progress_tracker)
                     print("\n✅ Training stopped successfully!")
                     print(f"   Final step: {train_state.step}/{train_state.total_steps}")
                     print(f"   Progress: {(train_state.step/train_state.total_steps)*100:.1f}%")
@@ -1623,7 +1697,7 @@ def launch(hydra_config: DictConfig):
                 if RANK == 0:
                     print("SAVE CHECKPOINT")
                 if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
-                    save_train_state(config, train_state_eval)
+                    save_train_state(config, train_state_eval, progress_tracker)
 
                 if config.ema:
                     del train_state_eval

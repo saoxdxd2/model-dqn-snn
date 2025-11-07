@@ -296,6 +296,11 @@ class StreamingCacheEncoder:
                     
                     with self.lock:
                         self.batch_files.append(batch_file)
+                        
+                        # Record batch in progress tracker
+                        if hasattr(self, 'progress_tracker'):
+                            batch_id = int(batch_file.stem.split('_')[1])
+                            self.progress_tracker.record_batch_built(batch_id)
                 
                 del batch_images, result, batch_data
                 batch_count += 1
@@ -322,25 +327,34 @@ class StreamingCacheEncoder:
         print(f"✅ Consumer: Encoding complete")
     
     def _consolidate_to_drive(self, up_to_batch):
-        """Consolidate processed batches and clean up local files to free disk space."""
+        """Consolidate processed batches using unified progress tracker."""
         import os
         import gc
         
-        # Find batches we haven't consolidated yet (100 batches per chunk)
-        chunk_size = 100
-        start_idx = len(self.drive_checkpoints) * chunk_size  # Batch NUMBER range
-        end_idx = up_to_batch
+        # Use progress tracker to determine what to consolidate
+        if not hasattr(self, 'progress_tracker'):
+            return  # No tracker initialized yet
         
-        # Build list of batch files by NUMBER, not by list index
-        # batch_files list may have gaps from previous consolidations
+        # Get batches to consolidate from tracker
+        start_batch, end_batch, next_chunk_id = self.progress_tracker.get_batches_to_consolidate()
+        
+        if end_batch == 0:
+            return  # Not enough batches for a complete chunk
+        
+        # Only consolidate up to the requested batch limit
+        end_batch = min(end_batch, up_to_batch)
+        
+        # Build list of batch files to consolidate
         batch_subset = []
-        for batch_num in range(start_idx, end_idx):
+        for batch_num in range(start_batch, end_batch):
             batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_num:05d}.pt")
             if os.path.exists(batch_file):
                 batch_subset.append(batch_file)
         
         if not batch_subset:
             return
+        
+        chunk_size = end_batch - start_batch
         
         # Pause producer thread during consolidation
         # NOTE: Consumer (GPU) thread is the one calling this, so it can't pause itself!
@@ -363,7 +377,7 @@ class StreamingCacheEncoder:
                 print(f"⏳ Waiting for producer to pause... ({paused}/1 paused, {elapsed:.0f}s elapsed)")
             time.sleep(0.1)
         
-        print(f"📤 Consolidating batches {start_idx}-{end_idx}...")
+        print(f"📤 Consolidating chunk {next_chunk_id}: batches {start_batch}-{end_batch-1}...")
         
         # Load and concatenate in smaller chunks to avoid OOM
         # Process 20 batches at a time instead of all 100+
@@ -406,9 +420,8 @@ class StreamingCacheEncoder:
         del all_consolidated
         
         # Save to drive_dir if available, otherwise checkpoint_dir
-        chunk_idx = len(self.drive_checkpoints)
         save_dir = self.drive_dir if self.drive_dir else self.checkpoint_dir
-        consolidated_file = os.path.join(save_dir, f"consolidated_{chunk_idx:03d}.pt")
+        consolidated_file = os.path.join(save_dir, f"consolidated_{next_chunk_id:03d}.pt")
         
         torch.save(consolidated, consolidated_file)
         self.drive_checkpoints.append(consolidated_file)
@@ -416,17 +429,25 @@ class StreamingCacheEncoder:
         gc.collect()
         
         chunk_size_mb = os.path.getsize(consolidated_file) / 1024 / 1024
-        print(f"✅ Saved consolidated chunk {chunk_idx} ({chunk_size_mb:.1f}MB)")
+        print(f"✅ Saved consolidated chunk {next_chunk_id} ({chunk_size_mb:.1f}MB)")
         
         # Report corrupted files that were skipped
         if corrupted_files:
             print(f"⚠️  Skipped {len(corrupted_files)} corrupted batch files from previous session")
         
+        # Record consolidation in progress tracker
+        batch_ids = list(range(start_batch, end_batch))
+        self.progress_tracker.record_consolidation(
+            chunk_id=next_chunk_id,
+            batch_ids=batch_ids
+        )
+        print(f"📊 Recorded consolidation: chunk {next_chunk_id} <- batches {start_batch}-{end_batch-1}")
+        
         # Delete individual batch files by batch NUMBER, not list index
         # batch_files list may have gaps from previous consolidations
         deleted_count = 0
         freed_mb = 0
-        for batch_num in range(start_idx, end_idx):
+        for batch_num in range(start_batch, end_batch):
             batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_num:05d}.pt")
             if os.path.exists(batch_file):
                 batch_size_mb = os.path.getsize(batch_file) / 1024 / 1024
@@ -479,29 +500,49 @@ class StreamingCacheEncoder:
             print(f"   Metadata preserved - won't re-render on resume")
     
     def _check_resume_state(self):
-        """Check for existing batch/consolidated files and determine resume point.
+        """Check for existing progress using unified tracker.
         
         Returns:
             (samples_already_encoded, existing_batch_files, existing_consolidated_files)
         """
         import os
         from pathlib import Path
+        from dataset.training_progress import TrainingProgressTracker
         
         checkpoint_dir = Path(self.checkpoint_dir)
         if not checkpoint_dir.exists():
             return 0, [], []
         
-        # Check for consolidated files
+        # Initialize unified progress tracker
+        dataset_name = checkpoint_dir.parent.name
+        tracker = TrainingProgressTracker(
+            checkpoint_dir=checkpoint_dir.parent / "checkpoints" if (checkpoint_dir.parent / "checkpoints").exists() else checkpoint_dir,
+            dataset_name=dataset_name
+        )
+        
+        # Load existing progress
+        if tracker.has_progress():
+            tracker.load()
+        
+        # Get actual batch files (for registration)
+        batch_files = sorted(checkpoint_dir.glob("batch_*.pt"))
         consolidated_files = sorted(checkpoint_dir.glob("consolidated_*.pt"))
         
-        # Check for batch files
-        batch_files = sorted(checkpoint_dir.glob("batch_*.pt"))
+        # Calculate samples from tracker (source of truth)
+        if tracker.progress.consolidation_progress:
+            cons = tracker.progress.consolidation_progress
+            samples_in_consolidated = cons.total_batches_consolidated * self.batch_size
+        else:
+            samples_in_consolidated = 0
         
-        # Calculate samples encoded
-        # IMPORTANT: Each consolidated file contains 100 batches (chunk_size in _consolidate_to_drive)
-        samples_in_consolidated = len(consolidated_files) * 100 * self.batch_size  # 100 batches per consolidated
-        samples_in_batches = len(batch_files) * self.batch_size
+        # Unconsolidated batches
+        unconsolidated = tracker.get_unconsolidated_batches()
+        samples_in_batches = len(unconsolidated) * self.batch_size
+        
         total_encoded = samples_in_consolidated + samples_in_batches
+        
+        # Store tracker for later use
+        self.progress_tracker = tracker
         
         return total_encoded, batch_files, consolidated_files
     

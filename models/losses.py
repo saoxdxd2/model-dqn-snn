@@ -11,42 +11,9 @@ from models.dqn_utils import (
     soft_update_target_network,
 )
 from models.intrinsic_reward import IntrinsicRewardModule
+from utils.annealing import compute_expansion_penalty
 
 IGNORE_LABEL_ID = -100
-
-
-def compute_annealed_penalty(step: int, config) -> float:
-    """Compute expansion penalty with annealing schedule.
-    
-    Args:
-        step: Current training step
-        config: Model config with annealing parameters
-    
-    Returns:
-        Current penalty value (annealed from start to end)
-    """
-    schedule = getattr(config, 'expansion_penalty_schedule', 'fixed')
-    
-    if schedule == 'fixed':
-        return getattr(config, 'expansion_penalty_start', 0.01)
-    
-    start = getattr(config, 'expansion_penalty_start', 0.1)
-    end = getattr(config, 'expansion_penalty_end', 0.001)
-    anneal_steps = getattr(config, 'expansion_anneal_steps', 50000)
-    
-    if step >= anneal_steps:
-        return end
-    
-    progress = step / anneal_steps
-    
-    if schedule == 'linear':
-        return start + (end - start) * progress
-    elif schedule == 'cosine':
-        return end + 0.5 * (start - end) * (1 + math.cos(math.pi * progress))
-    elif schedule == 'exponential':
-        return start * (end / start) ** progress
-    else:
-        return start
 
 
 def s(x, epsilon=1e-30):
@@ -80,10 +47,11 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 class ACTLossHead(nn.Module):
-    def __init__(self, model: nn.Module, loss_type: str, enable_dqn: bool = False, deep_supervision_steps: int = 1):
+    def __init__(self, model: nn.Module, loss_type: str, enable_dqn: bool = False, deep_supervision_steps: int = 1, total_steps: int = 100000):
         super().__init__()
         self.model = model
         self.loss_fn = globals()[loss_type]
+        self.total_steps = total_steps  # Store for annealing calculations
         self.enable_dqn = enable_dqn
         self.deep_supervision_steps = deep_supervision_steps  # Multi-step supervision (TRM paper: +20%)
         
@@ -130,11 +98,14 @@ class ACTLossHead(nn.Module):
     def forward(
         self,
         return_keys: Sequence[str],
+        global_step: int = 0,  # Global training step from train_state.step
         # Model args
         **model_kwargs,
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
         # Model logits
         # B x SeqLen x D
+        # CRITICAL: Pass global_step to inner model for annealing
+        model_kwargs['global_step'] = global_step
         new_carry, outputs = self.model(**model_kwargs)
         labels = new_carry.current_data["labels"]
         
@@ -308,7 +279,12 @@ class ACTLossHead(nn.Module):
                 
         # Expansion cost tracking (HESC + NEW TRM implementation)
         # Use annealed penalty instead of fixed 0.01
-        expansion_penalty = compute_annealed_penalty(self.dqn_step_counter if self.enable_dqn else 0, self.model.config)
+        # CRITICAL: Use global_step (train_state.step) not dqn_step_counter
+        expansion_penalty = compute_expansion_penalty(
+            current_step=global_step,
+            total_steps=self.total_steps,
+            config=self.model.config
+        )
         
         expansion_cost = 0
         # Legacy source: from carry state
@@ -473,10 +449,11 @@ class ACTLossHead(nn.Module):
             self._store_transitions(model_kwargs.get('carry'), new_carry, outputs, normalized_rewards)
             
             # Compute epsilon for current step
+            # CRITICAL: Use global_step, not dqn_step_counter
             from models.dqn_utils import compute_epsilon
             config = self.model.config
             current_epsilon = compute_epsilon(
-                self.dqn_step_counter,
+                global_step,
                 epsilon_start=config.dqn_epsilon_start,
                 epsilon_end=config.dqn_epsilon_end,
                 epsilon_decay_steps=config.dqn_epsilon_decay_steps
@@ -539,8 +516,12 @@ class ACTLossHead(nn.Module):
             
             # Track Q-head temperature if annealing is enabled
             if getattr(self.model.config, 'enable_q_temperature_annealing', False):
-                from models.dqn_utils import compute_q_temperature
-                q_temp = compute_q_temperature(self.dqn_step_counter, self.model.config)
+                from utils.annealing import compute_q_temperature
+                q_temp = compute_q_temperature(
+                    current_step=global_step,  # CRITICAL: Use global_step not dqn_step_counter
+                    total_steps=self.total_steps,
+                    config=self.model.config
+                )
                 metrics["q_temperature"] = q_temp
             
             # Memory bank metrics (if enabled)

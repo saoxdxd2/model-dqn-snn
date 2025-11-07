@@ -2,10 +2,12 @@ from typing import Tuple, List, Dict, Optional, Any
 from dataclasses import dataclass
 import math
 import torch
-import copy
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
-from torch.utils.checkpoint import checkpoint
+from typing import Optional, Dict, Any
+import math
+from utils.annealing import compute_q_temperature
+import torch.utils.checkpoint as checkpoint
 from functools import partial
 from pydantic import BaseModel, field_validator
 import random
@@ -13,7 +15,7 @@ from models.common import trunc_normal_init_
 from models.layers import rms_norm, LinearSwish, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
 from models.sparse_embedding import CastedSparseEmbedding
 from models.common import *
-from models.dqn_utils import compute_epsilon, compute_q_temperature, select_action_epsilon_greedy, select_action_epsilon_greedy_3way
+from models.dqn_utils import compute_epsilon, select_action_epsilon_greedy, select_action_epsilon_greedy_3way
 from models.q_heads import create_q_head
 from models.memory_bank import AssociativeMemoryBank
 
@@ -661,7 +663,14 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 
                 # Apply temperature annealing if enabled
                 if self.training and getattr(self.config, 'enable_q_temperature_annealing', False):
-                    temperature = compute_q_temperature(getattr(self, 'training_step', 0), self.config)
+                    total_steps = getattr(self.config, 'total_steps', 100000)
+                    # CRITICAL: Use global_step from config (set in forward), not local training_step
+                    current_step = getattr(self.config, 'global_step', 0)
+                    temperature = compute_q_temperature(
+                        current_step=current_step,
+                        total_steps=total_steps,
+                        config=self.config
+                    )
                     q_stacked = q_stacked / temperature
                 
                 q_actions_temp = torch.argmax(q_stacked, dim=-1)  # [B] - 0/1/2
@@ -779,7 +788,10 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             puzzle_ids=torch.zeros((batch_size, ), dtype=torch.int64, device=device) if hasattr(self.inner, 'q_head') and hasattr(self.inner.q_head, 'reset_hidden') else None
         )
         
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
+    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor], global_step: int = 0) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
+        # CRITICAL: Store global_step for annealing schedules (Q-temperature, expansion penalty)
+        # This synchronizes all annealing with actual training progress, not local counters
+        self.config.global_step = global_step
 
         # Update data, carry (removing halted sequences)
         new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
@@ -841,7 +853,14 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
                 
                 # Apply temperature annealing if enabled
                 if self.training and getattr(self.config, 'enable_q_temperature_annealing', False):
-                    temperature = compute_q_temperature(getattr(self, 'training_step', 0), self.config)
+                    total_steps = getattr(self.config, 'total_steps', 100000)
+                    # CRITICAL: Use global_step from config (set in forward), not local training_step
+                    current_step = getattr(self.config, 'global_step', 0)
+                    temperature = compute_q_temperature(
+                        current_step=current_step,
+                        total_steps=total_steps,
+                        config=self.config
+                    )
                     q_stacked = q_stacked / temperature
                 
                 q_actions = torch.argmax(q_stacked, dim=-1)  # [batch] - 0/1/2

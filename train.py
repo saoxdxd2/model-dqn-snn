@@ -33,21 +33,22 @@ CHECKPOINT_FILE = CHECKPOINT_DIR / "latest.pt"
 MODELS = {
     "vision-unified": {
         "name": "TRM Vision-Unified (All Modalities)",
-        "config": "cfg_multimodal",
-        "dataset_builder": "dataset/build_multimodal_dataset.py",
-        "dataset_args": [
-            "--sources", "kaggle/combined", "tinystories",
-            "--output-dir", "datasets/vision_unified",
-            "--augment"
-        ],
+        "config": "cfg_pretrain",  # Fixed: Use actual config file name
+        "architecture": "multimodal_hesc",  # Architecture to use (overrides default)
+        "dataset_builder": "dataset/streaming_builder.py",  # Fixed: Use streaming builder
+        "dataset_args": {
+            "output_dir": "datasets/vision_unified",
+            "sources": ["kaggle/combined", "tinystories"],
+            "augment": True
+        },
         "description": (
-            "TRM Vision-Unified Pipeline (5M encoder + 5M reasoner):\n"
+            "TRM Vision-Unified Pipeline (163M total, 35M COCONUT):\n"
             "  • ARC puzzles: Spatial reasoning (kaggle/combined)\n"
             "  • TinyStories: Simple fluent text generation\n"
             "  • All → rendered to images → TRM encoder → 12 capsules\n"
-            "  • Architecture: Encoder(2L, H=2, L=3), Reasoner(H=3, L=2)\n"
-            "  • Features: DQN, Memory Bank, MTP\n"
-            "  • 30× smaller than CLIP, 17× faster"
+            "  • Architecture: TRM(2L, H=2, L=3) + COCONUT(4 paths)\n"
+            "  • Features: DQN, Memory Bank, MTP, VQ Codebook\n"
+            "  • Checkpoint: checkpoints/multimodal-hesc"
         )
     }
 }
@@ -174,7 +175,7 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False, 
     """
     dataset_args = model_config['dataset_args']
     
-    # Handle both list and dict formats
+    # Ensure dataset_args is a dict
     if isinstance(dataset_args, list):
         # Convert list format to dict
         args_dict = {}
@@ -191,6 +192,9 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False, 
             else:
                 i += 1
         dataset_args = args_dict
+    elif not isinstance(dataset_args, dict):
+        print(f"\n❌ Error: Invalid dataset_args format: {type(dataset_args)}")
+        return False
     
     output_dir = dataset_args.get('output_dir', 'datasets/default')
     checkpoint_dir = Path(output_dir) / "stream_checkpoints"
@@ -242,37 +246,14 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False, 
         return False
     
     # Build command
-    args = model_config['dataset_args']
+    args = dataset_args  # Already converted to dict above
     cmd = ["python", builder_script]
     
     # Add subcommand if using unified builder
     if 'dataset_command' in model_config:
         cmd.append(model_config['dataset_command'])
     
-    # Convert list to dict, collecting multiple values for same key
-    if isinstance(args, list):
-        args_dict = {}
-        i = 0
-        while i < len(args):
-            if args[i].startswith('--'):
-                key = args[i][2:].replace('-', '_')
-                values = []
-                i += 1
-                # Collect all non-flag values
-                while i < len(args) and not args[i].startswith('--'):
-                    values.append(args[i])
-                    i += 1
-                
-                if values:
-                    # Multiple values = list, single value = string
-                    args_dict[key] = values if len(values) > 1 else values[0]
-                else:
-                    args_dict[key] = True
-            else:
-                i += 1
-        args = args_dict
-    
-    # Build arguments
+    # Build arguments from dict
     for key, value in args.items():
         flag = f"--{key.replace('_', '-')}"
         if isinstance(value, bool):
@@ -281,7 +262,7 @@ def download_and_build_dataset(model_config: dict, force_rebuild: bool = False, 
         elif isinstance(value, list):
             # Multiple values for same flag
             cmd.append(flag)
-            cmd.extend(value)
+            cmd.extend(str(v) for v in value)
         else:
             cmd.extend([flag, str(value)])
     
@@ -342,14 +323,13 @@ def _extract_output_dir_from_args(args_list: list) -> str:
 def train_model(model_config: dict, extra_args: list, checkpoint_path: str = None, epochs_override: int = None):
     """Start training with specified config."""
     config_name = model_config['config']
+    architecture = model_config.get('architecture', 'multimodal_hesc')  # Get architecture override
     
-    # Extract data path from dataset_args (which is a list of CLI arguments)
-    dataset_args = model_config.get('dataset_args', [])
+    # Extract data path from dataset_args
+    dataset_args = model_config.get('dataset_args', {})
     if isinstance(dataset_args, dict):
-        # Legacy dict format support
         data_path = dataset_args.get('output_dir')
     elif isinstance(dataset_args, list):
-        # New list format (command-line args)
         data_path = _extract_output_dir_from_args(dataset_args)
     else:
         data_path = None
@@ -362,6 +342,7 @@ def train_model(model_config: dict, extra_args: list, checkpoint_path: str = Non
     print(f"\n🚀 Starting training: {model_config['name']}")
     print("-" * 70)
     print(f"Config: {config_name}")
+    print(f"Architecture: {architecture}")
     print(f"Data: {data_path}")
     if checkpoint_path:
         print(f"Continue from: {checkpoint_path}")
@@ -371,18 +352,30 @@ def train_model(model_config: dict, extra_args: list, checkpoint_path: str = Non
     print()
     
     # Build training command with Hydra overrides
+    # Hydra syntax: key=value (no spaces around =)
     cmd = [
         "python", "pretrain.py",
         f"--config-name={config_name}",
-        f"data_paths=[{data_path}]"  # Override data path
     ]
     
-    # Add continual learning parameters (use + prefix for Hydra)
+    # Override architecture (use arch.name for nested config)
+    cmd.append(f"arch={architecture}")
+    
+    # Override data paths (proper Hydra list syntax)
+    cmd.append(f"data_paths=[{data_path}]")
+    
+    # Set checkpoint path
+    cmd.append(f"checkpoint_path={CHECKPOINT_DIR}")
+    
+    # Add checkpoint loading (use load_checkpoint, not + prefix)
     if checkpoint_path:
-        cmd.append(f"+load_checkpoint={checkpoint_path}")
+        cmd.append(f"load_checkpoint={checkpoint_path}")
+    
+    # Override epochs if specified
     if epochs_override:
         cmd.append(f"epochs={epochs_override}")
     
+    # Add any extra args from user
     cmd += extra_args
     
     print(f"Command: {' '.join(cmd)}\n")

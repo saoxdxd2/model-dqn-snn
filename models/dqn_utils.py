@@ -1,8 +1,9 @@
 """
-Utilities for DQN training: epsilon scheduling, running statistics, reward normalization, Q-head temperature annealing.
+Utilities for DQN training: epsilon scheduling, running statistics, reward normalization.
 """
 
 import torch
+from utils.annealing import compute_q_temperature  # Import instead of duplicate
 import math
 from torch import Tensor
 from typing import Optional
@@ -108,50 +109,7 @@ def compute_epsilon(
     return epsilon_start + (epsilon_end - epsilon_start) * progress
 
 
-def compute_q_temperature(step: int, config) -> float:
-    """
-    Compute Q-head temperature with annealing schedule.
-    
-    Temperature controls exploration vs exploitation in Q-value selection:
-    - High temperature (1.0+): More exploration (uniform distribution)
-    - Low temperature (0.1): More exploitation (greedy argmax)
-    
-    This enables smooth transition from exploration to exploitation during training,
-    improving convergence and final performance.
-    
-    Args:
-        step: Current training step
-        config: Model config with temperature parameters
-    
-    Returns:
-        Current temperature value (annealed from start to end)
-    """
-    # Get config parameters with defaults
-    temp_start = getattr(config, 'q_temperature_start', 1.0)
-    temp_end = getattr(config, 'q_temperature_end', 0.1)
-    anneal_steps = getattr(config, 'q_temperature_anneal_steps', 100000)
-    schedule = getattr(config, 'q_temperature_schedule', 'exponential')
-    
-    # Return final temperature if past annealing period
-    if step >= anneal_steps:
-        return temp_end
-    
-    # Compute progress [0, 1]
-    progress = step / anneal_steps
-    
-    # Apply annealing schedule
-    if schedule == 'linear':
-        # Linear interpolation
-        return temp_start + (temp_end - temp_start) * progress
-    elif schedule == 'exponential':
-        # Exponential decay (recommended for smooth transition)
-        return temp_start * (temp_end / temp_start) ** progress
-    elif schedule == 'cosine':
-        # Cosine annealing (smooth with slower start/end)
-        return temp_end + 0.5 * (temp_start - temp_end) * (1 + math.cos(math.pi * progress))
-    else:
-        # Default: no annealing
-        return temp_start
+# compute_q_temperature is now imported from utils.annealing
 
 
 def select_action_epsilon_greedy(
