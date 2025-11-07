@@ -114,7 +114,33 @@ class PuzzleDataset(IterableDataset):
         self._iters = 0
 
     def _load_metadata(self, dataset_path) -> PuzzleDatasetMetadata:
-        # Check if streaming format (consolidated_*.pt files)
+        # Check for NEW streaming format (shard_*.pt + shard_index.json)
+        shard_index_path = os.path.join(dataset_path, "shard_index.json")
+        if os.path.exists(shard_index_path):
+            with open(shard_index_path, 'r') as f:
+                shard_info = json.load(f)
+            
+            # Check if train/dataset.json exists for metadata
+            train_metadata_path = os.path.join(dataset_path, self.split, "dataset.json")
+            if os.path.exists(train_metadata_path):
+                with open(train_metadata_path, 'r') as f:
+                    return PuzzleDatasetMetadata(**json.load(f))
+            
+            # Fallback: create metadata from shard info
+            return PuzzleDatasetMetadata(
+                seq_len=512,
+                vocab_size=2048 + 4,
+                pad_id=0,
+                ignore_label_id=-100,
+                blank_identifier_id=0,
+                num_puzzle_identifiers=shard_info['total_samples'],
+                total_groups=shard_info['total_samples'],
+                mean_puzzle_examples=1.0,
+                total_puzzles=shard_info['total_samples'],
+                sets=[self.split]
+            )
+        
+        # Check if OLD streaming format (consolidated_*.pt files)
         stream_dir = os.path.join(dataset_path, "stream_checkpoints")
         if os.path.exists(stream_dir):
             consolidated_files = sorted(Path(stream_dir).glob("consolidated_*.pt"))
@@ -155,7 +181,34 @@ class PuzzleDataset(IterableDataset):
                 else:
                     set_name_ = set_name
                 
-                # Check if streaming format
+                # Check for NEW shard format (shard_*.pt files)
+                shard_index_path = os.path.join(dataset_path, "shard_index.json")
+                if os.path.exists(shard_index_path):
+                    with open(shard_index_path, 'r') as f:
+                        shard_info = json.load(f)
+                    
+                    # Load all shards and extract samples
+                    all_samples = []
+                    for shard_file in shard_info['shard_files']:
+                        shard = torch.load(shard_file, map_location='cpu')
+                        all_samples.extend(shard['samples'])
+                    
+                    # Convert samples to input/label format
+                    # For now, store raw samples - will be processed during training
+                    num_samples = len(all_samples)
+                    
+                    # Create placeholder arrays (actual data loaded on-demand)
+                    # Store samples directly for streaming access
+                    self._data[set_name_] = {
+                        "samples": all_samples,  # Raw DataSample objects
+                        "num_samples": num_samples,
+                        "puzzle_identifiers": np.arange(num_samples, dtype=np.int32),
+                        "puzzle_indices": np.arange(num_samples + 1, dtype=np.int32),
+                        "group_indices": np.arange(num_samples + 1, dtype=np.int32)
+                    }
+                    continue
+                
+                # Check if OLD streaming format
                 stream_dir = os.path.join(dataset_path, "stream_checkpoints")
                 if os.path.exists(stream_dir):
                     consolidated_files = sorted(Path(stream_dir).glob("consolidated_*.pt"))
