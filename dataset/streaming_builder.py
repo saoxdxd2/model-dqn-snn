@@ -463,41 +463,8 @@ class StreamingCacheEncoder:
         self.consolidation_pause.set()
         print(f"▶️  Resuming encoding and caching...\n")
         
-        # Note: Cache clearing is disabled to prevent deadlocks
-        # Manually clear cache if disk space is critical: find datasets/vision_unified/text_cache -name "*.npy" -delete
-    
-    def _clear_cache_for_consolidated_samples(self, start_idx, end_idx):
-        """Clear text cache images for consolidated samples but keep metadata.
-        
-        This deletes the .npy image files to save disk space but preserves metadata
-        so the system knows which samples were already processed and won't re-render them.
-        
-        Args:
-            start_idx: Starting sample index
-            end_idx: Ending sample index
-        """
-        print(f"\n🧹 Clearing cached images for consolidated samples {start_idx:,}-{end_idx:,}...")
-        
-        cache_dir = self.cache.cache_dir
-        
-        if cache_dir.exists():
-            # Delete only .npy image files, keep metadata
-            cache_files = list(cache_dir.rglob('*.npy'))
-            cache_size_gb = sum(f.stat().st_size for f in cache_files) / (1024**3)
-            
-            deleted_count = 0
-            for cache_file in cache_files:
-                try:
-                    cache_file.unlink()  # Delete the image file
-                    deleted_count += 1
-                except Exception:
-                    pass
-            
-            # Keep metadata intact - system knows what was cached
-            # Won't try to re-render, saves time on resume
-            
-            print(f"✅ Deleted {deleted_count:,} cached images ({cache_size_gb:.2f}GB freed)")
-            print(f"   Metadata preserved - won't re-render on resume")
+        # Cache management: Keep all cached images for now
+        # Can manually clear if disk space critical
     
     def _check_resume_state(self):
         """Check for existing progress using unified tracker.

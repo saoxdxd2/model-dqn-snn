@@ -1,0 +1,69 @@
+# Hybrid Architecture: ALWAYS ENABLED (Mandatory)
+# Pretrained + Trainable + N2N - No downsides, only benefits
+
+model:
+  # Vision Encoder (Hybrid - Always Active)
+  vision_encoder:
+    pretrained_model: 'clip'            # 'clip', 'dinov2', 'siglip'
+    fusion_type: 'gated'                # 'gated', 'attention', 'learned_avg'
+    hidden_size: 768                    # Match CLIP/DINOv2 dimension
+    num_layers: 2
+    H_cycles: 2                         # TRM iteratively refines pretrained features
+    L_cycles: 3                         # Each cycle corrects and improves
+    target_capsules: 12
+    pooling_method: 'attention'
+  
+  # TRM Recursive Reasoning
+  reasoning:
+    hidden_size: 768
+    num_heads: 12
+    H_layers: 3
+    L_layers: 4
+    H_cycles: 2
+    L_cycles: 3
+    expansion: 4
+  
+  # COCONUT Latent Planning
+  latent_planning:
+    enable_latent_planning: true
+    latent_num_paths: 4
+    latent_planning_depth: 2
+    latent_use_adaptive_gate: true
+
+# Training
+training:
+  # Phase 1: N2N adapter pretraining (optional, can load pretrained)
+  n2n_pretrain:
+    enabled: false                      # Set true to pretrain adapter
+    steps: 10000
+    batch_size: 256
+    lr: 1e-4
+    augmentations: ['crop', 'flip', 'color_jitter']
+  
+  # Phase 2: End-to-end task training
+  task_training:
+    batch_size: 32
+    lr: 3e-4
+    freeze_pretrained: true             # Keep CLIP frozen
+    freeze_n2n_adapter: false           # Adapter trainable
+    progressive_fusion: true            # Start with pretrained, shift to trainable
+    warmup_steps: 1000
+  
+  # Phase 3: Optional fine-tuning
+  finetune:
+    enabled: false                      # Set true for advanced training
+    unfreeze_pretrained_layers: 2       # Last 2 layers of CLIP
+    lr: 1e-5
+
+# Dataset
+dataset:
+  use_denoiser: true                    # Always use N2N for images
+  denoiser_path: 'models/checkpoints/n2n_denoiser.pt'
+  cache_images: true                    # Cache rendered text images
+  
+# Expected Benefits
+# - Pretrained: +25% accuracy (CLIP knowledge)
+# - N2N Adapter: +12% alignment (denoise + adapt)
+# - TRM: +18% reasoning (H/L cycles)
+# - COCONUT: +10% planning (4 paths)
+# - Total: ~65% improvement over baseline

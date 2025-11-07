@@ -65,13 +65,10 @@ class MultimodalDatasetConfig(BaseModel):
     
     # Processing
     use_capsules: bool = True
-    augment: bool = True
     train_split: float = 0.9
     seed: int = 42
     
-    # Quality scoring (from build_arc_dataset.py)
-    enable_quality_scoring: bool = False
-    difficulty_threshold: float = 0.3
+    # Quality scoring removed - adds overhead without implemented benefit
     
     # HESC capsule config
     hidden_size: int = 768
@@ -770,150 +767,28 @@ def build(config: MultimodalDatasetConfig):
     import json
     os.makedirs(config.output_dir, exist_ok=True)
     
-    # Get samples
+    # Get raw samples (no pre-encoding - TRM will encode during training)
     train_samples = dataset['train']
-    test_samples = dataset['test']
     
-    # Vision-unified pipeline: text → images → capsules
-    print("\n🎨 Encoding to capsules (vision-unified mode)...")
+    # Save raw samples instead of capsules (avoid double encoding)
+    print("💾 Saving raw samples...")
+    torch.save({
+        'samples': train_samples,
+        'num_samples': len(train_samples)
+    }, os.path.join(config.output_dir, 'raw_samples.pt'))
     
-    # Initialize capsule encoder
-    from models.capsule_encoder import CapsuleEncoder
-    encoder = CapsuleEncoder(
-        hidden_size=config.hidden_size,
-        target_capsules=config.target_capsules,
-        children_per_capsule=config.children_per_capsule,
-        num_layers=2,
-        H_cycles=2,
-        L_cycles=3,
-    )
-    encoder.eval()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    encoder = encoder.to(device)
+    # Save metadata
+    with open(info_path, 'w') as f:
+        json.dump({
+            'num_samples': len(train_samples),
+            'format': 'raw_samples',
+            'note': 'Images cached, TRM encodes during training'
+        }, f, indent=2)
     
-    def encode_to_capsules(samples, batch_size=128):  # Increased from 16 to 128
-        """Encode samples to capsule format (optimized)."""
-        import time
-        from tqdm import tqdm
-        
-        all_sketches = []
-        all_checksums = []
-        all_children = []
-        
-        num_batches = (len(samples) + batch_size - 1) // batch_size
-        start_time = time.time()
-        
-        # Process in batches with progress bar
-        for i in tqdm(range(0, len(samples), batch_size), total=num_batches, desc="   Encoding"):
-            batch_samples = samples[i:i+batch_size]
-            
-            # Prepare batch - render text to images if needed
-            batch_images = []
-            batch_texts = []
-            
-            for sample in batch_samples:
-                if sample.image is not None:
-                    batch_images.append(sample.image)
-                elif sample.text:
-                    # Truncate text to reasonable length for speed
-                    text = sample.text[:500] if len(sample.text) > 500 else sample.text
-                    batch_texts.append(text)
-            
-            # Encode batch
-            with torch.no_grad():
-                # Define image transform once (no duplicate)
-                from torchvision import transforms
-                transform = transforms.Compose([
-                    transforms.Resize((224, 224)),
-                    transforms.ToTensor(),
-                    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-                ])
-                
-                if batch_images:
-                    # Convert PIL images to tensors
-                    image_tensors = torch.stack([transform(img) for img in batch_images]).to(device)
-                    result = encoder(images=image_tensors, return_children=True)
-                elif batch_texts:
-                    # Render text to images, then encode with TRM
-                    from models.text_renderer import TextRenderer
-                    renderer = TextRenderer(width=224, height=224, font_size=12)
-                    
-                    # Render texts to images
-                    text_images = [renderer.render_plain_text(text[:500]) for text in batch_texts]
-                    
-                    # Convert PIL images to tensors (same transform)
-                    image_tensors = torch.stack([transform(img) for img in text_images]).to(device)
-                    
-                    # Encode through TRM
-                    result = encoder(images=image_tensors, return_children=True)
-                else:
-                    continue
-                
-                all_sketches.append(result['sketches'].cpu())
-                all_checksums.append(result['checksums'].cpu())
-                if result.get('children') is not None:
-                    all_children.append(result['children'].cpu())
-        
-        # Concatenate all batches
-        elapsed = time.time() - start_time
-        sketches = torch.cat(all_sketches, dim=0) if all_sketches else torch.zeros(1, config.target_capsules, config.hidden_size)
-        checksums = torch.cat(all_checksums, dim=0) if all_checksums else torch.zeros(1, config.target_capsules, 32)
-        children = torch.cat(all_children, dim=0) if all_children else None
-        
-        # Print timing info
-        samples_per_sec = len(samples) / elapsed if elapsed > 0 else 0
-        print(f"   ⏱️  Encoded {len(samples)} samples in {elapsed:.1f}s ({samples_per_sec:.1f} samples/sec)")
-        
-        return {
-            'sketches': sketches,
-            'checksums': checksums,
-            'children': children
-        }
-    
-    print("   Encoding train samples...")
-    train_capsules = encode_to_capsules(train_samples)
-    print(f"   ✓ Train: {train_capsules['sketches'].shape[0]} samples → {config.target_capsules} capsules")
-    
-    print("   Encoding test samples...")
-    test_capsules = encode_to_capsules(test_samples)
-    print(f"   ✓ Test: {test_capsules['sketches'].shape[0]} samples → {config.target_capsules} capsules")
-    
-    # Save as capsule_dataset.pt (semantic mode format)
-    print("\n💾 Saving capsule datasets...")
-    train_path = os.path.join(config.output_dir, 'capsule_dataset.pt')
-    test_path = os.path.join(config.output_dir, 'capsule_dataset_test.pt')
-    
-    torch.save(train_capsules, train_path)
-    torch.save(test_capsules, test_path)
-    
-    print(f"   ✓ {train_path}")
-    print(f"   ✓ {test_path}")
-    
-    # Also save metadata for compatibility
-    metadata = {
-        'num_samples': train_capsules['sketches'].shape[0],
-        'num_capsules': config.target_capsules,
-        'hidden_size': config.hidden_size,
-        'has_children': train_capsules['children'] is not None
-    }
-    
-    with open(os.path.join(config.output_dir, 'dataset_info.json'), 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
-    # Print summary
-    train_count = train_capsules['sketches'].shape[0]
-    test_count = test_capsules['sketches'].shape[0]
-    
-    print(f"\n✅ Complete: {train_count} train, {test_count} test samples")
-    print(f"   Format: {config.target_capsules} capsules per sample")
-    print(f"   Output: {config.output_dir}")
-    print(f"\n💡 Training will use semantic_mode=true with capsule datasets")
-    
-    if train_count == 0:
-        print(f"\n⚠️  WARNING: No samples were loaded from sources:")
-        for src in config.source_paths:
-            print(f"   - {src}")
-        print(f"   Please check that the data files exist and are accessible.")
+    print(f"✅ Dataset ready: {len(train_samples)} samples")
+    print(f"   Images cached: ImageCache handles rendering + denoising")
+    print(f"   TRM encoding: During training (on-the-fly)")
+
 
 def _post_process(config: MultimodalDatasetConfig, dataset: Dict):
     """Unified post-processing: concept tables, quality scoring."""
@@ -944,15 +819,7 @@ def _post_process(config: MultimodalDatasetConfig, dataset: Dict):
         except Exception as e:
             print(f"   ⚠️  {e}")
     
-    # Quality scoring (for reasoning tasks)
-    if config.enable_quality_scoring:
-        print(f"\n🎯 Quality scoring...")
-        try:
-            from difficulty_scorer import score_difficulty
-            # TODO: Apply scoring
-            print(f"   ✓ Complete")
-        except Exception as e:
-            print(f"   ⚠️  {e}")
+    # Quality scoring removed - not implemented and adds overhead
 
 
 # ===== Vision-Unified Pipeline Only =====
@@ -961,33 +828,10 @@ def _post_process(config: MultimodalDatasetConfig, dataset: Dict):
 # Images → TRM encoder → capsules
 # Grids → rendered to images → TRM encoder → capsules
 
-@cli.command()
-def build_composite(
-    sources: List[str], 
-    output_dir: str = "datasets/composite",
-    augment: bool = True,
-    num_concepts: int = 2048,
-    target_capsules: int = 12,
-    enable_quality_scoring: bool = True
-):
-    """Build composite multimodal dataset from multiple sources."""
-    config = MultimodalDatasetConfig(
-        source_paths=sources,
-        output_dir=output_dir,
-        include_text=True,
-        include_images=True,
-        include_grids=True,
-        # Encode to capsules (DISABLED - too slow and memory intensive during dataset building)
-        # This should happen on-the-fly during training instead
-        # if config.use_capsules:
-        #     print("🧶 Encoding to HESC capsules...")
-        #     dataset = encode_to_capsules(dataset, config)
-        use_capsules=False,
-        num_concepts=num_concepts,
-        target_capsules=target_capsules,
-        enable_quality_scoring=enable_quality_scoring
-    )
-    build(config)
+# Main entry point: use build(config) directly in your scripts
+# Example:
+#   config = MultimodalDatasetConfig(source_paths=['data/'], output_dir='datasets/out')
+#   build(config)
 
 
 if __name__ == "__main__":

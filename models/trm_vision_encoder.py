@@ -115,6 +115,8 @@ class TRMVisionEncoder(nn.Module):
         dropout: float = 0.0,
         pooling_method: str = "attention",  # "avg" | "attention"
         real_children: bool = True,
+        pretrained_model: str = 'clip',  # Which pretrained model (clip/dinov2/siglip)
+        fusion_type: str = 'gated',  # Fusion strategy (gated/attention/learned_avg)
     ):
         super().__init__()
         
@@ -129,19 +131,18 @@ class TRMVisionEncoder(nn.Module):
         self.pooling_method = pooling_method
         self.real_children = real_children
         
-        # Patch embedding: [B, 3, H, W] -> [B, num_patches, hidden_size]
-        self.patch_embed = nn.Conv2d(
-            3, hidden_size,
-            kernel_size=patch_size,
-            stride=patch_size
+        # ALWAYS use hybrid encoder (pretrained + trainable + fusion + N2N)
+        # Benefits: Generalization + Specialization + No downsides
+        from models.hybrid_vision_encoder import HybridVisionEncoder
+        self.hybrid_encoder = HybridVisionEncoder(
+            pretrained_model=pretrained_model,
+            hidden_size=hidden_size,
+            use_n2n_adapter=True,
+            fusion_type=fusion_type,
+            freeze_pretrained=True
         )
-        
-        # Positional embeddings (Learned 2D - ViT/CLIP standard)
-        # RoPE is for 1D sequences (text), not suitable for 2D vision patches
-        self.pos_embed = LearnedPositionalEmbedding2D(
-            num_patches=self.num_patches,
-            embedding_dim=hidden_size
-        )
+        print(f"   Hybrid encoder initialized (pretrained + trainable)")
+        print(f"   TRM recursive cycles will refine pretrained features iteratively")
         
         # Create TRM config for encoder
         encoder_config = TinyRecursiveReasoningModel_ACTV1Config(
@@ -205,17 +206,11 @@ class TRMVisionEncoder(nn.Module):
             capsules: [B, 12, 512]
         """
         B = images.shape[0]
-        device = images.device
         
-        # Patch embedding: [B, 3, 224, 224] -> [B, 512, 14, 14]
-        patch_embeddings = self.patch_embed(images)
-        
-        # Flatten to sequence: [B, 512, 14, 14] -> [B, 196, 512]
-        H_patches = W_patches = self.image_size // self.patch_size
-        tokens = patch_embeddings.flatten(2).transpose(1, 2)
-        
-        # Add learned 2D positional embeddings (ViT/CLIP standard)
-        tokens = self.pos_embed(tokens)  # [B, 196, 512]
+        # Get initial features from hybrid encoder
+        # Hybrid: CLIP (frozen) + Custom ViT (trainable) → Fusion → N2N Adapter
+        tokens = self.hybrid_encoder(images)  # [B, 196, 768]
+        # Note: Positional info already embedded by pretrained models
         
         # TRM Recursive Reasoning (H_cycles × L_cycles)
         # No cos_sin needed - using learned positional embeddings
@@ -229,9 +224,10 @@ class TRMVisionEncoder(nn.Module):
                     )
         
         # Apply layer normalization before pooling (ViT/CLIP standard)
-        tokens = self.pre_pool_norm(tokens)  # [B, 196, 512]
+        tokens = self.pre_pool_norm(tokens)  # [B, 196, 768]
         
-        # Reshape to spatial grid: [B, 196, 512] -> [B, 512, 14, 14]
+        # Reshape to spatial grid: [B, 196, 768] -> [B, 768, 14, 14]
+        H_patches = W_patches = self.image_size // self.patch_size  # 14x14 for 224/16
         tokens_spatial = tokens.transpose(1, 2).view(
             B, self.hidden_size, H_patches, W_patches
         )

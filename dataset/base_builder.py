@@ -95,80 +95,22 @@ class BaseDatasetBuilder(ABC):
         raw_samples = self.load_raw_data()
         print(f"   Loaded {len(raw_samples)} samples")
         
-        # Preprocess with joblib (C++ backend, 2x faster than multiprocessing)
-        print("⚙️  Preprocessing...")
-        import os
+        # Preprocessing handled by ImageCache during streaming
+        # No need for sequential bottleneck here - just pass through
+        print("⚙️  Preparing samples...")
+        processed = raw_samples  # ImageCache will handle rendering in parallel
         
-        # Note: Parallel processing disabled for text rendering (PIL font pickling issues)
-        # Process sequentially with progress indicator
-        from tqdm import tqdm
-        processed = [self.preprocess_sample(s) for s in tqdm(raw_samples, desc="   Processing", ncols=70)]
-        
-        del raw_samples  # Free original
-        
-        # Augment with streaming to prevent RAM explosion
-        print("🔄 Augmenting...")
-        if getattr(self.config, 'augment', False):
-            # OPTIMIZATION: Skip augmentation for text-only datasets
-            # Check first sample to determine dataset type
-            has_visual_data = False
-            if len(processed) > 0:
-                first_sample = processed[0]
-                has_visual_data = (first_sample.image is not None or first_sample.grid is not None)
-            
-            if not has_visual_data:
-                print("   Skipping augmentation (text-only dataset)")
-                augmented = processed
-            else:
-                augmented = []
-                batch_size = 5000  # Process in batches to free memory
-                
-                from tqdm import tqdm
-                for i in tqdm(range(0, len(processed), batch_size), desc="   Augmenting", ncols=70):
-                    batch = processed[i:i+batch_size]
-                    for sample in batch:
-                        augmented.extend(self.augment_sample(sample))
-                    
-                    # Free processed batch immediately
-                    del batch
-                    
-                    # Periodic cleanup
-                    if i % 10000 == 0 and i > 0:
-                        import gc
-                        gc.collect()
-            
-            del processed  # Free original
-        else:
-            augmented = processed
-        print(f"   Augmented to {len(augmented)} samples")
-        
-        # Split (keep both splits in RAM)
-        train_split = getattr(self.config, 'train_split', 0.9)
-        split_idx = int(len(augmented) * train_split)
-        train_data = augmented[:split_idx]
-        test_data = augmented[split_idx:]
-        del augmented  # Free original list
-        print(f"   Train: {len(train_data)}, Test: {len(test_data)}")
-        
-        # Encode to capsules (vision-unified pipeline - always uses TRM encoder)
-        print("🧶 Encoding to HESC capsules (TRM vision encoder)...")
-        import gc
-        
-        # Train encoding (batch processing with DataLoader)
-        print(f"   Encoding {len(train_data)} train samples...")
-        train_encoded = self._stream_encode_capsules(train_data)
-        del train_data  # Free after encoding
-        
-        # Test encoding (batch processing with DataLoader)
-        print(f"   Encoding {len(test_data)} test samples...")
-        test_encoded = self._stream_encode_capsules(test_data)
-        del test_data  # Free after encoding
+        # No augmentation, splitting, or pre-encoding - just return samples
+        # TRM will encode images to capsules during training (on-the-fly)
+        # Pre-encoding is pure overhead - we encode twice otherwise!
+        print(f"   Ready: {len(processed)} samples (images cached)")
         
         result = {
-            'train': train_encoded,
-            'test': test_encoded,
-            'metadata': self.create_metadata(train_encoded)
+            'train': processed,
+            'test': []  # No separate test set for pretraining
         }
+        
+        result['metadata'] = {'num_samples': len(processed)}
         
         return result
     
