@@ -1713,7 +1713,7 @@ def launch(hydra_config: DictConfig):
             ############ Train Iter
             if RANK == 0:
                 print("TRAIN")
-            train_state.model.train()
+            train_state.original_model.train()  # Use unwrapped model for .train()
             for set_name, batch, global_batch_size in train_loader:
                 metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE, gradient_monitor=gradient_monitor)
                 
@@ -1738,7 +1738,7 @@ def launch(hydra_config: DictConfig):
                     train_state_eval.model = ema_helper.ema_copy(train_state_eval.model)
                 else:
                     train_state_eval = train_state
-                train_state_eval.model.eval()
+                train_state_eval.original_model.eval()  # Use unwrapped model for .eval()
                 metrics = evaluate(config, 
                     train_state_eval, 
                     eval_loader, 
