@@ -2,11 +2,12 @@
 # Architecture: CLIP + Custom ViT + N2N + TRM + COCONUT
 # Optimizations: fp16 + torch.compile + batch=192
 
+defaults:
+  - multimodal_hesc  # Import base architecture
+  - _self_
+
 hydra:
   output_subdir: null
-
-# Architecture name (for model loading)
-arch: hybrid_pretrained
 
 # Data paths
 data_paths: ['datasets/vision_unified']
