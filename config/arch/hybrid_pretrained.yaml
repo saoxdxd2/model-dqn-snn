@@ -2,12 +2,47 @@
 # Architecture: CLIP + Custom ViT + N2N + TRM + COCONUT
 # Optimizations: fp16 + torch.compile + batch=192
 
-defaults:
-  - multimodal_hesc  # Import base architecture
-  - _self_
-
 hydra:
   output_subdir: null
+
+# Architecture (from multimodal_hesc)
+name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+loss:
+  name: losses@ACTLossHead
+  loss_type: stablemax_cross_entropy
+
+# TRM Recursion
+H_cycles: 5
+L_cycles: 5
+halt_exploration_prob: 0.1
+halt_max_steps: 64
+
+# Model Architecture
+H_layers: 0
+L_layers: 4
+hidden_size: 1024
+num_heads: 16
+num_key_value_heads: 16
+expansion: 4
+
+# Vision Encoder
+encoder_num_layers: 4
+encoder_H_cycles: 4
+encoder_L_cycles: 5
+
+puzzle_emb_ndim: ${.hidden_size}
+puzzle_emb_len: 16
+pos_encodings: rope
+forward_dtype: float16
+rope_theta: 10000
+mlp_t: false
+no_ACT_continue: true
+
+# Deep Supervision
+deep_supervision_steps: 3
+enable_gradient_checkpointing: true
+use_ema: true
+ema_decay: 0.999
 
 # Data paths
 data_paths: ['datasets/vision_unified']
@@ -46,17 +81,72 @@ ema: true               # Enable for smoother training
 ema_rate: 0.999
 freeze_weights: false
 
-# TRM Features
+# DQN
 enable_dqn: true
-enable_entropy_regularization: true
-entropy_regularization_weight: 0.01
+dqn_buffer_capacity: 500000
+dqn_buffer_min_size: 1000
+dqn_batch_size: 128
+dqn_gamma: 0.99
+dqn_epsilon_start: 0.3
+dqn_epsilon_end: 0.05
+dqn_epsilon_decay_steps: 200000
+dqn_warmstart_steps: 10000
+
+# Reward Shaping
+reward_step_penalty: 0.01
+reward_terminal_correct: 1.0
+reward_terminal_incorrect: -0.5
+
+# Q-Head
+q_head_type: mlp
+q_head_hidden_size: 128
+q_head_num_layers: 1
+q_head_num_actions: 3
+
+# COCONUT Latent Planning
+enable_latent_planning: true
+latent_num_paths: 4
+latent_planning_depth: 2
+latent_use_adaptive_gate: true
+
+# Memory Bank
 enable_memory: true
+memory_capacity: 16384
+memory_num_heads: 16
+memory_dropout: 0.1
+memory_reward_bonus: 0.5
+memory_reward_threshold: 0.05
+
+# Curiosity
+enable_count_curiosity: true
+enable_rnd_curiosity: true
+curiosity_count_beta: 0.05
+curiosity_rnd_weight: 0.1
+
+# Other TRM Features
+enable_entropy_regularization: false
+entropy_regularization_weight: 0.01
+enable_prioritized_replay: false
+per_alpha: 0.6
+per_beta: 0.4
 enable_mtp: true
+mtp_num_depths: 3
+mtp_loss_weight: 0.5
+mtp_share_embeddings: true
+mtp_share_output_head: true
 enable_adaptive_hcycles: true
 hcycle_confidence_threshold: 2.0
 enable_hierarchical_attention: true
-q_head_num_actions: 3
-q_head_type: "mlp"
+enable_capsule_expansion: false
+
+# HESC
+reconstruction_weight: 0.5
+checksum_halt_threshold: 0.5
+
+# Optimization
+cpu_optimized: false
+use_gelu: true
+ffn_expansion_ratio: 4.0
 
 # DQN Stability (SAFER)
 dqn_warmup_ratio: 0.2   # Increased from 0.1 (need more time for TRM+COCONUT stabilization)
