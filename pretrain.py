@@ -1149,8 +1149,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         
         # Create batch dict in expected format
         batch = {
-            'images': input_batch,  # Vision-unified mode uses 'images' key
-            'target_images': output_batch,
+            'inputs': input_batch,  # Model expects 'inputs' key
+            'targets': output_batch,
             'puzzle_identifiers': batch['puzzle_identifiers'].cuda(),
             'labels': torch.zeros(batch_size, dtype=torch.long).cuda()  # Placeholder
         }
