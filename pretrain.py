@@ -195,7 +195,8 @@ def per_layer_gradient_normalization(model: nn.Module, config) -> dict:
 
 @dataclass
 class TrainState:
-    model: nn.Module
+    model: nn.Module  # May be torch.compile wrapped
+    original_model: nn.Module  # Unwrapped model for .parameters() and EMA
     optimizers: Sequence[torch.optim.Optimizer]
     optimizer_lrs: Sequence[float]
     carry: Any
@@ -704,7 +705,11 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     # Model (pass total_steps for annealing)
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size, total_steps=total_steps)
     
+    # Store original model reference for parameter access and EMA
+    original_model = model
+    
     # torch.compile for 25% speedup (T4 compatible)
+    # NOTE: Compiled model is used for forward pass, original for .parameters() and EMA
     if getattr(config, 'use_torch_compile', True) and hasattr(torch, 'compile'):
         if rank == 0:
             print(f"   🚀 Compiling model with torch.compile (25% speedup)...")
@@ -715,6 +720,7 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         total_steps=total_steps,
 
         model=model,
+        original_model=original_model,  # Store for EMA and parameter counting
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
         carry=None
@@ -859,7 +865,7 @@ def save_train_state(config: PretrainConfig, train_state: TrainState, progress_t
     
     checkpoint = {
         'step': train_state.step,
-        'model_state_dict': train_state.model.state_dict(),
+        'model_state_dict': train_state.original_model.state_dict(),  # Use unwrapped model
         'optimizer_states': [opt.state_dict() for opt in train_state.optimizers],
         'carry': train_state.carry,  # Save RNN/memory states
         
@@ -1036,7 +1042,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 print(f"  Warmup ratio: {config.dqn_warmup_ratio*100:.1f}% of training")
                 print(f"{'='*70}\n")
             
-            for name, param in train_state.model.named_parameters():
+            for name, param in train_state.original_model.named_parameters():
                 if 'h_blocks' in name or 'l_blocks' in name or 'h_level' in name or 'l_level' in name:
                     param.requires_grad = False
             
@@ -1050,7 +1056,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 print(f"  Full model training enabled")
                 print(f"{'='*70}\n")
             
-            for param in train_state.model.parameters():
+            for param in train_state.original_model.parameters():
                 param.requires_grad = True
             
             train_state.representation_frozen = False
@@ -1191,7 +1197,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     # Allreduce
     if world_size > 1:
-        for param in train_state.model.parameters():
+        for param in train_state.original_model.parameters():
             if param.grad is not None:
                 dist.all_reduce(param.grad)
     
@@ -1207,11 +1213,11 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     # Gradient normalization: per-layer or global
     if getattr(config, 'enable_per_layer_grad_norm', False):
         # Per-layer gradient normalization (more fine-grained control)
-        grad_norms_dict = per_layer_gradient_normalization(train_state.model, config)
+        grad_norms_dict = per_layer_gradient_normalization(train_state.original_model, config)
         grad_norm = sum(grad_norms_dict.values()) / len(grad_norms_dict) if grad_norms_dict else 0.0
     else:
         # Global gradient clipping (default)
-        grad_norm = torch.nn.utils.clip_grad_norm_(train_state.model.parameters(), max_norm=1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(train_state.original_model.parameters(), max_norm=1.0)
             
     # Apply optimizer with mixed precision support
     lr_this_step = None    
@@ -1651,23 +1657,10 @@ def launch(hydra_config: DictConfig):
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
         
-        # Handle torch.compile wrapped models - unwrap to get actual nn.Module
-        # Try different access patterns to handle nested wrappers
-        model_for_params = train_state.model
-        
-        # Unwrap compiled model
-        if hasattr(model_for_params, '_orig_mod'):
-            model_for_params = model_for_params._orig_mod
-        
-        # Try to call .parameters() and count
-        try:
-            num_params = sum(x.numel() for x in model_for_params.parameters())
-            wandb.log({"num_params": num_params}, step=0)
-            print(f"   Total parameters: {num_params:,}")
-        except (AttributeError, TypeError) as e:
-            print(f"   ⚠️ Could not count parameters: {e}")
-            print(f"   Model type: {type(model_for_params)}")
-            wandb.log({"num_params": 0}, step=0)
+        # Count parameters from original model (before torch.compile)
+        num_params = sum(x.numel() for x in train_state.original_model.parameters())
+        wandb.log({"num_params": num_params}, step=0)
+        print(f"   Total parameters: {num_params:,}")
         save_code_and_config(config)
         
         # Initialize gradient flow monitor
@@ -1677,7 +1670,7 @@ def launch(hydra_config: DictConfig):
     if config.ema:
         print('Setup EMA')
         ema_helper = EMAHelper(mu=config.ema_rate)
-        ema_helper.register(train_state.model)
+        ema_helper.register(train_state.original_model)  # Use unwrapped model for EMA
 
     # Training Loop
     # Calculate starting iteration from restored step (for auto-resume)
