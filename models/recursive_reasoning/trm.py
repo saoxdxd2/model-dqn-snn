@@ -453,7 +453,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
             # Vision-unified mode: handle raw images or pre-encoded capsules
             if input.dim() == 4:  # Raw images [B, C, H, W]
                 # Encode raw images to capsules
-                embedding = self.capsule_encoder(input)  # [B, k, D]
+                result = self.capsule_encoder(images=input)  # Returns dict with 'sketches'
+                embedding = result['sketches']  # [B, k, D]
             elif input.dim() == 3 and input.shape[-1] != self.config.hidden_size:
                 # Pre-encoded capsules need projection: [batch, num_capsules, encoder_hidden] → [batch, num_capsules, model_hidden]
                 # Convert to float if needed (consolidated chunks may be int32)
