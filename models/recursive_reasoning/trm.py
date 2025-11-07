@@ -722,21 +722,48 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         # Multi-Token Prediction (if enabled)
         mtp_logits = None
         if self.mtp_modules is not None and self.training:
-            seq_info_mtp = dict(cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None)
+            # Detect vision mode: vision inputs are already processed into h_prev (z_H)
+            is_vision_mode = skip_rope  # Reuse the vision detection logic from main forward
+            
+            if is_vision_mode:
+                # Vision-unified: use continuous hidden states, no discrete tokens
+                seq_info_mtp = dict(cos_sin=None)  # No RoPE for vision
+            else:
+                # Text mode: use RoPE for 1D sequence
+                seq_info_mtp = dict(cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None)
+            
             mtp_logits = []
             h_prev = z_H[:, self.puzzle_emb_len:]  # Remove puzzle embeddings
             
             for depth, mtp_module in enumerate(self.mtp_modules):
-                # Get next token IDs (shifted by depth+1)
-                if depth + 1 < batch["inputs"].size(1):
-                    next_tokens = batch["inputs"][:, depth+1:]
-                    # Pad to match sequence length
-                    if next_tokens.size(1) < batch["inputs"].size(1):
-                        next_tokens = F.pad(next_tokens, (0, batch["inputs"].size(1) - next_tokens.size(1)))
+                if is_vision_mode:
+                    # Vision mode: h_prev is already the sequence, use it as "future" context
+                    # Shift hidden states to simulate predicting next steps
+                    if depth + 1 < h_prev.size(1):
+                        next_hidden = h_prev[:, depth+1:, :]
+                        # Pad to original length
+                        if next_hidden.size(1) < h_prev.size(1):
+                            padding = torch.zeros(h_prev.size(0), h_prev.size(1) - next_hidden.size(1), 
+                                                h_prev.size(2), device=h_prev.device, dtype=h_prev.dtype)
+                            next_hidden = torch.cat([next_hidden, padding], dim=1)
+                    else:
+                        next_hidden = torch.zeros_like(h_prev)
+                    
+                    # MTP forward expects (h_prev, next_tokens) but for vision we pass hidden states
+                    # The module will detect ndim > 3 and use them as continuous representations
+                    h_current, logits = mtp_module(h_prev, next_hidden, **seq_info_mtp)
                 else:
-                    next_tokens = torch.zeros_like(batch["inputs"])
+                    # Text mode: use discrete token IDs from batch["inputs"]
+                    if depth + 1 < batch["inputs"].size(1):
+                        next_tokens = batch["inputs"][:, depth+1:]
+                        # Pad to match sequence length
+                        if next_tokens.size(1) < batch["inputs"].size(1):
+                            next_tokens = F.pad(next_tokens, (0, batch["inputs"].size(1) - next_tokens.size(1)))
+                    else:
+                        next_tokens = torch.zeros_like(batch["inputs"])
+                    
+                    h_current, logits = mtp_module(h_prev, next_tokens, **seq_info_mtp)
                 
-                h_current, logits = mtp_module(h_prev, next_tokens, **seq_info_mtp)
                 mtp_logits.append(logits)
                 h_prev = h_current
         

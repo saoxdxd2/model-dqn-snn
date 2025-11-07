@@ -119,11 +119,25 @@ data_paths_test: []
 evaluators:
   - name: arc@ARC
 
-# Training hyperparameters (T4 GPU optimized)
-global_batch_size: 48  # Reduced from 192 to avoid OOM (398M params + CLIP + ViT + COCONUT)
-epochs: 50
+# Training hyperparameters (Winner Strategy - Streaming + Large Batch)
+global_batch_size: 128  # Increased from 48 (winner used 128-256)
+gradient_accumulation_steps: 4  # Effective batch = 128*4 = 512
+epochs: 0  # Infinite streaming (no epoch limit)
 eval_interval: 5
 checkpoint_every_eval: true
+
+# Task-Based Training (ALWAYS ENABLED - Single Unified Pipeline)
+# Model thinks until task completion (ACT/PonderNet approach)
+max_thinking_steps: 10              # Max thinking cycles per sample
+task_completion_threshold: 0.95     # Halt confidence (stops early when confident)
+# Adaptive computation: Hard samples use 10 steps, easy samples 2-3 steps
+# Metrics: thinking_steps (avg per batch), task_completed (% early stops)
+
+# Test-Time Training (TTT - Winner Strategy)
+enable_test_time_training: false  # Enable during evaluation
+ttt_steps: 300  # Fine-tune steps per test problem
+ttt_batch_size: 1  # Fastest adaptation
+ttt_learning_rate: 8e-5  # Higher than pretraining for fast learning
 
 # Learning rates (CORRECTED for stability)
 lr: 1e-4                # Reduced from 3e-4 (only 82M trainable params, CLIP frozen)

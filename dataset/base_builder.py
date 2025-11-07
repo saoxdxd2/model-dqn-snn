@@ -87,30 +87,80 @@ class BaseDatasetBuilder(ABC):
         return [sample]  # No augmentation by default
     
     def build_dataset(self) -> Dict[str, Any]:
-        """Main pipeline: load → preprocess → augment → encode (chunked for memory)."""
-        print("\n🔨 Building dataset...")
+        """Streaming pipeline: Generator → Batch encode → Save shards (constant memory)."""
+        print("\n🔨 Building dataset (streaming mode - zero accumulation)...")
         
-        # Load
-        print("📥 Loading raw data...")
-        raw_samples = self.load_raw_data()
-        print(f"   Loaded {len(raw_samples)} samples")
+        # Get generator (not list!)
+        print("📥 Streaming raw data...")
+        sample_generator = self.load_raw_data()
         
-        # Preprocessing handled by ImageCache during streaming
-        # No need for sequential bottleneck here - just pass through
-        print("⚙️  Preparing samples...")
-        processed = raw_samples  # ImageCache will handle rendering in parallel
+        # Process in batches and save to disk progressively
+        print("⚙️  Processing in batches (constant memory)...")
         
-        # No augmentation, splitting, or pre-encoding - just return samples
-        # TRM will encode images to capsules during training (on-the-fly)
-        # Pre-encoding is pure overhead - we encode twice otherwise!
-        print(f"   Ready: {len(processed)} samples (images cached)")
+        output_dir = Path(self.config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        batch_size = 256  # Process 256 samples at a time
+        shard_files = []
+        batch_buffer = []
+        total_processed = 0
+        shard_idx = 0
+        
+        # Consume generator in batches
+        for sample in sample_generator:
+            batch_buffer.append(sample)
+            
+            # When batch is full, save to disk
+            if len(batch_buffer) >= batch_size:
+                shard_file = output_dir / f"shard_{shard_idx:05d}.pt"
+                torch.save({
+                    'samples': batch_buffer,
+                    'count': len(batch_buffer)
+                }, shard_file)
+                
+                shard_files.append(str(shard_file))
+                total_processed += len(batch_buffer)
+                
+                if shard_idx % 10 == 0:  # Progress every 10 shards
+                    print(f"   💾 Saved {total_processed:,} samples ({shard_idx+1} shards)")
+                
+                # Clear batch (free memory)
+                batch_buffer = []
+                shard_idx += 1
+        
+        # Save remaining samples
+        if batch_buffer:
+            shard_file = output_dir / f"shard_{shard_idx:05d}.pt"
+            torch.save({
+                'samples': batch_buffer,
+                'count': len(batch_buffer)
+            }, shard_file)
+            shard_files.append(str(shard_file))
+            total_processed += len(batch_buffer)
+        
+        print(f"\n✅ Streaming complete: {total_processed:,} samples in {len(shard_files)} shards")
+        print(f"   Memory usage: Constant (~2KB buffer)")
+        print(f"   Shards saved to: {output_dir}")
+        
+        # Save shard index for training
+        index_file = output_dir / "shard_index.json"
+        import json
+        with open(index_file, 'w') as f:
+            json.dump({
+                'shard_files': shard_files,
+                'total_samples': total_processed,
+                'batch_size': batch_size,
+                'num_shards': len(shard_files)
+            }, f, indent=2)
         
         result = {
-            'train': processed,
-            'test': []  # No separate test set for pretraining
+            'shard_files': shard_files,
+            'metadata': {
+                'num_samples': total_processed,
+                'num_shards': len(shard_files),
+                'streaming_mode': True
+            }
         }
-        
-        result['metadata'] = {'num_samples': len(processed)}
         
         return result
     

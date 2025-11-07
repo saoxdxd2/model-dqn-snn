@@ -1219,30 +1219,76 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         with torch.device("cuda"):
             train_state.carry = train_state.original_model.initial_carry(batch)  # type: ignore
 
-    # Mixed precision training (fp16 for 2x speedup on T4)
+    # Task-Based Training (ALWAYS ENABLED - Single Unified Pipeline)
+    # Model thinks for variable steps until task completion (ACT/PonderNet approach)
+    max_thinking_steps = getattr(config, 'max_thinking_steps', 10)
+    task_completion_threshold = getattr(config, 'task_completion_threshold', 0.95)
     use_amp = getattr(config, 'use_mixed_precision', True)
-    if use_amp:
-        if not hasattr(train_state, 'scaler'):
-            from torch.cuda.amp import GradScaler
-            train_state.scaler = GradScaler()
-        
-        # Forward with autocast
-        from torch.cuda.amp import autocast
-        with autocast():
-            train_state.carry, loss, metrics, _, _ = train_state.model(
+    
+    # Think until completion or max steps
+    total_loss = 0.0
+    all_metrics = {}
+    thinking_steps_used = 0
+    task_completed = False
+    
+    for think_step in range(max_thinking_steps):
+        if use_amp:
+            if not hasattr(train_state, 'scaler'):
+                from torch.cuda.amp import GradScaler
+                train_state.scaler = GradScaler()
+            
+            from torch.cuda.amp import autocast
+            with autocast():
+                train_state.carry, step_loss, step_metrics, _, _ = train_state.model(
+                    carry=train_state.carry, 
+                    batch=batch, 
+                    return_keys=[],
+                    global_step=train_state.step
+                )
+        else:
+            train_state.carry, step_loss, step_metrics, _, _ = train_state.model(
                 carry=train_state.carry, 
                 batch=batch, 
                 return_keys=[],
                 global_step=train_state.step
             )
-    else:
-        # Standard fp32 training
-        train_state.carry, loss, metrics, _, _ = train_state.model(
-            carry=train_state.carry, 
-            batch=batch, 
-            return_keys=[],
-            global_step=train_state.step
-        )
+        
+        total_loss += step_loss
+        thinking_steps_used += 1
+        
+        # Merge metrics (accumulate)
+        for k, v in step_metrics.items():
+            if k not in all_metrics:
+                all_metrics[k] = v
+            else:
+                all_metrics[k] += v
+        
+        # Check task completion: Use halt probability from ACT
+        # High halt = model is confident it finished reasoning
+        if 'halt_prob' in step_metrics:
+            halt_prob = step_metrics['halt_prob']
+            if halt_prob > task_completion_threshold:
+                task_completed = True
+                break
+        
+        # Alternative: Check Q-value confidence
+        if 'q_max' in step_metrics and 'q_std' in step_metrics:
+            # High Q-value + low std = confident decision
+            if step_metrics['q_max'] > 0.8 and step_metrics['q_std'] < 0.1:
+                task_completed = True
+                break
+    
+    # Average loss over thinking steps
+    loss = total_loss / thinking_steps_used
+    
+    # Average metrics
+    for k in all_metrics:
+        all_metrics[k] = all_metrics[k] / thinking_steps_used
+    
+    # Add task-based metrics
+    all_metrics['thinking_steps'] = thinking_steps_used
+    all_metrics['task_completed'] = float(task_completed)
+    metrics = all_metrics
     
     # NaN Detection and Optimizer Fallback
     if torch.isnan(loss) or torch.isinf(loss):
@@ -1285,13 +1331,20 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             print(f"{'='*70}\n")
         return
 
+    # Gradient Accumulation (Winner Strategy - Large Effective Batch)
+    accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
+    accumulation_idx = train_state.step % accumulation_steps
+    
+    # Scale loss by accumulation steps (accumulate gradients over multiple batches)
+    scaled_loss = loss / accumulation_steps
+    
     # Backward pass with mixed precision scaling
     if use_amp and hasattr(train_state, 'scaler'):
         # Scale loss and backward
-        train_state.scaler.scale((1 / global_batch_size) * loss).backward()
+        train_state.scaler.scale((1 / global_batch_size) * scaled_loss).backward()
     else:
         # Standard backward
-        ((1 / global_batch_size) * loss).backward()
+        ((1 / global_batch_size) * scaled_loss).backward()
 
     # Allreduce
     if world_size > 1:
@@ -1308,34 +1361,40 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     if gradient_monitor is not None and rank == 0:
         grad_stats = gradient_monitor.update()
     
-    # Gradient normalization: per-layer or global
-    if getattr(config, 'enable_per_layer_grad_norm', False):
-        # Per-layer gradient normalization (more fine-grained control)
-        grad_norms_dict = per_layer_gradient_normalization(train_state.original_model, config)
-        grad_norm = sum(grad_norms_dict.values()) / len(grad_norms_dict) if grad_norms_dict else 0.0
-    else:
-        # Global gradient clipping (default)
-        grad_norm = torch.nn.utils.clip_grad_norm_(train_state.original_model.parameters(), max_norm=1.0)
-            
-    # Apply optimizer with mixed precision support
-    lr_this_step = None    
-    for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
-        lr_this_step = compute_lr(base_lr, config, train_state)
-
-        for param_group in optim.param_groups:
-            param_group['lr'] = lr_this_step
-        
-        # Use scaler.step() for mixed precision, or regular step()
-        if use_amp and hasattr(train_state, 'scaler'):
-            train_state.scaler.step(optim)
-        else:
-            optim.step()
-        
-        optim.zero_grad()
+    # Only step optimizer after accumulating N gradients (Winner Strategy)
+    should_step = (accumulation_idx == accumulation_steps - 1)
     
-    # Update scaler for next iteration (mixed precision)
-    if use_amp and hasattr(train_state, 'scaler'):
-        train_state.scaler.update()
+    grad_norm = 0.0
+    lr_this_step = None
+    
+    if should_step:
+        # Gradient normalization: per-layer or global
+        if getattr(config, 'enable_per_layer_grad_norm', False):
+            # Per-layer gradient normalization (more fine-grained control)
+            grad_norms_dict = per_layer_gradient_normalization(train_state.original_model, config)
+            grad_norm = sum(grad_norms_dict.values()) / len(grad_norms_dict) if grad_norms_dict else 0.0
+        else:
+            # Global gradient clipping (default)
+            grad_norm = torch.nn.utils.clip_grad_norm_(train_state.original_model.parameters(), max_norm=1.0)
+                
+        # Apply optimizer with mixed precision support
+        for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
+            lr_this_step = compute_lr(base_lr, config, train_state)
+
+            for param_group in optim.param_groups:
+                param_group['lr'] = lr_this_step
+            
+            # Use scaler.step() for mixed precision, or regular step()
+            if use_amp and hasattr(train_state, 'scaler'):
+                train_state.scaler.step(optim)
+            else:
+                optim.step()
+            
+            optim.zero_grad()
+        
+        # Update scaler for next iteration (mixed precision)
+        if use_amp and hasattr(train_state, 'scaler'):
+            train_state.scaler.update()
 
     # Reduce metrics
     if len(metrics):
