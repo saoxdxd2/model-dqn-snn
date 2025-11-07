@@ -1650,7 +1650,10 @@ def launch(hydra_config: DictConfig):
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
-        wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
+        
+        # Handle torch.compile wrapped models (access original via _orig_mod)
+        model_for_params = train_state.model._orig_mod if hasattr(train_state.model, '_orig_mod') else train_state.model
+        wandb.log({"num_params": sum(x.numel() for x in model_for_params.parameters())}, step=0)
         save_code_and_config(config)
         
         # Initialize gradient flow monitor
