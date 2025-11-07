@@ -194,7 +194,8 @@ class PuzzleDataset(IterableDataset):
                 raw_samples_path = os.path.join(dataset_path, self.split, 'raw_samples.pt')
                 if os.path.exists(raw_samples_path):
                     # Load raw samples (images + metadata)
-                    raw_samples = torch.load(raw_samples_path, map_location='cpu')
+                    # weights_only=False needed for custom DataSample class
+                    raw_samples = torch.load(raw_samples_path, map_location='cpu', weights_only=False)
                     num_samples = len(raw_samples)
                     
                     # Convert to expected format
