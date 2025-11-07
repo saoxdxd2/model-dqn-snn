@@ -1080,9 +1080,18 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         to_tensor = transforms.ToTensor()
         
         for sample in raw_samples:
-            # Input and output are PIL Images
-            input_img = to_tensor(sample['input_image'])  # [3, H, W]
-            output_img = to_tensor(sample['output_image'])
+            # DataSample is a Pydantic model - use dot notation
+            # sample.image is the main image, sample.label could be target
+            input_img = to_tensor(sample.image)  # [3, H, W]
+            
+            # For output, check if label is an image or if metadata has target
+            if hasattr(sample.label, 'convert'):  # PIL Image
+                output_img = to_tensor(sample.label)
+            elif 'target_image' in sample.metadata:
+                output_img = to_tensor(sample.metadata['target_image'])
+            else:
+                # Default: use same as input (for now)
+                output_img = input_img.clone()
             
             input_images.append(input_img)
             output_images.append(output_img)
