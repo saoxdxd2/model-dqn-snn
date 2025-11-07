@@ -429,8 +429,9 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
                 # Combine with previous state
                 combined = torch.cat([h_prev, token_emb], dim=-1)
                 h_combined = self.projection(combined)
-                # Transform
-                h_current = self.transformer(h_combined, **seq_info)
+                # Transform (Block expects: cos_sin, hidden_states as positional args)
+                cos_sin = seq_info.get('cos_sin', None)
+                h_current = self.transformer(cos_sin, h_combined)
                 # Predict
                 logits = self.output_head(h_current)
                 return h_current, logits
