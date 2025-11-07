@@ -39,8 +39,19 @@ def main():
     print("="*70)
     print()
     
-    # Build command: python pretrain.py --config <config> [other args]
-    cmd = ["python", "pretrain.py", "--config", config] + args
+    # Parse config path for Hydra
+    # config/arch/hybrid_pretrained.yaml -> config_path=config/arch, config_name=hybrid_pretrained
+    from pathlib import Path
+    config_path_obj = Path(config)
+    config_dir = str(config_path_obj.parent) if config_path_obj.parent != Path('.') else None
+    config_name = config_path_obj.stem  # filename without extension
+    
+    # Build command for Hydra
+    cmd = ["python", "pretrain.py"]
+    if config_dir:
+        cmd.extend(["--config-path", config_dir])
+    cmd.extend(["--config-name", config_name])
+    cmd += args
     
     print(f"Running: {' '.join(cmd)}\n")
     
