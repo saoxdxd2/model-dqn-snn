@@ -47,6 +47,11 @@ except ImportError:
 
 cli = ArgParser()
 
+@cli.command()
+def build_dataset(config: MultimodalDatasetConfig):
+    """Build multimodal dataset from source files."""
+    build(config)
+
 
 class MultimodalDatasetConfig(BaseModel):
     """Unified configuration for all dataset types."""
