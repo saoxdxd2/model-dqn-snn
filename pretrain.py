@@ -573,67 +573,16 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         loss_kwargs['total_steps'] = total_steps
         model = loss_head_cls(model, **loss_kwargs)  # type: ignore
         
-        if "DISABLE_COMPILE" not in os.environ:
-            # Configure Triton for GPU compute capability 7.5 (Tesla T4)
-            # Max block size is 4096, not 8192
-            try:
-                import torch._inductor.config as inductor_config
-                
-                # CRITICAL: Explicitly disable CUDA graphs to save 1.5GB memory
-                print("\n" + "="*70)
-                print("🔍 DEBUG: Inductor Config BEFORE changes")
-                print(f"  triton.cudagraphs = {getattr(inductor_config.triton, 'cudagraphs', 'NOT SET')}")
-                print(f"  cudagraphs = {getattr(inductor_config, 'cudagraphs', 'NOT SET')}")
-                print(f"  max_autotune = {inductor_config.max_autotune}")
-                print("="*70 + "\n")
-                
-                inductor_config.triton.cudagraphs = False
-                if hasattr(inductor_config, 'cudagraphs'):
-                    inductor_config.cudagraphs = False
-                
-                # Disable aggressive optimizations that require more SMs
-                inductor_config.max_autotune = False
-                inductor_config.max_autotune_gemm = False
-                
-                print("\n" + "="*70)
-                print("🔍 DEBUG: Inductor Config AFTER changes")
-                print(f"  triton.cudagraphs = {inductor_config.triton.cudagraphs}")
-                print(f"  cudagraphs = {getattr(inductor_config, 'cudagraphs', 'NOT SET')}")
-                print(f"  max_autotune = {inductor_config.max_autotune}")
-                print(f"  max_autotune_gemm = {inductor_config.max_autotune_gemm}")
-                print("="*70 + "\n")
-                
-                # Try to set Triton configs if available (API changed in newer PyTorch)
-                try:
-                    if hasattr(inductor_config, 'triton') and hasattr(inductor_config.triton, 'max_block'):
-                        inductor_config.triton.max_block = {"X": 4096, "Y": 4096, "Z": 4096, "R": 4096}
-                        inductor_config.triton.max_tiles = 4
-                        print(f"🔧 Triton config: max_block={inductor_config.triton.max_block}")
-                    else:
-                        print("ℹ️  Triton max_block config not available (newer PyTorch API)")
-                except AttributeError:
-                    pass  # Triton config API changed, skip
-                
-                if rank == 0:
-                    print(f"✅ CUDA graphs disabled: triton.cudagraphs={inductor_config.triton.cudagraphs}")
-            except Exception as e:
-                print(f"⚠️  Could not configure inductor: {e}")
-            
-            # Compile with EAGER backend - prevents deferred CUDA graphs at runtime
-            if rank == 0:
-                print("\n🚀 Compiling model with torch.compile (backend='eager')...")
-                print("   This prevents deferred CUDA graph allocation that bypasses config settings.")
-                torch.cuda.empty_cache()
-                print(f"\n📊 GPU Memory BEFORE compile:")
-                print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-                print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
-                print(f"  Free: {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated())/1e9:.2f} GB\n")
-            model = torch.compile(model, backend="eager")  # type: ignore
-            if rank == 0:
-                print(f"\n📊 GPU Memory AFTER compile:")
-                print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-                print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
-                print(f"  Free: {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated())/1e9:.2f} GB\n")
+        # CRITICAL: torch.compile disabled for memory constraints
+        # Even backend='eager' triggers AUTOTUNE and deferred cudagraphs that consume 14GB+
+        # AUTOTUNE benchmarks multiple implementations, allocating temporary buffers
+        if rank == 0:
+            print("\n⚠️  torch.compile DISABLED due to memory constraints")
+            print("   Reason: Even eager backend triggers AUTOTUNE addmm benchmarking")
+            print("   AUTOTUNE allocates temporary buffers for each kernel variant")
+            print("   This causes OOM on 15GB GPU with 366M parameter model")
+            print("   Trade-off: ~20-30% slower but fits in memory")
+            print("   Set ENABLE_COMPILE=1 to force enable (will likely OOM)\n")
 
         # Load checkpoint
         if rank == 0:
