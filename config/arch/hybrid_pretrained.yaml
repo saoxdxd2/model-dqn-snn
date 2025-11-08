@@ -120,7 +120,7 @@ evaluators:
   - name: arc@ARC
 
 # Training hyperparameters (Memory-Safe Batch Size)
-global_batch_size: 64   # Reduced from 128 to prevent system RAM OOM (SIGKILL)
+global_batch_size: 32   # Reduced from 128 to prevent system RAM OOM (SIGKILL)
 gradient_accumulation_steps: 4  # Effective batch = 32*4 = 128
 epochs: 1000000  # Very large epoch count for continuous streaming
 eval_interval: 5
