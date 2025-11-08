@@ -752,8 +752,9 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     original_model = model
     
     # torch.compile for 25% speedup (T4 compatible)
-    # NOTE: Compiled model is used for forward pass, original for .parameters() and EMA
-    if getattr(config, 'use_torch_compile', True) and hasattr(torch, 'compile'):
+    # NOTE: torch.compile DISABLED - even eager backend triggers AUTOTUNE and OOM
+    # AUTOTUNE benchmarks multiple kernel implementations, allocating 14GB+ temporary buffers
+    if False:  # Permanently disabled for memory safety
         if rank == 0:
             print(f"   🚀 Compiling model with torch.compile (25% speedup)...")
         model = torch.compile(model, mode='max-autotune')
