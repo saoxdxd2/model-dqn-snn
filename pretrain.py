@@ -10,6 +10,14 @@ os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,garbage_collec
 # Explicitly disable CUDA graphs to save ~1.5GB memory
 os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
 os.environ['TORCHINDUCTOR_CUDAGRAPHS'] = '0'
+
+print("\n" + "="*70)
+print("🔍 DEBUG: Environment Variables Set")
+print(f"  PYTORCH_CUDA_ALLOC_CONF = {os.environ.get('PYTORCH_CUDA_ALLOC_CONF', 'NOT SET')}")
+print(f"  TORCHINDUCTOR_CUDAGRAPHS = {os.environ.get('TORCHINDUCTOR_CUDAGRAPHS', 'NOT SET')}")
+print(f"  TORCHINDUCTOR_COMPILE_THREADS = {os.environ.get('TORCHINDUCTOR_COMPILE_THREADS', 'NOT SET')}")
+print("="*70 + "\n")
+
 import math
 import yaml
 import shutil
@@ -572,6 +580,13 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 import torch._inductor.config as inductor_config
                 
                 # CRITICAL: Explicitly disable CUDA graphs to save 1.5GB memory
+                print("\n" + "="*70)
+                print("🔍 DEBUG: Inductor Config BEFORE changes")
+                print(f"  triton.cudagraphs = {getattr(inductor_config.triton, 'cudagraphs', 'NOT SET')}")
+                print(f"  cudagraphs = {getattr(inductor_config, 'cudagraphs', 'NOT SET')}")
+                print(f"  max_autotune = {inductor_config.max_autotune}")
+                print("="*70 + "\n")
+                
                 inductor_config.triton.cudagraphs = False
                 if hasattr(inductor_config, 'cudagraphs'):
                     inductor_config.cudagraphs = False
@@ -579,6 +594,14 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 # Disable aggressive optimizations that require more SMs
                 inductor_config.max_autotune = False
                 inductor_config.max_autotune_gemm = False
+                
+                print("\n" + "="*70)
+                print("🔍 DEBUG: Inductor Config AFTER changes")
+                print(f"  triton.cudagraphs = {inductor_config.triton.cudagraphs}")
+                print(f"  cudagraphs = {getattr(inductor_config, 'cudagraphs', 'NOT SET')}")
+                print(f"  max_autotune = {inductor_config.max_autotune}")
+                print(f"  max_autotune_gemm = {inductor_config.max_autotune_gemm}")
+                print("="*70 + "\n")
                 
                 # Try to set Triton configs if available (API changed in newer PyTorch)
                 try:
@@ -599,7 +622,17 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             # Compile without CUDA graphs
             if rank == 0:
                 print("\n🚀 Compiling model with torch.compile (CUDA graphs DISABLED)...")
+                torch.cuda.empty_cache()
+                print(f"\n📊 GPU Memory BEFORE compile:")
+                print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                print(f"  Free: {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated())/1e9:.2f} GB\n")
             model = torch.compile(model, mode="default")  # type: ignore
+            if rank == 0:
+                print(f"\n📊 GPU Memory AFTER compile:")
+                print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                print(f"  Free: {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated())/1e9:.2f} GB\n")
 
         # Load checkpoint
         if rank == 0:
@@ -1287,6 +1320,13 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     task_completed = False
     
     for think_step in range(max_thinking_steps):
+        if think_step == 0 and rank == 0:
+            print(f"\n📊 GPU Memory at FIRST forward pass (step {train_state.step}):")
+            print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+            print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+            print(f"  Max Allocated: {torch.cuda.max_memory_allocated()/1e9:.2f} GB")
+            print(f"  Free: {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated())/1e9:.2f} GB\n")
+        
         # Use PyTorch native CPU offloading for activations (saves 3-4GB GPU memory)
         # This moves intermediate activations to pinned CPU memory during forward pass
         with torch.autograd.graph.save_on_cpu(pin_memory=True):
