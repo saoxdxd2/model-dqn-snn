@@ -619,15 +619,16 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             except Exception as e:
                 print(f"⚠️  Could not configure inductor: {e}")
             
-            # Compile without CUDA graphs
+            # Compile with EAGER backend - prevents deferred CUDA graphs at runtime
             if rank == 0:
-                print("\n🚀 Compiling model with torch.compile (CUDA graphs DISABLED)...")
+                print("\n🚀 Compiling model with torch.compile (backend='eager')...")
+                print("   This prevents deferred CUDA graph allocation that bypasses config settings.")
                 torch.cuda.empty_cache()
                 print(f"\n📊 GPU Memory BEFORE compile:")
                 print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
                 print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
                 print(f"  Free: {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated())/1e9:.2f} GB\n")
-            model = torch.compile(model, mode="default")  # type: ignore
+            model = torch.compile(model, backend="eager")  # type: ignore
             if rank == 0:
                 print(f"\n📊 GPU Memory AFTER compile:")
                 print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
