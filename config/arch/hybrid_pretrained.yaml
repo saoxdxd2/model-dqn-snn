@@ -119,9 +119,9 @@ data_paths_test: []
 evaluators:
   - name: arc@ARC
 
-# Training hyperparameters (Winner Strategy - Streaming + Large Batch)
-global_batch_size: 128  # Full batch with CPU offloading
-gradient_accumulation_steps: 4  # Effective batch = 128*4 = 512
+# Training hyperparameters (Memory-Safe Batch Size)
+global_batch_size: 64   # Reduced from 128 to prevent system RAM OOM (SIGKILL)
+gradient_accumulation_steps: 4  # Effective batch = 32*4 = 128
 epochs: 1000000  # Very large epoch count for continuous streaming
 eval_interval: 5
 checkpoint_every_eval: true
