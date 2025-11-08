@@ -15,6 +15,7 @@ flash-attn
 numba
 einops
 adam-atan2-pytorch
+bitsandbytes
 scikit-learn
 tqdm
 

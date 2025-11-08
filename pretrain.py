@@ -4,8 +4,12 @@ from pathlib import Path
 import os
 import sys
 
-# Memory optimization: Prevent fragmentation and enable expandable segments
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,max_split_size_mb:128'
+# Memory optimization: Reduce CUDA memory fragmentation and enable expandable segments
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128'
+
+# Explicitly disable CUDA graphs to save ~1.5GB memory
+os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
+os.environ['TORCHINDUCTOR_CUDAGRAPHS'] = '0'
 import math
 import yaml
 import shutil
@@ -36,6 +40,12 @@ import hydra
 import pydantic
 from omegaconf import DictConfig
 from adam_atan2_pytorch import AdamAtan2
+try:
+    import bitsandbytes as bnb
+    BNB_AVAILABLE = True
+except ImportError:
+    BNB_AVAILABLE = False
+    print("⚠️  bitsandbytes not available - using standard optimizers (4x more memory)")
 
 # Global flag for graceful shutdown
 shutdown_requested = False
@@ -560,9 +570,16 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             # Max block size is 4096, not 8192
             try:
                 import torch._inductor.config as inductor_config
+                
+                # CRITICAL: Explicitly disable CUDA graphs to save 1.5GB memory
+                inductor_config.triton.cudagraphs = False
+                if hasattr(inductor_config, 'cudagraphs'):
+                    inductor_config.cudagraphs = False
+                
                 # Disable aggressive optimizations that require more SMs
                 inductor_config.max_autotune = False
                 inductor_config.max_autotune_gemm = False
+                
                 # Try to set Triton configs if available (API changed in newer PyTorch)
                 try:
                     if hasattr(inductor_config, 'triton') and hasattr(inductor_config.triton, 'max_block'):
@@ -573,13 +590,16 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                         print("ℹ️  Triton max_block config not available (newer PyTorch API)")
                 except AttributeError:
                     pass  # Triton config API changed, skip
+                
+                if rank == 0:
+                    print(f"✅ CUDA graphs disabled: triton.cudagraphs={inductor_config.triton.cudagraphs}")
             except Exception as e:
                 print(f"⚠️  Could not configure inductor: {e}")
             
-            # Use max-autotune-no-cudagraphs mode to avoid CUDA graphs memory overhead
+            # Compile without CUDA graphs
             if rank == 0:
-                print("\n🚀 Compiling model with torch.compile (mode='max-autotune-no-cudagraphs')...")
-            model = torch.compile(model, mode="max-autotune-no-cudagraphs")  # type: ignore
+                print("\n🚀 Compiling model with torch.compile (CUDA graphs DISABLED)...")
+            model = torch.compile(model, mode="default")  # type: ignore
 
         # Load checkpoint
         if rank == 0:
@@ -593,18 +613,35 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
 
     # Helper function to create optimizer with fallback
     def create_optimizer_with_fallback(params, config, optimizer_type="main"):
-        """Create optimizer with automatic fallback to AdamW if AdamAtan2 fails."""
+        """Create optimizer with automatic fallback. Uses bitsandbytes 8-bit to save 75% memory."""
         lr = 1e-8  # Will be set by scheduler
         wd = config.weight_decay
         betas = (config.beta1, config.beta2)
         
-        if config.optimizer_type.lower() == "adamw":
-            # Direct AdamW request
+        # Priority 1: Use bitsandbytes 8-bit optimizer (saves 75% memory)
+        if BNB_AVAILABLE:
+            try:
+                optimizer = bnb.optim.AdamW8bit(
+                    params, 
+                    lr=lr, 
+                    weight_decay=wd, 
+                    betas=betas,
+                    min_8bit_size=4096  # Only quantize large tensors
+                )
+                if rank == 0:
+                    print(f"  Using bitsandbytes AdamW8bit optimizer for {optimizer_type} (saves 75% memory)")
+                return optimizer
+            except Exception as e:
+                if rank == 0:
+                    print(f"  ⚠️  bitsandbytes failed: {e}, falling back to standard optimizer")
+        
+        # Priority 2: Force AdamW if configured
+        if config.optimizer_type == "adamw":
             optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=wd, betas=betas)
             if rank == 0:
                 print(f"  Using AdamW optimizer for {optimizer_type}")
         else:
-            # Try AdamAtan2 first
+            # Priority 3: Try AdamAtan2
             try:
                 optimizer = AdamAtan2(params, lr=lr, weight_decay=wd, betas=betas)
                 if rank == 0:
@@ -616,7 +653,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                         print(f"  Falling back to AdamW optimizer for {optimizer_type}")
                     optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=wd, betas=betas)
                 else:
-                    raise e
+                    raise
         
         return optimizer
     
