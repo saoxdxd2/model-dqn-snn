@@ -555,16 +555,6 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         loss_kwargs['total_steps'] = total_steps
         model = loss_head_cls(model, **loss_kwargs)  # type: ignore
         
-        # Enable CPU activation offloading if configured
-        cpu_offload_enabled = getattr(config.arch, 'cpu_offload', False) or \
-                             (hasattr(config.arch, '__pydantic_extra__') and \
-                              config.arch.__pydantic_extra__.get('cpu_offload', False))
-        
-        if cpu_offload_enabled:
-            from utils.cpu_offload import enable_cpu_offload_for_module
-            if rank == 0:
-                print("\n🔧 Enabling CPU Activation Offloading (saves 3-4GB GPU memory)...")
-            model = enable_cpu_offload_for_module(model)
         if "DISABLE_COMPILE" not in os.environ:
             # Configure Triton for GPU compute capability 7.5 (Tesla T4)
             # Max block size is 4096, not 8192
@@ -585,7 +575,11 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                     pass  # Triton config API changed, skip
             except Exception as e:
                 print(f"⚠️  Could not configure inductor: {e}")
-            model = torch.compile(model)  # type: ignore
+            
+            # Use max-autotune-no-cudagraphs mode to avoid CUDA graphs memory overhead
+            if rank == 0:
+                print("\n🚀 Compiling model with torch.compile (mode='max-autotune-no-cudagraphs')...")
+            model = torch.compile(model, mode="max-autotune-no-cudagraphs")  # type: ignore
 
         # Load checkpoint
         if rank == 0:
@@ -1256,36 +1250,39 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     task_completed = False
     
     for think_step in range(max_thinking_steps):
-        if use_amp:
-            if not hasattr(train_state, 'scaler'):
-                from torch.amp import GradScaler
-                train_state.scaler = GradScaler('cuda')
-            
-            from torch.amp import autocast
-            with autocast('cuda'):
+        # Use PyTorch native CPU offloading for activations (saves 3-4GB GPU memory)
+        # This moves intermediate activations to pinned CPU memory during forward pass
+        with torch.autograd.graph.save_on_cpu(pin_memory=True):
+            if use_amp:
+                # Use mixed precision training
+                if not hasattr(train_state, 'scaler'):
+                    from torch.amp import GradScaler
+                    train_state.scaler = GradScaler('cuda')
+                
+                from torch.amp import autocast
+                with autocast('cuda'):
+                    train_state.carry, step_loss, step_metrics, _, _ = train_state.model(
+                        carry=train_state.carry, 
+                        batch=batch, 
+                        return_keys=[],
+                        global_step=train_state.step
+                    )
+            else:
                 train_state.carry, step_loss, step_metrics, _, _ = train_state.model(
                     carry=train_state.carry, 
                     batch=batch, 
                     return_keys=[],
                     global_step=train_state.step
                 )
-        else:
-            train_state.carry, step_loss, step_metrics, _, _ = train_state.model(
-                carry=train_state.carry, 
-                batch=batch, 
-                return_keys=[],
-                global_step=train_state.step
-            )
         
-        total_loss += step_loss
-        thinking_steps_used += 1
-        
-        # Merge metrics (accumulate)
         for k, v in step_metrics.items():
             if k not in all_metrics:
                 all_metrics[k] = v
             else:
                 all_metrics[k] += v
+        
+        total_loss += step_loss
+        thinking_steps_used += 1
         
         # Check task completion: Use halt probability from ACT
         # High halt = model is confident it finished reasoning
@@ -1303,7 +1300,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 break
     
     # Average loss over thinking steps
-    loss = total_loss / thinking_steps_used
+    loss = total_loss / thinking_steps_used if thinking_steps_used > 0 else torch.tensor(0.0)
     
     # Average metrics
     for k in all_metrics:
