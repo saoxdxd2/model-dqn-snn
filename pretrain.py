@@ -351,6 +351,7 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
     epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
     
     try:
+        dataset = DistributedMMapDataset(dataset_paths, config.tokenizer_path, config.context_length, epochs=epochs_per_iter, sampler_config=SamplerConfig(
             rank=rank,
             num_replicas=world_size,
             **kwargs
