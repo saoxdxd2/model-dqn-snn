@@ -10,6 +10,7 @@ import queue
 import gc
 import time
 import os
+import shutil
 import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -116,10 +117,10 @@ class StreamingCacheEncoder:
 
             
             batch_buffer.append(sample)
-            print(f"DEBUG: Producer received sample: {str(sample)[:50]}")
+            # print(f"DEBUG: Producer received sample: {str(sample)[:50]}")
             
             if len(batch_buffer) >= batch_size:
-                print(f"DEBUG: Producer processing batch of {len(batch_buffer)}")
+                # print(f"DEBUG: Producer processing batch of {len(batch_buffer)}")
                 self._process_batch(batch_buffer, renderer, pbar)
                 batch_buffer = []
                 
@@ -223,7 +224,7 @@ class StreamingCacheEncoder:
                 
                 # Save to cache
                 if img_array is not None:
-                    print(f"DEBUG: Caching {key[:20]}...")
+                    # print(f"DEBUG: Caching {key[:20]}...")
                     self.cache.put(key, 224, 224, img_array)
                     
             except Exception as e:
@@ -463,14 +464,30 @@ class StreamingCacheEncoder:
         del consolidated_tensors
         print(f"DEBUG: Freed consolidated_tensors memory.", flush=True)
         gc.collect()
+        print(f"DEBUG: GC done.", flush=True)
+
+        print(f"DEBUG: Meta sizes - Checksums: {len(consolidated_meta.get('checksums', []))}, Children: {len(consolidated_meta.get('children', []))}", flush=True)
+        if consolidated_meta.get('children') and len(consolidated_meta['children']) > 0:
+             print(f"DEBUG: First child type: {type(consolidated_meta['children'][0])}", flush=True)
 
         print(f"DEBUG: Saving metadata to {consolidated_meta_file}...", flush=True)
         try:
-            with open(consolidated_meta_file, 'w') as f:
+            # Write to local temp file first to avoid network drive timeouts/hangs
+            temp_meta_file = f"temp_{next_chunk_id:03d}_meta.json"
+            print(f"DEBUG: Writing to temp file {temp_meta_file}...", flush=True)
+            with open(temp_meta_file, 'w') as f:
                 json.dump(consolidated_meta, f)
+            print(f"DEBUG: Wrote temp file. Moving to target...", flush=True)
+            
+            # Move/Copy to target
+            import shutil
+            shutil.move(temp_meta_file, consolidated_meta_file)
             print(f"DEBUG: Saved metadata file.", flush=True)
         except Exception as e:
             print(f"DEBUG: Error saving metadata: {e}", flush=True)
+            # Clean up temp file if it exists
+            if os.path.exists(temp_meta_file):
+                os.remove(temp_meta_file)
             raise e
             
         self.drive_checkpoints.append(consolidated_file)
