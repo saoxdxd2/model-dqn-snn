@@ -8,28 +8,53 @@ env/
 venv/
 ENV/
 
-# Dataset files
-datasets/
+# --- TENSORS & MODEL WEIGHTS ---
+# PyTorch
 *.pt
 *.pth
+*.ckpt
+
+# Hugging Face / SafeTensors (High priority)
+*.safetensors
+*.bin
+
+# TensorFlow / Keras
+*.pb
+*.h5
+*.hdf5
+*.keras
+
+# NumPy / Data
 *.npy
 *.npz
 
+# ONNX / Exported Models
+*.onnx
+
+# Dataset directories
+datasets/
+
+# --- USER SPECIFIC ---
 # Consolidated encoding chunks (large files - synced via Drive)
 consolidated_*.pt
 encoding_chunk_*.pt
 recovery_checkpoint.pt
 stream_checkpoints/
 
-# IDE
+# --- IDE ---
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS
+# --- OS ---
 .DS_Store
 Thumbs.db
 
-# Jupyter
+# --- JUPYTER ---
 .ipynb_checkpoints/
+
+# --- LOGS & METRICS ---
+runs/
+*.log
+wandb/
