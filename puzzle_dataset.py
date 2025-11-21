@@ -15,6 +15,112 @@ from utils.data_processing import process_vision_batch
 from argdantic import ArgParser
 from pydantic import BaseModel
 
+class LazySafetensorsLoader:
+    """
+    Lazy loader for sharded safetensors files.
+    Mimics a numpy array or tensor for read-only access.
+    """
+    def __init__(self, file_paths: List[Path], field_name: str):
+        from safetensors import safe_open
+        self.file_paths = sorted([str(p) for p in file_paths])
+        self.field_name = field_name
+        self.files = []
+        self.file_ranges = [] # (start, end)
+        self.total_length = 0
+        self.shapes = []
+        
+        # Initialize files and index
+        for fp in self.file_paths:
+            try:
+                # We keep files open for performance. 
+                # Note: This might consume file descriptors.
+                f = safe_open(fp, framework="np", device="cpu")
+                
+                # Check if field exists
+                keys = f.keys()
+                if field_name not in keys:
+                    # If field is missing, we assume it's missing in this chunk.
+                    # For consistency, we should probably error or skip?
+                    # But if we skip, indices will be misaligned with other fields.
+                    # We assume consistent schema.
+                    print(f"[WARN] Field '{field_name}' missing in {fp}")
+                    continue
+                
+                slice_info = f.get_slice(field_name)
+                shape = slice_info.get_shape()
+                length = shape[0]
+                
+                self.files.append(f)
+                self.shapes.append(shape)
+                self.file_ranges.append((self.total_length, self.total_length + length))
+                self.total_length += length
+            except Exception as e:
+                print(f"[WARN] Failed to load {fp}: {e}")
+                
+    def __len__(self):
+        return self.total_length
+        
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(self.total_length)
+            if step != 1:
+                raise NotImplementedError("Slicing with step != 1 not supported")
+            
+            result = []
+            current = start
+            while current < stop:
+                # Find file
+                for i, (s, e) in enumerate(self.file_ranges):
+                    if s <= current < e:
+                        f = self.files[i]
+                        local_start = current - s
+                        local_end = min(stop, e) - s
+                        slice_obj = f.get_slice(self.field_name)
+                        result.append(slice_obj[local_start:local_end])
+                        current += (local_end - local_start)
+                        break
+                else:
+                    break # Should not happen
+            
+            if not result:
+                return np.array([])
+            return np.concatenate(result, axis=0)
+            
+        elif isinstance(idx, (list, np.ndarray, torch.Tensor)):
+            if isinstance(idx, torch.Tensor):
+                idx = idx.numpy()
+            if isinstance(idx, list):
+                idx = np.array(idx)
+                
+            out_arrays = []
+            for i in idx:
+                found = False
+                for f_idx, (s, e) in enumerate(self.file_ranges):
+                    if s <= i < e:
+                        f = self.files[f_idx]
+                        local_i = i - s
+                        slice_obj = f.get_slice(self.field_name)
+                        out_arrays.append(slice_obj[local_i:local_i+1])
+                        found = True
+                        break
+                if not found:
+                    raise IndexError(f"Index {i} out of bounds")
+            
+            if not out_arrays:
+                return np.array([])
+            return np.concatenate(out_arrays, axis=0)
+            
+        else:
+            # Single index
+            for f_idx, (s, e) in enumerate(self.file_ranges):
+                if s <= idx < e:
+                    f = self.files[f_idx]
+                    local_i = idx - s
+                    slice_obj = f.get_slice(self.field_name)
+                    return slice_obj[local_i]
+            raise IndexError("Index out of bounds")
+
+
 def _sample_batch(rng: np.random.Generator, group_order: np.ndarray, puzzle_indices: np.ndarray, group_indices: np.ndarray, start_index: int, global_batch_size: int):
     # Pack examples into a full batch
     batch = []
@@ -249,21 +355,28 @@ class PuzzleDataset(IterableDataset):
                     # Check for safetensors first (preferred)
                     safetensors_files = sorted(Path(stream_dir).glob("consolidated_*.safetensors"))
                     if safetensors_files:
-                        from safetensors.torch import load_file
-                        all_inputs = []
-                        all_labels = []
+                        # Lazy load using custom loader
+                        # Check if 'sketches' exists in first file to confirm schema
+                        from safetensors import safe_open
+                        has_sketches = False
+                        has_checksums = False
+                        try:
+                            with safe_open(safetensors_files[0], framework="pt", device="cpu") as f:
+                                keys = f.keys()
+                                if 'sketches' in keys:
+                                    has_sketches = True
+                                if 'checksums' in keys:
+                                    has_checksums = True
+                        except Exception as e:
+                            print(f"[ERROR] Failed to inspect {safetensors_files[0]}: {e}")
                         
-                        for chunk_file in safetensors_files:
-                            chunk = load_file(chunk_file)
-                            if 'sketches' in chunk:
-                                all_inputs.append(chunk['sketches'].numpy())
-                            if 'checksums' in chunk:
-                                all_labels.append(chunk['checksums'].numpy())
-                        
-                        if all_inputs:
-                            inputs = np.concatenate(all_inputs, axis=0)
-                            labels = np.concatenate(all_labels, axis=0) if all_labels else None
-                            num_samples = inputs.shape[0]
+                        if has_sketches:
+                            inputs = LazySafetensorsLoader(safetensors_files, "sketches")
+                            num_samples = len(inputs)
+                            
+                            labels = None
+                            if has_checksums:
+                                labels = LazySafetensorsLoader(safetensors_files, "checksums")
                             
                             # group_indices are boundary markers: [0, 1, 2, ..., N]
                             # Each sample is its own group (1 sample per puzzle)
@@ -382,11 +495,14 @@ class PuzzleDataset(IterableDataset):
                 del batch['raw_samples']
             return batch
         else:
-            return self._collate_batch({
+            batch_data = {
                 "inputs": dataset["inputs"][sample_indices],
-                "labels": dataset["labels"][sample_indices],
                 "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_identifier_indices]
-            })
+            }
+            if dataset["labels"] is not None:
+                batch_data["labels"] = dataset["labels"][sample_indices]
+            
+            return self._collate_batch(batch_data)
 
     def _iter_train(self):
         worker_info = get_worker_info()

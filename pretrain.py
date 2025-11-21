@@ -267,6 +267,9 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             )
         
         print(f"\n[LOAD] Loading multimodal capsule dataset: {capsule_path}")
+        if psutil:
+            print(f"   Pre-load RAM: {psutil.Process().memory_info().rss / 1024**3:.2f} GB")
+
         # Use mmap=True for lazy loading (requires PyTorch >= 2.1)
         # This keeps tensors on disk until accessed, saving massive RAM
         try:
@@ -324,6 +327,9 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
         import gc
         gc.collect()
         torch.cuda.empty_cache()
+        if psutil:
+            print(f"   Post-load RAM: {psutil.Process().memory_info().rss / 1024**3:.2f} GB")
+
         
         local_batch_size = config.global_batch_size // world_size
         raw_dataloader = DataLoader(
