@@ -170,3 +170,123 @@ print('   Downloading...\n')
 
 from google.colab import files
 files.download('model-dqn-snn.tar')
+
+
+
+
+
+
+
+# === Kaggle Setup ===
+import os
+import shutil
+import tarfile
+from pathlib import Path
+
+print("="*70)
+print("🛠️  Kaggle Setup - Persistent Storage Mode")
+print("   Input:  Reads from /kaggle/input (Attach your .tar as a Dataset)")
+print("   Output: Saves to /kaggle/working (Download from Output tab later)")
+print("="*70 + "\n")
+
+# === CONFIGURATION ===
+# This is the name of the file inside your uploaded Kaggle Dataset
+# If you upload 'model-dqn-snn.tar', it usually appears in /kaggle/input/your-dataset-name/
+# We will search for any .tar file in input if this name doesn't match exactly.
+TAR_INPUT_NAME = "model-dqn-snn.tar" 
+
+# 1. Setup Working Directory & Repo
+# Kaggle requires we work in /kaggle/working
+os.chdir('/kaggle/working')
+
+if os.path.exists('model-dqn-snn'):
+    os.chdir('model-dqn-snn')
+    print("✅ Repo folder exists, pulling latest...")
+    !git reset --hard HEAD
+    !git pull origin main
+else:
+    print("⬇️ Cloning Repo...")
+    !git clone https://github.com/saoxdxd2/model-dqn-snn.git
+    os.chdir('model-dqn-snn')
+    print("✅ Repo cloned")
+
+# 2. Restore Data from Kaggle Input (Dataset)
+checkpoints_dir = Path('model_checkpoints')
+dataset_chunks_dir = Path('datasets/vision_unified/stream_checkpoints')
+
+# Search for the tar file in Kaggle Input directories
+input_tar_path = None
+for root, dirs, files in os.walk('/kaggle/input'):
+    for file in files:
+        if file.endswith('.tar'):
+            input_tar_path = os.path.join(root, file)
+            break
+    if input_tar_path: break
+
+if input_tar_path:
+    print(f"\n📦 Found input archive: {input_tar_path}")
+    print("   Extracting to workspace (this takes a moment)...")
+    
+    with tarfile.open(input_tar_path, 'r') as tar:
+        # Extract directly to current folder (model-dqn-snn)
+        # We filter members to prevent path issues
+        tar.extractall('.')
+        
+    print("✅ Extraction complete")
+    
+    # Verification
+    if checkpoints_dir.exists():
+        print(f"   - Restored model_checkpoints/")
+    
+    chunks = list(dataset_chunks_dir.glob('consolidated_*.pt')) if dataset_chunks_dir.exists() else []
+    if chunks:
+        total_gb = sum(c.stat().st_size for c in chunks) / (1024**3)
+        print(f"   - Restored {len(chunks)} dataset chunks ({total_gb:.2f}GB)")
+else:
+    print("\nℹ️  No .tar file found in /kaggle/input.")
+    print("    If you have data, upload it as a Kaggle Dataset and add it to this notebook.")
+    print("    Starting FRESH run.")
+
+# 3. Install dependencies
+print("\n📦 Installing dependencies...")
+!pip install --no-cache-dir -r requirements.txt
+print("✅ Dependencies installed")
+
+# 4. Start training
+print("\n" + "="*70)
+print("🚀 Starting Training - Kaggle Background Mode")
+print("   Time: Up to 12 hours (if committed)")
+print("="*70 + "\n")
+
+# Ensure output dirs exist to prevent errors
+checkpoints_dir.mkdir(exist_ok=True)
+
+# RUN TRAINING
+!python train.py
+
+# 5. Pack Outputs for Download
+print("\n" + "="*70)
+print("💾 Packaging Output for Download")
+print("="*70)
+
+output_tar = '/kaggle/working/training_output.tar'
+
+# Remove previous output if exists
+if os.path.exists(output_tar):
+    os.remove(output_tar)
+
+print("📦 Compressing 'model_checkpoints' and 'datasets'...")
+
+with tarfile.open(output_tar, 'w') as tar:
+    # Add Checkpoints
+    if checkpoints_dir.exists():
+        print(f"   Adding {checkpoints_dir}...")
+        tar.add(checkpoints_dir, arcname='model_checkpoints')
+    
+    # Add Datasets (only if they exist/changed)
+    if Path('datasets').exists():
+        print(f"   Adding datasets folder...")
+        tar.add('datasets', arcname='datasets')
+
+print(f"\n✅ Done! File saved to: {output_tar}")
+print("👉 Go to the 'Output' tab of this notebook version to download it.")

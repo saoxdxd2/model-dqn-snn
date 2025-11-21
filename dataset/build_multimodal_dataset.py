@@ -579,6 +579,11 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         
         sys.path.insert(0, str(rearc_path))
         
+        # Hack: Fix module shadowing (project utils vs re-arc utils)
+        old_utils = None
+        if 'utils' in sys.modules:
+            old_utils = sys.modules.pop('utils')
+        
         try:
             import generators
             
@@ -603,6 +608,9 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                         total_generated += 1
                     except Exception:
                         continue  # Skip failed generations
+        finally:
+            if old_utils:
+                sys.modules['utils'] = old_utils
             
             print(f"   Generated {total_generated} Re-ARC samples (streaming)")
         except Exception as e:
