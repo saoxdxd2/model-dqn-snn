@@ -100,7 +100,7 @@ def detect_dataset_features(data_path: str) -> Dict[str, Any]:
     ]
     
     for path in capsule_paths:
-        if os.path.exists(path):
+        if os.path.exists(path) and os.path.isfile(path):
             try:
                 # Attempt to load with mmap if possible, or just check file size
                 # If file is small (<1GB), try loading keys. If large, assume it has features based on name.
