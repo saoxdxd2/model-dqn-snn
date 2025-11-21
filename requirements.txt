@@ -27,6 +27,4 @@ datasets
 huggingface-hub
 opencv-python
 gradio
-pylibcudf-cu12
-cudf-cu12
 lz4
