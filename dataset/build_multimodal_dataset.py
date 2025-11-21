@@ -584,6 +584,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         if 'utils' in sys.modules:
             old_utils = sys.modules.pop('utils')
         
+        total_generated = 0
         try:
             import generators
             
@@ -592,7 +593,6 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
             generators_dict = {name[9:]: getattr(generators, name) 
                              for name in dir(generators) if name.startswith('generate_')}
             
-            total_generated = 0
             for task_id, generator_fn in generators_dict.items():
                 for i in range(self.config.rearc_examples_per_task):
                     try:
@@ -608,13 +608,14 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                         total_generated += 1
                     except Exception:
                         continue  # Skip failed generations
+
+        except Exception as e:
+            print(f"WARNING: Re-ARC streaming failed: {e}")
         finally:
             if old_utils:
                 sys.modules['utils'] = old_utils
             
             print(f"   Generated {total_generated} Re-ARC samples (streaming)")
-        except Exception as e:
-            print(f"WARNING: Re-ARC streaming failed: {e}")
     
     def _load_rearc_infinite(self) -> List[DataSample]:
         """Load infinite synthetic ARC data from Re-ARC (Winner Strategy)."""
