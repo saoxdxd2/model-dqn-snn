@@ -101,7 +101,7 @@ class MultimodalDatasetConfig(BaseModel):
     # Re-ARC infinite synthetic data (Winner Strategy)
     use_rearc_infinite: bool = True  # Infinite synthetic ARC tasks
     rearc_path: str = "dataset/re-arc"  # Path to re-arc repo
-    rearc_examples_per_task: int = 100  # Generate 100 examples per task
+    rearc_examples_per_task: int = 5  # Generate 5 examples per task (Fast mode for Colab)
     
     # Problem Augmentation (Winner Strategy - Creates 10-20x more tasks)
     enable_problem_augmentation: bool = True  # Transform inputs/outputs separately

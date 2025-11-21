@@ -724,7 +724,21 @@ def load_checkpoint(model: nn.Module, config: PretrainConfig, optimizers=None, t
     )
 
     # Load checkpoint if exists
+    # Load checkpoint if exists
     start_step = 0
+    
+    # Auto-resume logic: If no specific checkpoint provided, look for latest in checkpoint_dir
+    if not config.load_checkpoint and config.checkpoint_path:
+        checkpoint_dir = Path(config.checkpoint_path)
+        if checkpoint_dir.exists():
+            checkpoints = sorted(
+                [d for d in checkpoint_dir.iterdir() if d.is_dir() and d.name.startswith("checkpoint-")],
+                key=lambda x: int(x.name.split('-')[-1])
+            )
+            if checkpoints:
+                config.load_checkpoint = str(checkpoints[-1])
+                print(f"[AUTO-RESUME] Found latest checkpoint: {config.load_checkpoint}")
+
     if config.load_checkpoint:
         try:
             extra_data = checkpoint_manager.load(config.load_checkpoint, model, optimizers)

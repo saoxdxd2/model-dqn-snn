@@ -29,7 +29,7 @@ dataset_chunks_dir = Path('datasets/vision_unified/stream_checkpoints')
 
 # Check what we already have
 has_model_ckpt = checkpoints_dir.exists()
-has_dataset_chunks = dataset_chunks_dir.exists() and list(dataset_chunks_dir.glob('consolidated_*.pt'))
+has_dataset_chunks = dataset_chunks_dir.exists() and list(dataset_chunks_dir.glob('consolidated_*.safetensors'))
 
 if not has_model_ckpt and not has_dataset_chunks:
     print("\n📤 No checkpoints or dataset chunks found. Upload tar from your E:\\ drive?")
@@ -62,7 +62,7 @@ if not has_model_ckpt and not has_dataset_chunks:
                 shutil.copytree(extracted_dataset, 'datasets', dirs_exist_ok=True)
                 
                 # Count consolidated chunks
-                chunks = list(dataset_chunks_dir.glob('consolidated_*.pt')) if dataset_chunks_dir.exists() else []
+                chunks = list(dataset_chunks_dir.glob('consolidated_*.safetensors')) if dataset_chunks_dir.exists() else []
                 if chunks:
                     total_gb = sum(c.stat().st_size for c in chunks) / (1024**3)
                     print(f"✅ Restored {len(chunks)} pre-encoded chunk(s) ({total_gb:.2f}GB)")
@@ -79,7 +79,7 @@ else:
     if has_model_ckpt:
         print("✅ Found existing model_checkpoints/")
     if has_dataset_chunks:
-        chunks = list(dataset_chunks_dir.glob('consolidated_*.pt'))
+        chunks = list(dataset_chunks_dir.glob('consolidated_*.safetensors'))
         total_gb = sum(c.stat().st_size for c in chunks) / (1024**3)
         print(f"✅ Found {len(chunks)} pre-encoded chunk(s) ({total_gb:.2f}GB)")
         print(f"   🚀 Training will start on existing data!")
@@ -238,7 +238,7 @@ if input_tar_path:
     if checkpoints_dir.exists():
         print(f"   - Restored model_checkpoints/")
     
-    chunks = list(dataset_chunks_dir.glob('consolidated_*.pt')) if dataset_chunks_dir.exists() else []
+    chunks = list(dataset_chunks_dir.glob('consolidated_*.safetensors')) if dataset_chunks_dir.exists() else []
     if chunks:
         total_gb = sum(c.stat().st_size for c in chunks) / (1024**3)
         print(f"   - Restored {len(chunks)} dataset chunks ({total_gb:.2f}GB)")
