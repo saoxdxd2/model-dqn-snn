@@ -1,9 +1,6 @@
-dab2e42da43bc44934cb07d7973984cad6a4407a
-
 # === Colab Setup with Local Tar Transfer (No Drive) ===
 import os, shutil, tarfile
 from pathlib import Path
-
 # Handle running locally vs Colab
 try:
     from google.colab import files
@@ -99,6 +96,7 @@ if not has_model_ckpt and not has_dataset_chunks:
                     count = 0
                     for filename in uploaded.keys():
                         # Move file to dataset directory
+                        # In Colab, uploads go to CWD (/content/model-dqn-snn)
                         if filename.startswith("consolidated_") and (filename.endswith(".safetensors") or filename.endswith(".json")):
                             shutil.move(filename, dataset_chunks_dir / filename)
                             count += 1
@@ -143,195 +141,6 @@ print("🚀 Starting Training - Hybrid Pretrained Pipeline")
 print("   Config: hybrid_pretrained.yaml (CLIP+ViT+N2N+TRM+COCONUT)")
 print("   Resume: Auto-continues from model_checkpoints/")
 print("="*70 + "\n")
+# !python train.py
 if IN_COLAB:
     os.system('python train.py')
-
-
-
-
-!find datasets/vision_unified/text_cache -name "*.npy" -type f -delete
-import tarfile
-import os
-import shutil
-
-os.chdir('/content')
-
-print('📦 Creating tar with recursive space-saving mode...')
-print('   Archives deepest subdirectories first, deletes as it goes\n')
-
-def get_all_subdirs(base_path):
-    """Get all subdirectories sorted by depth (deepest first)."""
-    all_dirs = []
-    for root, dirs, files in os.walk(base_path):
-        for d in dirs:
-            full_path = os.path.join(root, d)
-            depth = full_path.count(os.sep)
-            all_dirs.append((depth, full_path))
-    # Sort by depth (deepest first) so we delete leaf directories first
-    all_dirs.sort(reverse=True, key=lambda x: x[0])
-    return [path for _, path in all_dirs]
-
-def get_dir_size(path):
-    """Get total size of directory in MB."""
-    total = 0
-    for root, dirs, files in os.walk(path):
-        for f in files:
-            fp = os.path.join(root, f)
-            if os.path.exists(fp):
-                total += os.path.getsize(fp)
-    return total / (1024**2)
-
-base_dir = 'model-dqn-snn'
-
-# Get all subdirectories (deepest first)
-all_subdirs = get_all_subdirs(base_dir)
-print(f'Found {len(all_subdirs)} subdirectories to process\n')
-
-with tarfile.open('model-dqn-snn.tar', 'w') as tar:
-    # Archive deepest directories first
-    for i, dir_path in enumerate(all_subdirs, 1):
-        if not os.path.exists(dir_path):  # Skip if already deleted
-            continue
-            
-        rel_path = os.path.relpath(dir_path, '.')
-        dir_size = get_dir_size(dir_path)
-        
-        print(f'{i}/{len(all_subdirs)} {rel_path} (~{dir_size:.0f}MB)')
-        tar.add(dir_path, arcname=rel_path)
-        shutil.rmtree(dir_path)
-        print(f'         ✅ Freed ~{dir_size:.0f}MB\n')
-    
-    # Archive remaining files in base directory
-    print('Adding remaining files...')
-    for item in os.listdir(base_dir):
-        item_path = os.path.join(base_dir, item)
-        if os.path.isfile(item_path):
-            tar.add(item_path, arcname=item_path)
-    print('    ✅ Done\n')
-
-print('✅ Successfully created model-dqn-snn.tar')
-print('   All source directories deleted to save space')
-print('   Downloading...\n')
-
-from google.colab import files
-files.download('model-dqn-snn.tar')
-
-
-
-
-
-
-
-# === Kaggle Setup ===
-import os
-import shutil
-import tarfile
-from pathlib import Path
-
-print("="*70)
-print("🛠️  Kaggle Setup - Persistent Storage Mode")
-print("   Input:  Reads from /kaggle/input (Attach your .tar as a Dataset)")
-print("   Output: Saves to /kaggle/working (Download from Output tab later)")
-print("="*70 + "\n")
-
-# === CONFIGURATION ===
-# This is the name of the file inside your uploaded Kaggle Dataset
-# If you upload 'model-dqn-snn.tar', it usually appears in /kaggle/input/your-dataset-name/
-# We will search for any .tar file in input if this name doesn't match exactly.
-TAR_INPUT_NAME = "model-dqn-snn.tar" 
-
-# 1. Setup Working Directory & Repo
-# Kaggle requires we work in /kaggle/working
-os.chdir('/kaggle/working')
-
-if os.path.exists('model-dqn-snn'):
-    os.chdir('model-dqn-snn')
-    print("✅ Repo folder exists, pulling latest...")
-    !git reset --hard HEAD
-    !git pull origin main
-else:
-    print("⬇️ Cloning Repo...")
-    !git clone https://github.com/saoxdxd2/model-dqn-snn.git
-    os.chdir('model-dqn-snn')
-    print("✅ Repo cloned")
-
-# 2. Restore Data from Kaggle Input (Dataset)
-checkpoints_dir = Path('model_checkpoints')
-dataset_chunks_dir = Path('datasets/vision_unified/stream_checkpoints')
-
-# Search for the tar file in Kaggle Input directories
-input_tar_path = None
-for root, dirs, files in os.walk('/kaggle/input'):
-    for file in files:
-        if file.endswith('.tar'):
-            input_tar_path = os.path.join(root, file)
-            break
-    if input_tar_path: break
-
-if input_tar_path:
-    print(f"\n📦 Found input archive: {input_tar_path}")
-    print("   Extracting to workspace (this takes a moment)...")
-    
-    with tarfile.open(input_tar_path, 'r') as tar:
-        # Extract directly to current folder (model-dqn-snn)
-        # We filter members to prevent path issues
-        tar.extractall('.')
-        
-    print("✅ Extraction complete")
-    
-    # Verification
-    if checkpoints_dir.exists():
-        print(f"   - Restored model_checkpoints/")
-    
-    chunks = list(dataset_chunks_dir.glob('consolidated_*.safetensors')) if dataset_chunks_dir.exists() else []
-    if chunks:
-        total_gb = sum(c.stat().st_size for c in chunks) / (1024**3)
-        print(f"   - Restored {len(chunks)} dataset chunks ({total_gb:.2f}GB)")
-else:
-    print("\nℹ️  No .tar file found in /kaggle/input.")
-    print("    If you have data, upload it as a Kaggle Dataset and add it to this notebook.")
-    print("    Starting FRESH run.")
-
-# 3. Install dependencies
-print("\n📦 Installing dependencies...")
-!pip install --no-cache-dir -r requirements.txt
-print("✅ Dependencies installed")
-
-# 4. Start training
-print("\n" + "="*70)
-print("🚀 Starting Training - Kaggle Background Mode")
-print("   Time: Up to 12 hours (if committed)")
-print("="*70 + "\n")
-
-# Ensure output dirs exist to prevent errors
-checkpoints_dir.mkdir(exist_ok=True)
-
-# RUN TRAINING
-!python train.py
-
-# 5. Pack Outputs for Download
-print("\n" + "="*70)
-print("💾 Packaging Output for Download")
-print("="*70)
-
-output_tar = '/kaggle/working/training_output.tar'
-
-# Remove previous output if exists
-if os.path.exists(output_tar):
-    os.remove(output_tar)
-
-print("📦 Compressing 'model_checkpoints' and 'datasets'...")
-
-with tarfile.open(output_tar, 'w') as tar:
-    # Add Checkpoints
-    if checkpoints_dir.exists():
-        print(f"   Adding {checkpoints_dir}...")
-        tar.add(checkpoints_dir, arcname='model_checkpoints')
-    
-    # Add Datasets (only if they exist/changed)
-    if Path('datasets').exists():
-        print(f"   Adding datasets folder...")
-        tar.add('datasets', arcname='datasets')
-
-print(f"\n✅ Done! File saved to: {output_tar}")
-print("👉 Go to the 'Output' tab of this notebook version to download it.")
