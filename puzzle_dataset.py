@@ -246,6 +246,39 @@ class PuzzleDataset(IterableDataset):
                 # Check if OLD streaming format
                 stream_dir = os.path.join(dataset_path, "stream_checkpoints")
                 if os.path.exists(stream_dir):
+                    # Check for safetensors first (preferred)
+                    safetensors_files = sorted(Path(stream_dir).glob("consolidated_*.safetensors"))
+                    if safetensors_files:
+                        from safetensors.torch import load_file
+                        all_inputs = []
+                        all_labels = []
+                        
+                        for chunk_file in safetensors_files:
+                            chunk = load_file(chunk_file)
+                            if 'sketches' in chunk:
+                                all_inputs.append(chunk['sketches'].numpy())
+                            if 'checksums' in chunk:
+                                all_labels.append(chunk['checksums'].numpy())
+                        
+                        if all_inputs:
+                            inputs = np.concatenate(all_inputs, axis=0)
+                            labels = np.concatenate(all_labels, axis=0) if all_labels else None
+                            num_samples = inputs.shape[0]
+                            
+                            # group_indices are boundary markers: [0, 1, 2, ..., N]
+                            # Each sample is its own group (1 sample per puzzle)
+                            group_indices = np.arange(num_samples + 1, dtype=np.int32)
+                            puzzle_indices = np.arange(num_samples + 1, dtype=np.int32)
+                            
+                            self._data[set_name_] = {
+                                "inputs": inputs,
+                                "labels": labels,
+                                "puzzle_identifiers": np.arange(num_samples, dtype=np.int32),
+                                "puzzle_indices": puzzle_indices,
+                                "group_indices": group_indices
+                            }
+                            continue
+
                     consolidated_files = sorted(Path(stream_dir).glob("consolidated_*.pt"))
                     if consolidated_files:
                         # Load and concatenate consolidated chunks
