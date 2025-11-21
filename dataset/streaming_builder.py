@@ -420,23 +420,28 @@ class StreamingCacheEncoder:
                         continue
             
             # Concatenate this mini chunk
-            # Concatenate this mini chunk
             if chunk_data['sketches']:
+                print(f"DEBUG: Concatenating mini-chunk {mini_start}...")
                 mini_concat = torch.cat(chunk_data['sketches'], dim=0)
                 all_consolidated['sketches'].append(mini_concat)
                 del mini_concat
+                print(f"DEBUG: Concatenation complete.")
             
             # Extend lists for metadata
             all_consolidated['checksums'].extend(chunk_data['checksums'])
             all_consolidated['children'].extend(chunk_data['children'])
             
             del chunk_data
+            print(f"DEBUG: GC collecting...")
             gc.collect()
+            print(f"DEBUG: GC done.")
         
         # Final concatenation
         consolidated_tensors = {}
         if all_consolidated['sketches']:
+            print(f"DEBUG: Final concatenation...")
             consolidated_tensors['sketches'] = torch.cat(all_consolidated['sketches'], dim=0)
+            print(f"DEBUG: Final concatenation done.")
             
         consolidated_meta = {
             'checksums': all_consolidated['checksums'],
@@ -450,7 +455,9 @@ class StreamingCacheEncoder:
         consolidated_meta_file = os.path.join(save_dir, f"consolidated_{next_chunk_id:03d}_meta.json")
         
         if consolidated_tensors:
+            print(f"DEBUG: Saving consolidated file {consolidated_file}...")
             save_file(consolidated_tensors, consolidated_file)
+            print(f"DEBUG: Saved consolidated file.")
         with open(consolidated_meta_file, 'w') as f:
             json.dump(consolidated_meta, f)
             
