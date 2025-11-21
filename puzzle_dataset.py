@@ -144,9 +144,39 @@ class PuzzleDataset(IterableDataset):
                 sets=[self.split]
             )
         
-        # Check if OLD streaming format (consolidated_*.pt files)
+        # Check if OLD streaming format (consolidated_*.pt or .safetensors files)
         stream_dir = os.path.join(dataset_path, "stream_checkpoints")
         if os.path.exists(stream_dir):
+            # Check for safetensors first (preferred)
+            safetensors_files = sorted(Path(stream_dir).glob("consolidated_*.safetensors"))
+            if safetensors_files:
+                from safetensors import safe_open
+                # Load metadata from first chunk
+                with safe_open(safetensors_files[0], framework="pt", device="cpu") as f:
+                    # Assuming 'sketches' key exists
+                    first_shape = f.get_tensor("sketches").shape
+                
+                # Calculate total samples efficiently
+                num_samples = 0
+                for sf in safetensors_files:
+                    with safe_open(sf, framework="pt", device="cpu") as f:
+                        # Read shape of 'sketches' tensor without loading data
+                        slice_info = f.get_slice("sketches")
+                        num_samples += slice_info.get_shape()[0]
+
+                return PuzzleDatasetMetadata(
+                    seq_len=first_shape[1],
+                    vocab_size=0,
+                    pad_id=0,
+                    ignore_label_id=-100,
+                    blank_identifier_id=0,
+                    num_puzzle_identifiers=num_samples,
+                    total_groups=1,
+                    mean_puzzle_examples=1.0,
+                    total_puzzles=num_samples,
+                    sets=["default"]
+                )
+
             consolidated_files = sorted(Path(stream_dir).glob("consolidated_*.pt"))
             if consolidated_files:
                 # Load streaming format metadata from first chunk
