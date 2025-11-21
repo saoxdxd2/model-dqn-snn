@@ -38,8 +38,8 @@ def main():
             args = args[:i] + args[i+2:]
             break
             
-    config_path_obj = Path(config)
-    config_dir = str(config_path_obj.parent) if config_path_obj.parent != Path('.') else None
+    config_path_obj = Path(config).resolve()
+    config_dir = str(config_path_obj.parent)
     config_name = config_path_obj.stem
     
     pretrain_cmd = ["python", "pretrain.py"]

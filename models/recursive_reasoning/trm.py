@@ -370,15 +370,16 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
 
         # COCONUT-style Latent Planning (optional)
         self.latent_planner = None
-        if self.config.enable_latent_planning:
+        if hasattr(self.config, 'enable_latent_planning') and self.config.enable_latent_planning:
             from models.latent_planning import AdaptiveLatentPlanning
+            print(f" COCONUT Latent Planning enabled")
             self.latent_planner = AdaptiveLatentPlanning(
                 hidden_size=self.config.hidden_size,
                 num_paths=self.config.latent_num_paths,
                 planning_depth=self.config.latent_planning_depth,
                 use_adaptive_gate=self.config.latent_use_adaptive_gate
             )
-            print(f"🧠 COCONUT Latent Planning enabled")
+
 
         # Memory Bank (optional)
         self.memory = None
@@ -526,7 +527,8 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         )
 
     def forward(self, carry: TinyRecursiveReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor], 
-                enable_deep_supervision: bool = False, supervision_steps: int = 4) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+                enable_deep_supervision: bool = False, supervision_steps: int = 4,
+                h_cycles_override: Optional[int] = None) -> Tuple[TinyRecursiveReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # Reset DQN step buffer for this forward pass
         self._dqn_step_buffer = []
         batch_size = batch["inputs"].shape[0]
@@ -590,16 +592,16 @@ class TinyRecursiveReasoningModel_ACTV1_Inner(nn.Module):
         
         # Process H-cycles with adaptive early exit (IMPROVED: dynamic recursion depth)
         enable_adaptive_cycles = getattr(self.config, 'enable_adaptive_hcycles', False)
-        h_cycles_actual = self.config.H_cycles
+        h_cycles_actual = h_cycles_override if h_cycles_override is not None else self.config.H_cycles
         
         # Track last stability and loop count for final Q-head call
         last_stability = torch.zeros(batch_size, 1, device=z_H.device, dtype=self.forward_dtype)
         last_loop_count = torch.zeros(batch_size, 1, device=z_H.device, dtype=self.forward_dtype)
 
-        for h_step in range(self.config.H_cycles):
+        for h_step in range(h_cycles_actual):
             # Determine if this step should have gradients
-            is_supervision_step = enable_deep_supervision and (h_step % supervision_interval == 0 or h_step == self.config.H_cycles - 1)
-            is_final_step = (h_step == self.config.H_cycles - 1)
+            is_supervision_step = enable_deep_supervision and (h_step % supervision_interval == 0 or h_step == h_cycles_actual - 1)
+            is_final_step = (h_step == h_cycles_actual - 1)
             
             # Adaptive early exit: check if reasoning has converged
             if enable_adaptive_cycles and h_step > 0 and not is_final_step:
@@ -912,7 +914,7 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
             puzzle_ids=torch.zeros((batch_size, ), dtype=torch.int64, device=device) if hasattr(self.inner, 'q_head') and hasattr(self.inner.q_head, 'reset_hidden') else None
         )
         
-    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor], global_step: int = 0) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
+    def forward(self, carry: TinyRecursiveReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor], global_step: int = 0, h_cycles_override: Optional[int] = None) -> Tuple[TinyRecursiveReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
         # CRITICAL: Store global_step for annealing schedules (Q-temperature, expansion penalty)
         # This synchronizes all annealing with actual training progress, not local counters
         # Store on model instance (not Pydantic config which is immutable)
@@ -931,7 +933,8 @@ class TinyRecursiveReasoningModel_ACTV1(nn.Module):
         inner_result = self.inner(
             new_inner_carry, new_current_data, 
             enable_deep_supervision=enable_deep_supervision,
-            supervision_steps=supervision_steps
+            supervision_steps=supervision_steps,
+            h_cycles_override=h_cycles_override
         )
         
         # Handle 2-action or 3-action Q-head

@@ -74,6 +74,7 @@ def process_vision_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
             output_images.append(torch.zeros_like(input_tensor))
             
     batch['target_images'] = torch.stack(output_images)
+    batch['images'] = torch.stack(input_images)
     
     return batch
 

@@ -79,7 +79,7 @@ class LatentPlanningModule(nn.Module):
             nn.LayerNorm(hidden_size)
         )
         
-        print(f"🧠 Latent Planning Module:")
+        print(f" Latent Planning Module:")
         print(f"   Paths: {num_paths}")
         print(f"   Planning depth: {planning_depth}")
         print(f"   Path dropout: {use_path_dropout}")

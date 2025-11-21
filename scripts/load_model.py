@@ -97,8 +97,11 @@ class ModelLoader:
             # Hydra-style config
             config = checkpoint['arch']
         else:
-            # Config not in checkpoint, try loading from all_config.yaml in same directory
+            # Config not in checkpoint, try loading from all_config.yaml in same directory or parent
             config_path = self.checkpoint_path.parent / 'all_config.yaml'
+            if not config_path.exists():
+                config_path = self.checkpoint_path.parent.parent / 'all_config.yaml'
+            
             if config_path.exists():
                 print(f"   Loading config from: {config_path}")
                 with open(config_path, 'r') as f:
@@ -111,7 +114,7 @@ class ModelLoader:
             else:
                 raise ValueError(
                     f"No config found in checkpoint or {config_path}.\n"
-                    f"Available checkpoint keys: {checkpoint.keys()}"
+                    f"Available checkpoint keys: {list(checkpoint.keys())[:5]}..."
                 )
         
         # Convert OmegaConf to dict if needed
@@ -138,7 +141,23 @@ class ModelLoader:
         # Extract config
         self.config = self.extract_config(checkpoint)
         
-        print(f"\n📊 Model Configuration:")
+        # Inject defaults for missing fields (required by Pydantic model but often dynamic)
+        if 'seq_len' not in self.config:
+            print("   Injecting default seq_len=1024")
+            self.config['seq_len'] = 1024
+        if 'vocab_size' not in self.config:
+            print("   Injecting default vocab_size=4096")
+            self.config['vocab_size'] = 4096
+        if 'num_puzzle_identifiers' not in self.config:
+            print("   Injecting default num_puzzle_identifiers=0")
+            self.config['num_puzzle_identifiers'] = 0
+        if 'input_vocab_size' not in self.config:
+            self.config['input_vocab_size'] = self.config['vocab_size']
+        if 'batch_size' not in self.config:
+            print("   Injecting default batch_size=1")
+            self.config['batch_size'] = 1
+            
+        print(f"\n Model Configuration:")
         print(f"   Architecture: {self.config.get('name', 'TRM')}")
         print(f"   Hidden size: {self.config.get('hidden_size')}")
         print(f"   Vocab size: {self.config.get('vocab_size')}")
@@ -147,7 +166,7 @@ class ModelLoader:
         print(f"   L layers: {self.config.get('L_layers')}")
         
         # Create model instance
-        print("\n🔨 Instantiating model...")
+        print("\n Instantiating model...")
         self.model = TinyRecursiveReasoningModel_ACTV1(self.config)
         
         # Load state dict
@@ -169,6 +188,11 @@ class ModelLoader:
         if any(k.startswith('module.') for k in state_dict.keys()):
             print("   Removing 'module.' prefix...")
             state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            
+        # Remove 'model.' prefix if present (e.g. from some wrappers)
+        if any(k.startswith('model.') for k in state_dict.keys()):
+            print("   Removing 'model.' prefix...")
+            state_dict = {k.replace('model.', ''): v for k, v in state_dict.items()}
         
         # Remove '_orig_mod.model.' prefix from torch.compile
         if any(k.startswith('_orig_mod.model.') for k in state_dict.keys()):
@@ -182,13 +206,13 @@ class ModelLoader:
         print(f"   Sample key after cleanup: {sample_key_after}")
         
         # Load weights
-        print("📥 Loading weights...")
+        print(" Loading weights...")
         missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
         
         if missing_keys:
-            print(f"⚠️  Missing keys: {missing_keys}")
+            print(f"  Missing keys: {missing_keys}")
         if unexpected_keys:
-            print(f"⚠️  Unexpected keys: {unexpected_keys}")
+            print(f"  Unexpected keys: {unexpected_keys}")
         
         # Set to evaluation mode (CRITICAL for inference)
         self.model.eval()
@@ -206,13 +230,13 @@ class ModelLoader:
         total_params = sum(p.numel() for p in self.model.parameters())
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         
-        print(f"\n✅ Model loaded successfully!")
+        print(f"\n Model loaded successfully!")
         print(f"   Total parameters: {total_params:,}")
         print(f"   Trainable parameters: {trainable_params:,}")
         print(f"   Device: {self.device}")
         
         if quantized:
-            print(f"   🔥 Quantized model (BNN/INT8)")
+            print(f"    Quantized model (BNN/INT8)")
         
         return self.model
     
@@ -231,7 +255,7 @@ class ModelLoader:
         with open(output_path, 'w') as f:
             json.dump(info, f, indent=2)
         
-        print(f"💾 Model info saved to: {output_path}")
+        print(f" Model info saved to: {output_path}")
 
 
 def load_bnn_model(checkpoint_path: str, device: str = 'cpu') -> TinyRecursiveReasoningModel_ACTV1:
@@ -273,4 +297,4 @@ if __name__ == "__main__":
     if args.save_info:
         loader.save_model_info(args.save_info)
     
-    print("\n🎯 Model ready for inference!")
+    print("\n Model ready for inference!")

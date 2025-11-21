@@ -1,4 +1,4 @@
-from typing import Optional, Any, Sequence, List
+from typing import Optional, Any, Sequence, List, Dict
 from dataclasses import dataclass
 from pathlib import Path
 import os
@@ -11,6 +11,11 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 import numpy as np
+try:
+    import psutil
+except ImportError:
+    psutil = None
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from utils.env_setup import setup_training_env
 setup_training_env()
@@ -214,6 +219,8 @@ class TrainState:
     last_checkpoint_step: int = 0  # Track last saved checkpoint
     representation_frozen: bool = False  # Track if representation layers are frozen
     nan_count: int = 0  # Track NaN occurrences for optimizer fallback
+    scaler: Optional[Any] = None  # GradScaler for mixed precision
+    device: torch.device = torch.device("cpu")  # Device for tensors
 
 
 
@@ -236,7 +243,7 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
         features = detect_dataset_features(dataset_path) if os.path.exists(dataset_path) else {'is_capsule': semantic_mode, 'has_checksums': False, 'has_children': False, 'enable_dqn': False}
     
     if rank == 0 and features['is_capsule']:
-        print(f"\n🔍 Auto-detected HESC capsule dataset")
+        print(f"\n[INFO] Auto-detected HESC capsule dataset")
         print(f"   Checksums: {features['has_checksums']}")
         print(f"   Children: {features['has_children']}")
         print(f"   DQN recommended: {features['enable_dqn']}")
@@ -259,7 +266,7 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
                 f"Build with: python dataset/build_multimodal_dataset.py build_text --input_file wikitext2 --output_dir {os.path.dirname(capsule_path)}"
             )
         
-        print(f"\n📦 Loading multimodal capsule dataset: {capsule_path}")
+        print(f"\n[LOAD] Loading multimodal capsule dataset: {capsule_path}")
         data = torch.load(capsule_path)
         
         # Import CapsuleState for expansion tracking
@@ -391,7 +398,7 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
     dataloader = DataLoader(
         dataset,
         batch_size=None,
-        num_workers=1,
+        num_workers=2,
         prefetch_factor=8,
         pin_memory=True,
         persistent_workers=True
@@ -473,7 +480,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         # Even backend='eager' triggers AUTOTUNE and deferred cudagraphs that consume 14GB+
         # AUTOTUNE benchmarks multiple implementations, allocating temporary buffers
         if rank == 0:
-            print("\n⚠️  torch.compile DISABLED due to memory constraints")
+            print("\n[WARNING] torch.compile DISABLED due to memory constraints")
             print("   Reason: Even eager backend triggers AUTOTUNE addmm benchmarking")
             print("   AUTOTUNE allocates temporary buffers for each kernel variant")
             print("   This causes OOM on 15GB GPU with 366M parameter model")
@@ -512,7 +519,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
                 return optimizer
             except Exception as e:
                 if rank == 0:
-                    print(f"  ⚠️  bitsandbytes failed: {e}, falling back to standard optimizer")
+                    print(f"  [WARNING] bitsandbytes failed: {e}, falling back to standard optimizer")
         
         # Priority 2: Force AdamW if configured
         if config.optimizer_type == "adamw":
@@ -528,7 +535,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             except Exception as e:
                 if config.enable_optimizer_fallback:
                     if rank == 0:
-                        print(f"  ⚠️  AdamAtan2 failed: {e}")
+                        print(f"  [WARNING] AdamAtan2 failed: {e}")
                         print(f"  Falling back to AdamW optimizer for {optimizer_type}")
                     optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=wd, betas=betas)
                 else:
@@ -581,18 +588,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
 
     return model, optimizers, optimizer_lrs
 
-def mix_weights_direct(device, alpha, net, nets):
-    sd = []
-    for i in range(len(nets)):
-        sd += [nets[i].state_dict()]
-    sd_alpha = {}
-    for k in sd[0].keys():
-        comb_net = alpha[0]*sd[0][k].to(device)
-        for i in range(1,len(nets)):
-            comb_net += alpha[i]*sd[i][k].to(device)
-        sd_alpha[k] =  comb_net
-    net.load_state_dict(sd_alpha)
-    return net
+
 
 def cosine_schedule_with_warmup_lr_lambda(
     current_step: int, *, base_lr: float, num_warmup_steps: int, num_training_steps: int, min_ratio: float = 0.0, num_cycles: float = 0.5
@@ -652,15 +648,19 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     # AUTOTUNE benchmarks multiple kernel implementations
     # Re-enabled with safer configuration
     if getattr(config, 'compile_model', True):
-        if rank == 0:
-            print(f"   🚀 Compiling model with torch.compile (mode='default')...")
-        # Use 'default' mode which is safer than 'max-autotune' for memory
-        # 'reduce-overhead' is also good for small batches but can be memory hungry
-        try:
-            model = torch.compile(model, mode='default')
-        except Exception as e:
+        if os.name == 'nt':
+             if rank == 0:
+                 print(f"   [INFO] torch.compile disabled on Windows (experimental support)")
+        else:
             if rank == 0:
-                print(f"   ⚠️  torch.compile failed: {e}. Proceeding without compilation.")
+                print(f"   [INFO] Compiling model with torch.compile (mode='default')...")
+            # Use 'default' mode which is safer than 'max-autotune' for memory
+            # 'reduce-overhead' is also good for small batches but can be memory hungry
+            try:
+                model = torch.compile(model, mode='default')
+            except Exception as e:
+                if rank == 0:
+                    print(f"   [WARNING] torch.compile failed: {e}. Proceeding without compilation.")
 
     return TrainState(
         step=0,
@@ -670,7 +670,9 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         original_model=original_model,  # Store for EMA and parameter counting
         optimizers=optimizers,
         optimizer_lrs=optimizer_lrs,
-        carry=None
+        carry=None,
+        scaler=GradScaler(enabled=torch.cuda.is_available()) if getattr(config, 'use_mixed_precision', True) else None,
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
 
 
@@ -760,6 +762,86 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 
     return evaluators
 
+def prepare_batch(batch: Any, device: torch.device, config: PretrainConfig) -> Dict[str, Any]:
+    """
+    Prepare batch for training: process vision samples, move to device, handle capsules.
+    """
+    # Handle raw_samples format (vision-unified pipeline) OR pre-processed vision batch
+    if isinstance(batch, dict) and ('raw_samples' in batch or 'images' in batch):
+        if 'raw_samples' in batch and 'images' not in batch:
+            batch = process_vision_batch(batch)
+        
+        # Move new tensors to device
+        if 'images' in batch:
+            batch['images'] = batch['images'].to(device, non_blocking=True)
+        if 'target_images' in batch:
+            batch['target_images'] = batch['target_images'].to(device, non_blocking=True)
+        
+        # Map to model inputs
+        if 'images' in batch:
+            batch = {
+                'inputs': batch['images'],
+                'targets': batch.get('target_images'),
+                'puzzle_identifiers': batch['puzzle_identifiers'].to(device),
+                'labels': torch.zeros(batch['images'].shape[0], dtype=torch.long, device=device)
+            }
+    # Handle HESC capsules (tuple) vs dict batches
+    elif isinstance(batch, tuple):
+        # HESC mode: batch from TensorDataset
+        if len(batch) == 3:
+            # Capsules with children: (sketches, checksums, children)
+            sketches, checksums, children = batch
+            batch = {
+                'inputs': sketches.to(device),
+                'capsule_sketches': sketches.to(device),
+                'capsule_checksums': checksums.to(device),
+                'capsule_children': children.to(device),
+                'labels': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
+                'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).to(device) # Dummy
+            }
+        elif len(batch) == 2:
+             # Capsules without children: (sketches, checksums)
+             sketches, checksums = batch
+             batch = {
+                'inputs': sketches.to(device),
+                'capsule_sketches': sketches.to(device),
+                'capsule_checksums': checksums.to(device),
+                'labels': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
+                'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
+                'num_expansions': torch.zeros(sketches.shape[0], dtype=torch.long).to(device)
+             }
+        else:
+            # Legacy semantic: (embeddings,)
+            embeddings = batch[0].to(device)
+            batch = {
+                'inputs': embeddings,
+                'labels': torch.zeros(embeddings.shape[0], dtype=torch.long).to(device),
+                'puzzle_identifiers': torch.zeros(embeddings.shape[0], dtype=torch.long).to(device)
+            }
+    elif isinstance(batch, dict):
+        # Standard dict batch
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                batch[k] = v.to(device, non_blocking=True)
+                
+    # Add CapsuleState for expansion tracking (if enabled)
+    if hasattr(config.arch, 'enable_capsule_expansion') and config.arch.enable_capsule_expansion:
+        if 'inputs' in batch and batch['inputs'].dim() == 3:
+            from models.capsule_state import CapsuleState
+            
+            children = batch.get('capsule_children', None)
+            checksums = batch.get('capsule_checksums', None)
+            
+            capsule_state = CapsuleState(
+                sketches=batch['inputs'].clone(),
+                children=children,
+                checksums=checksums
+            )
+            batch['capsule_state'] = capsule_state
+            
+    return batch
+
+
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int, gradient_monitor=None):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
@@ -782,7 +864,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             # Freeze representation layers (h_blocks, l_blocks)
             if rank == 0:
                 print(f"\n{'='*70}")
-                print(f"  🔒 DQN WARMUP: Freezing representation layers")
+                print(f"  [LOCKED] DQN WARMUP: Freezing representation layers")
                 print(f"  Steps 0-{dqn_warmup_steps}: Supervised learning only")
                 print(f"  Step {dqn_warmup_steps}+: Full DQN training")
                 print(f"  Warmup ratio: {config.dqn_warmup_ratio*100:.1f}% of training")
@@ -798,7 +880,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             # Unfreeze after warmup
             if rank == 0:
                 print(f"\n{'='*70}")
-                print(f"  🔓 DQN WARMUP COMPLETE: Unfreezing representation layers")
+                print(f"  [UNLOCKED] DQN WARMUP COMPLETE: Unfreezing representation layers")
                 print(f"  Full model training enabled")
                 print(f"{'='*70}\n")
             
@@ -807,82 +889,14 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             
             train_state.representation_frozen = False
 
-    # Handle raw_samples format (vision-unified pipeline)
-    if isinstance(batch, dict) and 'raw_samples' in batch:
-        batch = process_vision_batch(batch)
-        
-        # Move new tensors to device
-        if 'images' in batch:
-            batch['images'] = batch['images'].to(train_state.device, non_blocking=True)
-        if 'target_images' in batch:
-            batch['target_images'] = batch['target_images'].to(train_state.device, non_blocking=True)
-        # Map to model inputs
-        batch = {
-            'inputs': batch['images'],
-            'targets': batch['target_images'],
-            'puzzle_identifiers': batch['puzzle_identifiers'].to(train_state.device),
-            'labels': torch.zeros(batch['images'].shape[0], dtype=torch.long, device=train_state.device)
-        }
-    # Handle HESC capsules (tuple) vs dict batches
-    elif isinstance(batch, tuple):
-        # HESC mode: batch from TensorDataset
-        if len(batch) == 3:
-            # Capsules with children: (sketches, checksums, children)
-            sketches, checksums, children = batch
-            batch = {
-                'inputs': sketches.to(device),
-                'capsule_sketches': sketches.to(device),
-                'capsule_checksums': checksums.to(device),
-                'capsule_children': children.to(device),
-                'labels': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
-                'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
-                'num_expansions': torch.zeros(sketches.shape[0], dtype=torch.long).to(device)
-            }
-        elif len(batch) == 2:
-            # Capsules without children: (sketches, checksums)
-            sketches, checksums = batch
-            batch = {
-                'inputs': sketches.to(device),
-                'capsule_sketches': sketches.to(device),
-                'capsule_checksums': checksums.to(device),
-                'labels': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
-                'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
-                'num_expansions': torch.zeros(sketches.shape[0], dtype=torch.long).to(device)
-            }
-        else:
-            # Legacy semantic: (embeddings,)
-            embeddings = batch[0].to(device)
-            batch = {
-                'inputs': embeddings,  # Changed from 'input' for consistency
-                'labels': torch.zeros(embeddings.shape[0], dtype=torch.long).to(device),
-                'puzzle_identifiers': torch.zeros(embeddings.shape[0], dtype=torch.long).to(device)
-            }
-    else:
-        # Standard token mode: batch is dict
-        # Handle None values (e.g., missing children/checksums in capsule mode)
-        batch = {k: v.to(device) if v is not None else None for k, v in batch.items()}
-        
-    # Add CapsuleState for expansion tracking (if enabled)
-    # Works for both tuple and dict batch modes
-    if hasattr(config.arch, 'enable_capsule_expansion') and config.arch.enable_capsule_expansion:
-        if 'inputs' in batch and batch['inputs'].dim() == 3:
-            from models.capsule_state import CapsuleState
-            
-            children = batch.get('capsule_children', None)
-            checksums = batch.get('capsule_checksums', None)
-            
-            capsule_state = CapsuleState(
-                sketches=batch['inputs'].clone(),
-                children=children,
-                checksums=checksums
-            )
-            batch['capsule_state'] = capsule_state
+    # Handle raw_samples format (vision-unified pipeline) OR pre-processed vision batch
+    # Prepare batch (process vision, move to device, handle capsules)
+    batch = prepare_batch(batch, train_state.device, config)
 
     # Init carry if it is None
     if train_state.carry is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        with torch.device(device):
-            train_state.carry = train_state.original_model.initial_carry(batch)  # type: ignore
+        # device is already in train_state.device
+        train_state.carry = train_state.original_model.initial_carry(batch)  # type: ignore
 
     # Task-Based Training (ALWAYS ENABLED - Single Unified Pipeline)
     # Model thinks for variable steps until task completion (ACT/PonderNet approach)
@@ -897,29 +911,23 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     task_completed = False
     
     for think_step in range(max_thinking_steps):
-        if think_step == 0 and rank == 0:
-            print(f"\n📊 GPU Memory at FIRST forward pass (step {train_state.step}):")
-        if torch.cuda.is_available():
-            print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
-            print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
-            print(f"  Max Allocated: {torch.cuda.max_memory_allocated()/1e9:.2f} GB")
-            print(f"  Free: {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated())/1e9:.2f} GB\n")
-        else:
-            import psutil
-            vm = psutil.virtual_memory()
-            print(f"  RAM Used: {vm.used/1e9:.2f} GB")
-            print(f"  RAM Total: {vm.total/1e9:.2f} GB\n")
+        if train_state.step == 1 and think_step == 0 and rank == 0:
+            print(f"\n[STATS] GPU Memory at FIRST forward pass (step {train_state.step}):")
+            if torch.cuda.is_available():
+                print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                print(f"  Max Allocated: {torch.cuda.max_memory_allocated()/1e9:.2f} GB")
+                print(f"  Free: {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated())/1e9:.2f} GB\n")
+            elif psutil is not None:
+                vm = psutil.virtual_memory()
+                print(f"  RAM Used: {vm.used/1e9:.2f} GB")
+                print(f"  RAM Total: {vm.total/1e9:.2f} GB\n")
         
         # Use PyTorch native CPU offloading for activations (saves 3-4GB GPU memory)
         # This moves intermediate activations to pinned CPU memory during forward pass
         with torch.autograd.graph.save_on_cpu(pin_memory=True):
             if use_amp:
                 # Use mixed precision training
-                if not hasattr(train_state, 'scaler'):
-                    from torch.amp import GradScaler
-                    train_state.scaler = GradScaler(enabled=torch.cuda.is_available())
-                
-                from torch.amp import autocast
                 device_type = "cuda" if torch.cuda.is_available() else "cpu"
                 with autocast(device_type):
                     train_state.carry, step_loss, step_metrics, _, _ = train_state.model(
@@ -978,13 +986,13 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         
         if rank == 0:
             print(f"\n{'='*70}")
-            print(f"  ⚠️  NaN/Inf DETECTED in loss at step {train_state.step}")
+            print(f"  [WARNING] NaN/Inf DETECTED in loss at step {train_state.step}")
             print(f"  NaN count: {train_state.nan_count}/{config.nan_threshold_for_fallback}")
             print(f"  Loss value: {loss.item()}")
         
         if config.enable_optimizer_fallback and train_state.nan_count >= config.nan_threshold_for_fallback:
             if rank == 0:
-                print(f"  🔄 Switching to AdamW optimizer (fallback)")
+                print(f"  [SWITCH] Switching to AdamW optimizer (fallback)")
                 print(f"{'='*70}\n")
             
             # Recreate optimizers with AdamW
@@ -1009,7 +1017,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         
         # Skip this batch
         if rank == 0:
-            print(f"  ⏭️  Skipping batch due to NaN/Inf")
+            print(f"  [SKIP] Skipping batch due to NaN/Inf")
             print(f"{'='*70}\n")
         return
 
@@ -1021,7 +1029,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     scaled_loss = loss / accumulation_steps
     
     # Backward pass with mixed precision scaling
-    if use_amp and hasattr(train_state, 'scaler'):
+    if use_amp and train_state.scaler is not None:
         # Scale loss and backward
         train_state.scaler.scale((1 / global_batch_size) * scaled_loss).backward()
     else:
@@ -1035,7 +1043,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 dist.all_reduce(param.grad)
     
     # Unscale gradients before clipping (for mixed precision)
-    if use_amp and hasattr(train_state, 'scaler'):
+    if use_amp and train_state.scaler is not None:
         train_state.scaler.unscale_(train_state.optimizers[0])
     
     # Track gradients before clipping (for monitoring)
@@ -1067,7 +1075,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 param_group['lr'] = lr_this_step
             
             # Use scaler.step() for mixed precision, or regular step()
-            if use_amp and hasattr(train_state, 'scaler'):
+            if use_amp and train_state.scaler is not None:
                 train_state.scaler.step(optim)
             else:
                 optim.step()
@@ -1075,7 +1083,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             optim.zero_grad()
         
         # Update scaler for next iteration (mixed precision)
-        if use_amp and hasattr(train_state, 'scaler'):
+        if use_amp and train_state.scaler is not None:
             train_state.scaler.update()
 
     # Reduce metrics
@@ -1530,9 +1538,9 @@ def launch(hydra_config: DictConfig):
     
     if RANK == 0 and start_iter > 0:
         print(f"\n{'='*70}")
-        print(f"  📍 Resuming from iteration {start_iter}/{total_iters}")
-        print(f"  📍 Epoch: {start_iter * train_epochs_per_iter}/{config.epochs}")
-        print(f"  📍 Step: {train_state.step}/{train_state.total_steps}")
+        print(f"  [RESUME] Resuming from iteration {start_iter}/{total_iters}")
+        print(f"  [INFO] Epoch: {start_iter * train_epochs_per_iter}/{config.epochs}")
+        print(f"  [INFO] Step: {train_state.step}/{train_state.total_steps}")
         print(f"{'='*70}\n")
     
     # Graceful shutdown handler
@@ -1561,11 +1569,11 @@ def launch(hydra_config: DictConfig):
                             }
                         )
                         checkpoint_manager.wait_for_completion()
-                    print("\n✅ Training stopped successfully!")
+                    print("\n[STOP] Training stopped successfully!")
                     print(f"   Final step: {train_state.step}/{train_state.total_steps}")
                     print(f"   Progress: {(train_state.step/train_state.total_steps)*100:.1f}%")
                     print(f"   Checkpoint saved to: {config.checkpoint_path}")
-                    print("\n💡 Resume training with the same command.\n")
+                    print("\n[INFO] Resume training with the same command.\n")
                 
                 # Clean exit
                 if dist.is_initialized():
@@ -1642,7 +1650,7 @@ def launch(hydra_config: DictConfig):
     except KeyboardInterrupt:
         if RANK == 0:
             print("\n" + "="*70)
-            print("  STOP: TRAINING INTERRUPTED (Ctrl+C)")
+            print("  [STOP] TRAINING INTERRUPTED (Ctrl+C)")
             print("="*70)
             
             # Calculate lost progress

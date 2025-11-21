@@ -83,7 +83,7 @@ def generate_training_texts(num_samples=10000):
         "y = {m}x + {b}",
         "∫{a} to {b} f(x)dx",
         "lim(x→{val}) f(x)",
-        "∑_{i=1}^{n} x_i",
+        "∑_{{i=1}}^{{n}} x_i",
     ]
     
     for _ in range(num_samples):
@@ -179,7 +179,7 @@ def train_noise2noise(
     
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        optimizer, mode='min', factor=0.5, patience=5
     )
     
     params = sum(p.numel() for p in denoiser.model.parameters())

@@ -262,6 +262,18 @@ dataset:
   use_denoiser: true                    # Always use N2N for images
   denoiser_path: 'models/checkpoints/n2n_denoiser.pt'
   cache_images: true                    # Cache rendered text images
+
+# Distillation (Phase 3)
+distillation:
+  teacher_checkpoint_dir: checkpoints/hybrid_pretrained  # Directory to search for latest teacher checkpoint
+  temperature: 2.0
+  alpha: 0.5                            # Weight for distillation loss
+  student_config:                       # Overrides for student model (if different from main model)
+    # Example: smaller model
+    # arch:
+    #   H_layers: 2
+    #   L_layers: 2
+    null  # Use same config as teacher by default
   
 # Expected Benefits (REALISTIC ESTIMATES - not yet measured)
 # These are aspirational targets, not empirical results

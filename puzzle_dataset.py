@@ -10,6 +10,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from models.losses import IGNORE_LABEL_ID
 from dataset.common import PuzzleDatasetMetadata
+from utils.data_processing import process_vision_batch
 
 from argdantic import ArgParser
 from pydantic import BaseModel
@@ -307,10 +308,16 @@ class PuzzleDataset(IterableDataset):
     def _package_batch(self, dataset, sample_indices, puzzle_identifier_indices):
         if "raw_samples" in dataset:
             batch_samples = [dataset["raw_samples"][i] for i in sample_indices]
-            return {
+            batch = {
                 "raw_samples": batch_samples,
                 "puzzle_identifiers": torch.from_numpy(dataset["puzzle_identifiers"][puzzle_identifier_indices].astype(np.int32))
             }
+            # Process vision batch in worker process (parallel)
+            batch = process_vision_batch(batch)
+            # Remove raw_samples to save IPC bandwidth
+            if 'raw_samples' in batch:
+                del batch['raw_samples']
+            return batch
         else:
             return self._collate_batch({
                 "inputs": dataset["inputs"][sample_indices],

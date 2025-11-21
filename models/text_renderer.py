@@ -28,7 +28,7 @@ def ensure_dejavu_font_installed():
     print("Installing DejaVuSansMono font...")
     
     if os.name == 'nt':
-        print("Windows detected: Skipping font installation. Please install DejaVuSansMono manually if needed.")
+        # print("Windows detected: Skipping font installation. Please install DejaVuSansMono manually if needed.")
         return "arial.ttf"  # Fallback for Windows
 
     try:
@@ -418,7 +418,7 @@ if __name__ == "__main__":
     renderer = TextRenderer(width=224, height=224, font_size=14)
     img = renderer.render_plain_text(sample_text)
     img.save("test_plain.png")
-    print("✓ Saved test_plain.png")
+    print("[OK] Saved test_plain.png")
     
     # Test 2: Code
     sample_code = """def hello_world():
@@ -427,7 +427,7 @@ if __name__ == "__main__":
 """
     img = renderer.render_code(sample_code, language='python')
     img.save("test_code.png")
-    print("✓ Saved test_code.png")
+    print("[OK] Saved test_code.png")
     
     # Test 3: Batch rendering
     texts = [
@@ -436,6 +436,6 @@ if __name__ == "__main__":
         "Another plain text"
     ]
     batch = renderer.render_batch(texts)
-    print(f"✓ Batch shape: {batch.shape}")
+    print(f"[OK] Batch shape: {batch.shape}")
     
     print("\nAll tests passed!")
