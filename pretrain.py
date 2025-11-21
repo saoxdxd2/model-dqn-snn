@@ -651,6 +651,17 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         print(f"   Total training steps: {total_steps:,} ({config.epochs} epochs)")
 
     # Model (pass total_steps for annealing)
+    # Clear cache before model creation to avoid OOM
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    # Check if dataset is empty (which might happen if build failed or was interrupted)
+    if train_metadata.total_puzzles == 0:
+        print("\n[WARN] Dataset appears to be empty (0 samples).")
+        # Raise FileNotFoundError to trigger auto-build logic if enabled
+        raise FileNotFoundError("Dataset is empty (0 samples). Triggering auto-build.")
+
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, rank=rank, world_size=world_size, total_steps=total_steps)
     
     # Store original model reference for parameter access and EMA
