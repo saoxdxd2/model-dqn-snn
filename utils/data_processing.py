@@ -102,15 +102,31 @@ def detect_dataset_features(data_path: str) -> Dict[str, Any]:
     for path in capsule_paths:
         if os.path.exists(path):
             try:
-                data = torch.load(path, map_location='cpu')
-                if 'sketches' in data:
+                # Attempt to load with mmap if possible, or just check file size
+                # If file is small (<1GB), try loading keys. If large, assume it has features based on name.
+                file_size = os.path.getsize(path)
+                if file_size < 1024 * 1024 * 1024:  # < 1GB
+                    # Use weights_only=False because it's a dictionary, but map to CPU
+                    data = torch.load(path, map_location='cpu', weights_only=False)
+                    if isinstance(data, dict) and 'sketches' in data:
+                        features['is_capsule'] = True
+                        features['has_checksums'] = 'checksums' in data
+                        features['has_children'] = 'children' in data
+                        features['enable_expansion'] = features['has_children']
+                        features['enable_dqn'] = features['enable_expansion']
+                        del data # Free memory immediately
+                        return features
+                else:
+                    # Large file, assume standard capsule format if name matches
+                    print(f"[INFO] Detected large capsule dataset ({file_size/1e9:.2f} GB). Assuming standard features.")
                     features['is_capsule'] = True
-                    features['has_checksums'] = 'checksums' in data
-                    features['has_children'] = 'children' in data
-                    features['enable_expansion'] = features['has_children']
-                    features['enable_dqn'] = features['enable_expansion']
+                    features['has_checksums'] = True # Assume standard format has these
+                    features['has_children'] = True
+                    features['enable_expansion'] = True
+                    features['enable_dqn'] = True
                     return features
-            except Exception:
+            except Exception as e:
+                print(f"[WARN] Failed to probe dataset features: {e}")
                 pass
     
     # Detect from path patterns
