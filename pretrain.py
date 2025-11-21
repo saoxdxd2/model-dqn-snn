@@ -248,101 +248,9 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
         print(f"   Children: {features['has_children']}")
         print(f"   DQN recommended: {features['enable_dqn']}")
     
-    if semantic_mode:
-        # Load unified multimodal capsule dataset
-        import torch
-        
-        # Construct capsule path - handle both explicit semantic_dataset and data_paths override
-        if hasattr(config, 'semantic_dataset') and config.semantic_dataset:
-            capsule_path = config.semantic_dataset.replace('semantic_embeddings', 'capsule_dataset') if split == 'train' else config.semantic_eval_dataset.replace('semantic_embeddings', 'capsule_dataset')
-        else:
-            # Fallback: construct from data_paths
-            base_path = config.data_paths[0] if split == 'train' else (config.data_paths_test[0] if config.data_paths_test else config.data_paths[0])
-            capsule_path = os.path.join(base_path, 'capsule_dataset.pt' if split == 'train' else 'capsule_dataset_test.pt')
-        
-        if not os.path.exists(capsule_path):
-            raise FileNotFoundError(
-                f"Capsule dataset not found: {capsule_path}\n"
-                f"Build with: python dataset/build_multimodal_dataset.py build_text --input_file wikitext2 --output_dir {os.path.dirname(capsule_path)}"
-            )
-        
-        print(f"\n[LOAD] Loading multimodal capsule dataset: {capsule_path}")
-        if psutil:
-            print(f"   Pre-load RAM: {psutil.Process().memory_info().rss / 1024**3:.2f} GB")
+    # Unified dataset loading using PuzzleDataset
+    # This handles both standard token datasets and new streaming capsule datasets
 
-        # Use mmap=True for lazy loading (requires PyTorch >= 2.1)
-        # This keeps tensors on disk until accessed, saving massive RAM
-        try:
-            data = torch.load(capsule_path, map_location='cpu', mmap=True, weights_only=False)
-        except TypeError:
-            # Fallback for older PyTorch versions or if mmap not supported for this file
-            print("[WARN] mmap=True failed, falling back to standard load (high RAM usage)")
-            data = torch.load(capsule_path, map_location='cpu', weights_only=False)
-        
-        # Import CapsuleState for expansion tracking
-        from models.capsule_state import CapsuleState
-        
-        # Extract components (unified format)
-        sketches = data['sketches']  # [N, k, hidden_size]
-        checksums = data.get('checksums', None)
-        children = data.get('children', None)
-        
-        print(f"   Samples: {sketches.shape[0]}, Capsules: {sketches.shape[1]}, Dim: {sketches.shape[2]}")
-        if children is not None:
-            print(f"   Expandable: {children.shape[2]} children per capsule")
-        
-        # Metadata with concept vocabulary
-        num_concepts = getattr(config.arch, 'num_concepts', 2048)
-        vocab_size = num_concepts + 4  # Concept vocab + control symbols
-        
-        metadata = PuzzleDatasetMetadata(
-            seq_len=sketches.shape[1],
-            vocab_size=vocab_size,
-            pad_id=0,
-            ignore_label_id=-100,
-            blank_identifier_id=0,
-            num_puzzle_identifiers=0,
-            total_groups=sketches.shape[0],
-            mean_puzzle_examples=1.0,
-            total_puzzles=sketches.shape[0],
-            sets=["all"]
-        )
-        
-        # Store children and checksums for batch-time CapsuleState creation
-        # These will be accessed by index during training
-        dataset_children = children  # [N, k, m, D] or None
-        dataset_checksums = checksums  # [N, k, R] or None
-        
-        # Create dataset with available components
-        from torch.utils.data import TensorDataset
-        if children is not None and checksums is not None:
-            dataset = TensorDataset(sketches, checksums, children)
-        elif checksums is not None:
-            dataset = TensorDataset(sketches, checksums)
-        else:
-            dataset = TensorDataset(sketches)
-        
-        # Explicitly delete 'data' dict to free reference (though mmap tensors keep file open)
-        del data
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-        if psutil:
-            print(f"   Post-load RAM: {psutil.Process().memory_info().rss / 1024**3:.2f} GB")
-
-        
-        local_batch_size = config.global_batch_size // world_size
-        raw_dataloader = DataLoader(
-            dataset,
-            batch_size=local_batch_size,
-            shuffle=(split == 'train'),
-            num_workers=0,
-            pin_memory=True
-        )
-        
-        wrapped_dataloader = CapsuleDataLoaderWrapper(raw_dataloader, config.global_batch_size)
-        return wrapped_dataloader, metadata
-    
     # Token-based mode (original logic)
     dataset_paths = config.data_paths if split == 'train' else config.data_paths_test
     
@@ -870,8 +778,22 @@ def prepare_batch(batch: Any, device: torch.device, config: PretrainConfig) -> D
     elif isinstance(batch, dict):
         # Standard dict batch
         for k, v in batch.items():
+            # Convert numpy to tensor
+            if isinstance(v, np.ndarray):
+                v = torch.from_numpy(v)
+                batch[k] = v
+                
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(device, non_blocking=True)
+        
+        # Map PuzzleDataset keys to Capsule keys if 3D inputs (sketches)
+        if 'inputs' in batch and batch['inputs'].dim() == 3:
+             if 'capsule_sketches' not in batch:
+                 batch['capsule_sketches'] = batch['inputs']
+             if 'labels' in batch and 'capsule_checksums' not in batch:
+                 batch['capsule_checksums'] = batch['labels']
+             if 'children' in batch and 'capsule_children' not in batch:
+                 batch['capsule_children'] = batch['children']
                 
     # Add CapsuleState for expansion tracking (if enabled)
     if hasattr(config.arch, 'enable_capsule_expansion') and config.arch.enable_capsule_expansion:

@@ -383,9 +383,31 @@ class PuzzleDataset(IterableDataset):
                             group_indices = np.arange(num_samples + 1, dtype=np.int32)
                             puzzle_indices = np.arange(num_samples + 1, dtype=np.int32)
                             
+                            # Load children from metadata if available
+                            all_children = []
+                            for sf in safetensors_files:
+                                meta_file = str(sf).replace('.safetensors', '_meta.json')
+                                if os.path.exists(meta_file):
+                                    try:
+                                        with open(meta_file, 'r') as f:
+                                            meta = json.load(f)
+                                            if 'children' in meta:
+                                                all_children.extend(meta['children'])
+                                    except Exception as e:
+                                        print(f"[WARN] Failed to load metadata {meta_file}: {e}")
+
+                            children = None
+                            if all_children:
+                                try:
+                                    children = np.array(all_children)
+                                    print(f"[INFO] Loaded {len(children)} children records")
+                                except Exception as e:
+                                    print(f"[ERROR] Failed to convert children to numpy: {e}")
+
                             self._data[set_name_] = {
                                 "inputs": inputs,
                                 "labels": labels,
+                                "children": children,
                                 "puzzle_identifiers": np.arange(num_samples, dtype=np.int32),
                                 "puzzle_indices": puzzle_indices,
                                 "group_indices": group_indices
@@ -501,6 +523,8 @@ class PuzzleDataset(IterableDataset):
             }
             if dataset["labels"] is not None:
                 batch_data["labels"] = dataset["labels"][sample_indices]
+            if dataset.get("children") is not None:
+                batch_data["children"] = dataset["children"][sample_indices]
             
             return self._collate_batch(batch_data)
 
