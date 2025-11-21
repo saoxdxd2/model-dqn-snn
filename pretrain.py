@@ -942,10 +942,9 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     # Prepare batch (process vision, move to device, handle capsules)
     batch = prepare_batch(batch, train_state.device, config)
 
-    # Init carry if it is None
-    if train_state.carry is None:
-        # device is already in train_state.device
-        train_state.carry = train_state.original_model.initial_carry(batch)  # type: ignore
+    # Always initialize fresh carry for new batch (independent puzzles)
+    # This prevents memory leaks (graph persistence) and state contamination
+    train_state.carry = train_state.original_model.initial_carry(batch)  # type: ignore
 
     # Task-Based Training (ALWAYS ENABLED - Single Unified Pipeline)
     # Model thinks for variable steps until task completion (ACT/PonderNet approach)
