@@ -93,7 +93,22 @@ class StreamingCacheEncoder:
         self.cached_count = 0  # Number of samples cached so far
         self.cache_threshold_reached = threading.Event()  # Signal when threshold reached
         self.new_batches_start_idx = 0  # Index where NEW batches start (after resume)
-        self.new_batches_start_idx = 0  # Index where NEW batches start (after resume)
+        self.new_batches_start_idx = 0  # Index where New batches start (after resume)
+        
+        # Cleanup stale temp files from previous runs
+        self._cleanup_stale_temp_files()
+
+    def _cleanup_stale_temp_files(self):
+        """Clean up any stuck temp metadata files from previous runs."""
+        import glob
+        stale_files = glob.glob("temp_*_meta.json")
+        if stale_files:
+            print(f"Cleaning up {len(stale_files)} stale temp metadata files...", flush=True)
+            for f in stale_files:
+                try:
+                    os.remove(f)
+                except Exception as e:
+                    print(f"Warning: Could not remove stale file {f}: {e}", flush=True)
         
     def producer_thread(self, samples, renderer, start_threshold=50000):
         """
@@ -471,9 +486,9 @@ class StreamingCacheEncoder:
              print(f"DEBUG: First child type: {type(consolidated_meta['children'][0])}", flush=True)
 
         print(f"DEBUG: Saving metadata to {consolidated_meta_file}...", flush=True)
+        temp_meta_file = f"temp_{next_chunk_id:03d}_meta.json"
         try:
             # Write to local temp file first to avoid network drive timeouts/hangs
-            temp_meta_file = f"temp_{next_chunk_id:03d}_meta.json"
             print(f"DEBUG: Writing to temp file {temp_meta_file}...", flush=True)
             with open(temp_meta_file, 'w') as f:
                 json.dump(consolidated_meta, f)
@@ -485,10 +500,14 @@ class StreamingCacheEncoder:
             print(f"DEBUG: Saved metadata file.", flush=True)
         except Exception as e:
             print(f"DEBUG: Error saving metadata: {e}", flush=True)
-            # Clean up temp file if it exists
-            if os.path.exists(temp_meta_file):
-                os.remove(temp_meta_file)
             raise e
+        finally:
+            # Clean up temp file if it exists (success or failure)
+            if os.path.exists(temp_meta_file):
+                try:
+                    os.remove(temp_meta_file)
+                except Exception as cleanup_error:
+                    print(f"DEBUG: Failed to cleanup temp file {temp_meta_file}: {cleanup_error}", flush=True)
             
         self.drive_checkpoints.append(consolidated_file)
         print(f"DEBUG: Appended to drive_checkpoints: {consolidated_file}", flush=True)
