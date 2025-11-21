@@ -455,15 +455,27 @@ class StreamingCacheEncoder:
         consolidated_meta_file = os.path.join(save_dir, f"consolidated_{next_chunk_id:03d}_meta.json")
         
         if consolidated_tensors:
-            print(f"DEBUG: Saving consolidated file {consolidated_file}...")
+            print(f"DEBUG: Saving consolidated file {consolidated_file}...", flush=True)
             save_file(consolidated_tensors, consolidated_file)
-            print(f"DEBUG: Saved consolidated file.")
-        with open(consolidated_meta_file, 'w') as f:
-            json.dump(consolidated_meta, f)
+            print(f"DEBUG: Saved consolidated file.", flush=True)
+        
+        # Free memory immediately to prevent OOM during JSON dump
+        del consolidated_tensors
+        print(f"DEBUG: Freed consolidated_tensors memory.", flush=True)
+        gc.collect()
+
+        print(f"DEBUG: Saving metadata to {consolidated_meta_file}...", flush=True)
+        try:
+            with open(consolidated_meta_file, 'w') as f:
+                json.dump(consolidated_meta, f)
+            print(f"DEBUG: Saved metadata file.", flush=True)
+        except Exception as e:
+            print(f"DEBUG: Error saving metadata: {e}", flush=True)
+            raise e
             
         self.drive_checkpoints.append(consolidated_file)
-        print(f"DEBUG: Appended to drive_checkpoints: {consolidated_file}")
-        del consolidated_tensors
+        print(f"DEBUG: Appended to drive_checkpoints: {consolidated_file}", flush=True)
+        
         del consolidated_meta
         gc.collect()
         
