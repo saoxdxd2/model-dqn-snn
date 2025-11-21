@@ -267,7 +267,14 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             )
         
         print(f"\n[LOAD] Loading multimodal capsule dataset: {capsule_path}")
-        data = torch.load(capsule_path)
+        # Use mmap=True for lazy loading (requires PyTorch >= 2.1)
+        # This keeps tensors on disk until accessed, saving massive RAM
+        try:
+            data = torch.load(capsule_path, map_location='cpu', mmap=True, weights_only=False)
+        except TypeError:
+            # Fallback for older PyTorch versions or if mmap not supported for this file
+            print("[WARN] mmap=True failed, falling back to standard load (high RAM usage)")
+            data = torch.load(capsule_path, map_location='cpu', weights_only=False)
         
         # Import CapsuleState for expansion tracking
         from models.capsule_state import CapsuleState
@@ -311,6 +318,12 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             dataset = TensorDataset(sketches, checksums)
         else:
             dataset = TensorDataset(sketches)
+        
+        # Explicitly delete 'data' dict to free reference (though mmap tensors keep file open)
+        del data
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
         
         local_batch_size = config.global_batch_size // world_size
         raw_dataloader = DataLoader(
