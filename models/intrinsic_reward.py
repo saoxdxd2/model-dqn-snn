@@ -6,6 +6,7 @@ Implements curiosity-driven rewards, count-based bonuses, and prediction error r
 import torch
 from torch import nn, Tensor
 from typing import Dict, Optional
+from models.bitnet import BitLinear
 import numpy as np
 
 
@@ -93,20 +94,20 @@ class RandomNetworkDistillation(nn.Module):
         
         # Random target network (frozen)
         self.target_net = nn.Sequential(
-            nn.Linear(hidden_size, rnd_hidden),
+            BitLinear(hidden_size, rnd_hidden),
             nn.ReLU(),
-            nn.Linear(rnd_hidden, rnd_hidden),
+            BitLinear(rnd_hidden, rnd_hidden),
             nn.ReLU(),
-            nn.Linear(rnd_hidden, rnd_hidden)
+            BitLinear(rnd_hidden, rnd_hidden)
         )
         
         # Predictor network (learned)
         self.predictor_net = nn.Sequential(
-            nn.Linear(hidden_size, rnd_hidden),
+            BitLinear(hidden_size, rnd_hidden),
             nn.ReLU(),
-            nn.Linear(rnd_hidden, rnd_hidden),
+            BitLinear(rnd_hidden, rnd_hidden),
             nn.ReLU(),
-            nn.Linear(rnd_hidden, rnd_hidden)
+            BitLinear(rnd_hidden, rnd_hidden)
         )
         
         # Freeze target network
@@ -182,11 +183,11 @@ class ForwardDynamicsModel(nn.Module):
         
         # Forward dynamics model
         self.dynamics_net = nn.Sequential(
-            nn.Linear(hidden_size + num_actions, dynamics_hidden),
+            BitLinear(hidden_size + num_actions, dynamics_hidden),
             nn.ReLU(),
-            nn.Linear(dynamics_hidden, dynamics_hidden),
+            BitLinear(dynamics_hidden, dynamics_hidden),
             nn.ReLU(),
-            nn.Linear(dynamics_hidden, hidden_size)
+            BitLinear(dynamics_hidden, hidden_size)
         )
     
     def forward(self, state: Tensor, action: Tensor) -> Tensor:

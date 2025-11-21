@@ -113,7 +113,7 @@ def compress_model_for_deployment(model: nn.Module, target_config: dict) -> nn.M
     Returns:
         compressed_model: Smaller model for deployment
     """
-    print(f"\n🗜️  Compressing model for deployment...")
+    print(f"\nCOMPRESS: Compressing model for deployment...")
     print(f"   Target: {target_config.get('hidden_size', 768)}D, {target_config.get('num_heads', 12)} heads")
     
     # Strategy: Knowledge distillation via weight truncation
@@ -139,7 +139,7 @@ def compress_model_for_deployment(model: nn.Module, target_config: dict) -> nn.M
         else:
             compressed_state[name] = param
     
-    print(f"   ✓ Compressed from {sum(p.numel() for p in model.parameters())/1e6:.1f}M to {sum(p.numel() for p in compressed_state.values())/1e6:.1f}M params")
+    print(f"   DONE: Compressed from {sum(p.numel() for p in model.parameters())/1e6:.1f}M to {sum(p.numel() for p in compressed_state.values())/1e6:.1f}M params")
     
     return compressed_state
 
@@ -253,7 +253,7 @@ def export_to_openvino(
     import tempfile
     import os
     
-    print(f"\n📦 Exporting to OpenVINO IR format...")
+    print(f"\nEXPORT: Exporting to OpenVINO IR format...")
     print(f"   Input shape: {input_shape}")
     print(f"   FP16: {fp16}")
     if optimize_for_igpu:
@@ -280,7 +280,7 @@ def export_to_openvino(
             do_constant_folding=True
         )
         
-        print(f"   ✓ ONNX export complete")
+        print(f"   DONE: ONNX export complete")
         
         # Step 2: Convert ONNX to OpenVINO IR with iGPU optimizations
         convert_args = {
@@ -295,12 +295,12 @@ def export_to_openvino(
         
         model_ir = mo.convert_model(onnx_path, **convert_args)
         
-        print(f"   ✓ OpenVINO IR conversion complete")
+        print(f"   DONE: OpenVINO IR conversion complete")
         
         # Step 3: Save IR files
         ov.save_model(model_ir, output_path)
         
-    print(f"   ✓ Saved to: {output_path}")
+    print(f"   DONE: Saved to: {output_path}")
     
     # Print deployment info
     model_size_mb = os.path.getsize(output_path.replace('.xml', '.bin')) / (1024 ** 2)
@@ -310,7 +310,7 @@ def export_to_openvino(
         print(f"   Compression: ~2× (FP16)")
     
     if optimize_for_igpu:
-        print(f"   \n💡 Deployment tips for Intel i5-1035G1 + UHD Graphics:")
+        print(f"   \nTIP: Deployment tips for Intel i5-1035G1 + UHD Graphics:")
         print(f"      - Use device='GPU' in OpenVINO runtime")
         print(f"      - Batch size 1-4 for low latency")
         print(f"      - Expected latency: 40-100ms on UHD Graphics")
@@ -344,7 +344,7 @@ def benchmark_openvino(
     
     import time
     
-    print(f"\n⚡ Benchmarking OpenVINO on {device}...")
+    print(f"\nBENCHMARK: Benchmarking OpenVINO on {device}...")
     
     # Initialize OpenVINO runtime
     core = ov.Core()
@@ -354,7 +354,7 @@ def benchmark_openvino(
     print(f"   Available devices: {available_devices}")
     
     if device not in available_devices:
-        print(f"   ⚠️  {device} not available, falling back to CPU")
+        print(f"   WARNING: {device} not available, falling back to CPU")
         device = 'CPU'
     
     # Load model

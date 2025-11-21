@@ -25,8 +25,12 @@ def ensure_dejavu_font_installed():
     except:
         pass
     
-    print("📦 Installing DejaVuSansMono font...")
+    print("Installing DejaVuSansMono font...")
     
+    if os.name == 'nt':
+        print("Windows detected: Skipping font installation. Please install DejaVuSansMono manually if needed.")
+        return "arial.ttf"  # Fallback for Windows
+
     try:
         # Clean up any broken files
         subprocess.run(["rm", "-f", font_path], check=False, stderr=subprocess.DEVNULL)
@@ -56,11 +60,11 @@ def ensure_dejavu_font_installed():
         
         # Verify installation
         font = ImageFont.truetype(font_path, 14)
-        print("✅ DejaVuSansMono font installed successfully!")
+        print("DejaVuSansMono font installed successfully!")
         return font_path
         
     except Exception as e:
-        print(f"⚠️  Font installation failed: {e}")
+        print(f"Font installation failed: {e}")
         return None
 
 
@@ -141,7 +145,7 @@ class TextRenderer:
         
         # Final fallback to default PIL font
         if not font_loaded:
-            print(f"⚠️  Font {font_family} not found, using default")
+            print(f"Font {font_family} not found, using default")
             self.font = ImageFont.load_default()
         
         # Calculate usable text area
@@ -252,7 +256,7 @@ class TextRenderer:
                 return img
                 
             except ImportError:
-                print("⚠️  pygments not installed, rendering as plain text")
+                print("WARNING: pygments not installed, rendering as plain text")
                 syntax_highlight = False
             except Exception as e:
                 # Suppress repetitive font warnings (already shown during init)
@@ -434,4 +438,4 @@ if __name__ == "__main__":
     batch = renderer.render_batch(texts)
     print(f"✓ Batch shape: {batch.shape}")
     
-    print("\n✅ All tests passed!")
+    print("\nAll tests passed!")

@@ -14,6 +14,7 @@ from models.recursive_reasoning.trm import (
     TinyRecursiveReasoningModel_ACTV1Config,
 )
 from models.layers import RotaryEmbedding, LearnedPositionalEmbedding2D
+from models.bitnet import BitLinear
 
 
 class CapsuleAttentionPool(nn.Module):
@@ -183,7 +184,7 @@ class TRMVisionEncoder(nn.Module):
             self.spatial_pool = nn.AdaptiveAvgPool2d(capsule_grid_shape)
             print(f"   Pooling: Adaptive average (grid {capsule_grid_shape})")
         
-        print(f"\n🔧 TRM Vision Encoder Initialized:")
+        print(f"\nTRM Vision Encoder Initialized:")
         print(f"   Patches: {self.num_patches} ({image_size//patch_size}×{image_size//patch_size})")
         print(f"   Hidden: {hidden_size}")
         print(f"   Layers: {num_layers}")
@@ -280,13 +281,13 @@ class TRMVisionEncoderWithChecksums(nn.Module):
         
         # Checksum head (integrity signature)
         self.checksum_head = nn.Sequential(
-            nn.Linear(hidden_size, 128),
+            BitLinear(hidden_size, 128),
             nn.ReLU(),
-            nn.Linear(128, checksum_dim)
+            BitLinear(128, checksum_dim)
         )
         
         # Children projection (for hierarchical expansion)
-        self.children_projection = nn.Linear(hidden_size, hidden_size)
+        self.children_projection = BitLinear(hidden_size, hidden_size)
     
     def _extract_topk_children(self, spatial_tokens, attention_maps, m: int = 4):
         """
@@ -385,4 +386,4 @@ if __name__ == "__main__":
     print(f"  Checksums: {output['checksums'].shape}")  # [4, 12, 32]
     print(f"  Children: {output['children'].shape}")  # [4, 12, 4, 512]
     
-    print("\n✅ TRM Vision Encoder working!")
+    print("\nTRM Vision Encoder working!")

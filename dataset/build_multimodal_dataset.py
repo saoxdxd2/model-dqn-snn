@@ -12,11 +12,13 @@ Ideal for reasoning tasks requiring multiple modalities.
 
 import sys
 import glob
+import random
 from pathlib import Path
+from typing import List, Dict, Any, Optional, Union, Set, Iterator
+
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from typing import List, Dict, Any, Optional, Union
 import numpy as np
 import torch
 from pydantic import BaseModel
@@ -36,13 +38,20 @@ try:
     TEXT_RENDERER_AVAILABLE = True
 except ImportError:
     TEXT_RENDERER_AVAILABLE = False
-    print("⚠️  TextRenderer not available - text will not be rendered to images")
+    print(f"WARNING: TextRenderer not available - text will not be rendered to images")
 
 try:
     from datasets import load_dataset
     HF_DATASETS_AVAILABLE = True
 except ImportError:
     HF_DATASETS_AVAILABLE = False
+
+try:
+    from dataset.deepseek_ocr import DeepSeekOCRProcessor
+    DEEPSEEK_OCR_AVAILABLE = True
+except ImportError:
+    DEEPSEEK_OCR_AVAILABLE = False
+
 
 
 cli = ArgParser()
@@ -67,8 +76,6 @@ class MultimodalDatasetConfig(BaseModel):
     use_capsules: bool = True
     train_split: float = 0.9
     seed: int = 42
-    
-    # Quality scoring removed - adds overhead without implemented benefit
     
     # HESC capsule config
     hidden_size: int = 768
@@ -107,6 +114,9 @@ class MultimodalDatasetConfig(BaseModel):
     maze_augment_dihedral: bool = True
     cache_images: bool = True
 
+    # DeepSeek-OCR
+    use_deepseek_ocr: bool = False  # Enable DeepSeek-OCR for PDF/Image text extraction
+
 
 @cli.command()
 def build_dataset(config: MultimodalDatasetConfig):
@@ -127,6 +137,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
     def __init__(self, config: MultimodalDatasetConfig):
         super().__init__(config)
         self.config: MultimodalDatasetConfig = config
+        self._logged_warnings: Set[str] = set()
         
         # Initialize text renderer for vision-unified pipeline
         self.text_renderer = None
@@ -135,9 +146,20 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                 width=self.config.text_image_width,
                 height=self.config.text_image_height
             )
-            print(f"✓ TextRenderer initialized: {self.config.text_image_width}×{self.config.text_image_height}")
+            print(f"TextRenderer initialized: {self.config.text_image_width}x{self.config.text_image_height}")
+
+        # Initialize DeepSeek-OCR
+        self.ocr_processor = None
+        if self.config.use_deepseek_ocr and DEEPSEEK_OCR_AVAILABLE:
+            print("Initializing DeepSeek-OCR...")
+            self.ocr_processor = DeepSeekOCRProcessor()
+            if not self.ocr_processor.is_available():
+                print("WARNING: DeepSeek-OCR failed to load (check logs). PDF processing will be limited.")
+            else:
+                print("✓ DeepSeek-OCR initialized")
+
     
-    def load_raw_data(self):
+    def load_raw_data(self) -> Iterator[DataSample]:
         """Generator: Yield samples one at a time - NEVER accumulate (fixes OOM).
         
         Memory-efficient streaming pipeline:
@@ -148,7 +170,6 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         
         Constant memory: ~2KB per sample (vs 240MB for 120K samples)
         """
-        import random
         
         # Track task groups for multi-task (minimal memory)
         task_buffer = {}  # Keep last N samples per task for distribution learning
@@ -278,24 +299,24 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         """Unified loader for HF and local sources."""
         if is_hf:
             if not HF_DATASETS_AVAILABLE:
-                print(f"⚠️  HuggingFace not available")
+                print(f"WARNING: HuggingFace not available")
                 return []
             
-            print(f"📦 Loading: {source}")
+            print(f"Loading: {source}")
             try:
                 dataset = load_dataset(source)
                 data = dataset.get('train', dataset)
                 return [self._parse_item(item, f"{source}_{i}") for i, item in enumerate(data)]
             except Exception as e:
-                print(f"❌ Failed: {e}")
+                print(f"Failed: {e}")
                 return []
         else:
             path = Path(source)
             if not path.exists():
-                print(f"⚠️  Not found: {source}")
+                print(f"Not found: {source}")
                 return []
             
-            print(f"📁 Loading: {source}")
+            print(f"Loading: {source}")
             if path.is_dir():
                 return [s for f in path.glob("**/*") if f.is_file() for s in [self._load_file(f)] if s]
             return [self._load_file(path)] if self._load_file(path) else []
@@ -329,7 +350,8 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                 sample_id=str(file_path), modality=ModalityType.GRID,
                 grid=np.load(file_path),
                 metadata={'source': str(file_path)}
-            ) if self.config.include_grids else None
+            ) if self.config.include_grids else None,
+            ('.pdf',): lambda: self._process_pdf(file_path) if self.config.include_text else None
         }
         
         for exts, loader in loaders.items():
@@ -337,10 +359,30 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                 try:
                     return loader()
                 except Exception as e:
-                    print(f"⚠️  Error loading {file_path}: {e}")
+                    print(f"Error loading {file_path}: {e}")
                     return None
         return None
     
+    def _process_pdf(self, file_path: Path) -> Optional[DataSample]:
+        """Process PDF using DeepSeek-OCR."""
+        if not self.ocr_processor or not self.ocr_processor.is_available():
+            print(f"Skipping PDF {file_path}: DeepSeek-OCR not available")
+            return None
+            
+        print(f"OCR Processing: {file_path}")
+        text = self.ocr_processor.process_pdf(file_path)
+        
+        if not text or text.startswith("[OCR ERROR]"):
+            print(f"OCR Failed for {file_path}: {text}")
+            return None
+            
+        return DataSample(
+            sample_id=str(file_path),
+            modality=ModalityType.TEXT,
+            text=text,
+            metadata={'source': str(file_path), 'ocr': 'deepseek'}
+        )
+
     def _load_arc_json(self, json_path: str) -> List[DataSample]:
         """Load ARC dataset (challenge + solution files)."""
         # Use orjson for 2-3x faster JSON parsing (C++ backend)
@@ -382,7 +424,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                         print(f"🔍 Found {challenges_file} but no solutions file")
                         return self._parse_json_format(challenges_file, 'arc')
         
-        print(f"⚠️  Skipping ARC: No training files found in {base_dir}")
+        print(f"Skipping ARC: No training files found in {base_dir}")
         return []
     
     def _load_maze_csv(self, csv_path: str) -> List[DataSample]:
@@ -404,13 +446,13 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         
         if path in hf_name_mapping:
             actual_name = hf_name_mapping[path]
-            print(f"📦 Loading: {path} (using HF: {actual_name})")
+            print(f"Loading: {path} (using HF: {actual_name})")
             try:
                 dataset = load_dataset(actual_name, 'wikitext-2-raw-v1' if 'wikitext' in actual_name else None)
                 data = dataset.get('train', dataset)
                 return [self._parse_item(item, f"{path}_{i}") for i, item in enumerate(data)]
             except Exception as e:
-                print(f"⚠️  Skipping {path}: {e}")
+                print(f"Skipping {path}: {e}")
                 return []
         # Local file chunking
         return self._chunk_text_file(path) if Path(path).exists() else []
@@ -468,12 +510,12 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
             print(f"   Loaded {len(samples)} ARC samples from {len(challenges)} tasks")
             return samples
         except Exception as e:
-            print(f"⚠️  Error parsing ARC files: {e}")
+            print(f"Error parsing ARC files: {e}")
             return []
     
-    def _load_arc_json_streaming(self, source_path: str):
+    def _load_arc_json_streaming(self, source_path: str) -> Iterator[DataSample]:
         """Streaming generator: Yield ARC samples one at a time."""
-        print(f"🔄 Streaming ARC JSON: {source_path}")
+        print(f"Streaming ARC JSON: {source_path}")
         
         try:
             import orjson as json
@@ -522,9 +564,9 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                                     metadata={'task_id': task_id, 'split': split}
                                 )
         except Exception as e:
-            print(f"⚠️  Error streaming ARC: {e}")
+            print(f"WARNING: Error streaming ARC: {e}")
     
-    def _load_rearc_infinite_streaming(self):
+    def _load_rearc_infinite_streaming(self) -> Iterator[DataSample]:
         """Streaming generator: Yield infinite Re-ARC samples on-the-fly."""
         if not self.config.use_rearc_infinite:
             return
@@ -532,7 +574,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         import sys
         rearc_path = Path(self.config.rearc_path)
         if not rearc_path.exists():
-            print(f"⚠️  Re-ARC not found at {rearc_path}")
+            print(f"WARNING: Re-ARC not found at {rearc_path}")
             return
         
         sys.path.insert(0, str(rearc_path))
@@ -540,7 +582,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         try:
             import generators
             
-            print(f"🔄 Streaming Re-ARC infinite data (on-the-fly generation)...")
+            print(f"Streaming Re-ARC infinite data (on-the-fly generation)...")
             
             generators_dict = {name[9:]: getattr(generators, name) 
                              for name in dir(generators) if name.startswith('generate_')}
@@ -562,9 +604,9 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                     except Exception:
                         continue  # Skip failed generations
             
-            print(f"   ✓ Generated {total_generated} Re-ARC samples (streaming)")
+            print(f"   Generated {total_generated} Re-ARC samples (streaming)")
         except Exception as e:
-            print(f"⚠️  Re-ARC streaming failed: {e}")
+            print(f"WARNING: Re-ARC streaming failed: {e}")
     
     def _load_rearc_infinite(self) -> List[DataSample]:
         """Load infinite synthetic ARC data from Re-ARC (Winner Strategy)."""
@@ -574,7 +616,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         import sys
         rearc_path = Path(self.config.rearc_path)
         if not rearc_path.exists():
-            print(f"⚠️  Re-ARC not found at {rearc_path}. Clone with: git clone https://github.com/michaelhodel/re-arc.git {rearc_path}")
+            print(f"WARNING: Re-ARC not found at {rearc_path}. Clone with: git clone https://github.com/michaelhodel/re-arc.git {rearc_path}")
             return []
         
         # Add Re-ARC to path
@@ -582,9 +624,8 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         
         try:
             import generators
-            from utils import format_example
             
-            print(f"🔄 Generating infinite Re-ARC data ({self.config.rearc_examples_per_task} examples per task)...")
+            print(f"Generating infinite Re-ARC data ({self.config.rearc_examples_per_task} examples per task)...")
             
             # Get all generator functions
             generators_dict = {name[9:]: getattr(generators, name) 
@@ -607,15 +648,14 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                     except Exception as e:
                         continue  # Skip failed generations
             
-            print(f"   ✓ Generated {len(samples)} synthetic ARC samples from {len(generators_dict)} tasks")
+            print(f"   Generated {len(samples)} synthetic ARC samples from {len(generators_dict)} tasks")
             return samples
         except Exception as e:
-            print(f"⚠️  Re-ARC generation failed: {e}")
+            print(f"WARNING: Re-ARC generation failed: {e}")
             return []
     
-    def _augment_sample_streaming(self, sample: DataSample):
+    def _augment_sample_streaming(self, sample: DataSample) -> Optional[DataSample]:
         """On-the-fly augmentation: Transform input OR output (Winner Strategy)."""
-        import random
         
         if sample.modality not in [ModalityType.GRID, ModalityType.MAZE]:
             return None
@@ -666,36 +706,253 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
         )
     
     # Stub streaming loaders (fallback to empty generators for unused types)
-    def _load_puzzlevqa_streaming(self, path: str):
-        return iter([])  # Stub: implement if needed
+    def _load_puzzlevqa_streaming(self, path: str) -> Iterator[DataSample]:
+        """Stream PuzzleVQA dataset."""
+        print(f"Streaming PuzzleVQA: {path}")
+        import json
+        from PIL import Image
+        
+        data_path = Path(path)
+        if data_path.is_dir():
+            annot_file = data_path / "annotations.json"
+            img_dir = data_path / "images"
+        else:
+            annot_file = Path(path)
+            img_dir = annot_file.parent / "images"
+            
+        if not annot_file.exists():
+            print(f"WARNING: PuzzleVQA annotations not found: {annot_file}")
+            return
+            
+        with open(annot_file) as f:
+            data = json.load(f)
+            
+        for item in data:
+            img_path = img_dir / item.get('image', '')
+            if img_path.exists():
+                yield DataSample(
+                    sample_id=f"puzzlevqa_{item['id']}",
+                    modality=ModalityType.IMAGE,
+                    image=np.array(Image.open(img_path).convert('RGB')),
+                    text=item.get('question', ''),
+                    label=item.get('answer'),
+                    metadata={'concept': item.get('concept'), 'source': 'puzzlevqa'}
+                )
     
-    def _load_mathv_streaming(self, path: str):
-        return iter([])  # Stub: implement if needed
+    def _load_mathv_streaming(self, path: str) -> Iterator[DataSample]:
+        """Stream MATH-V dataset."""
+        print(f"📐 Streaming MATH-V: {path}")
+        import json
+        from PIL import Image
+        import io
+        import base64
+        
+        data_path = Path(path)
+        json_files = list(data_path.glob("*.json")) if data_path.is_dir() else [Path(path)]
+        
+        for json_file in json_files:
+            with open(json_file) as f:
+                data = json.load(f)
+            
+            for item in data:
+                img = None
+                if 'image' in item:
+                    if isinstance(item['image'], str) and item['image'].startswith('data:image'):
+                        try:
+                            img_data = base64.b64decode(item['image'].split(',')[1])
+                            img = np.array(Image.open(io.BytesIO(img_data)).convert('RGB'))
+                        except:
+                            pass
+                    else:
+                        img_path = data_path / item['image']
+                        if img_path.exists():
+                            img = np.array(Image.open(img_path).convert('RGB'))
+                
+                yield DataSample(
+                    sample_id=f"mathv_{item['pid']}",
+                    modality=ModalityType.MULTIMODAL if img is not None else ModalityType.TEXT,
+                    image=img,
+                    text=item.get('question', ''),
+                    label=item.get('answer'),
+                    metadata={
+                        'subject': item.get('subject'),
+                        'level': item.get('level'),
+                        'source': 'math-v'
+                    }
+                )
     
-    def _load_raven_streaming(self, path: str):
-        return iter([])  # Stub: implement if needed
+    def _load_raven_streaming(self, path: str) -> Iterator[DataSample]:
+        """Stream RAVEN dataset."""
+        print(f"🧠 Streaming RAVEN: {path}")
+        import numpy as np
+        from PIL import Image
+        
+        data_path = Path(path)
+        config_dirs = [d for d in data_path.iterdir() if d.is_dir()]
+        
+        for config_dir in config_dirs:
+            config_name = config_dir.name
+            npz_files = list(config_dir.glob("*.npz"))
+            
+            for npz_file in npz_files:
+                try:
+                    data = np.load(npz_file)
+                    context = data['image'].reshape(8, 160, 160)
+                    target = data['target']
+                    
+                    grid_img = np.ones((480, 480), dtype=np.uint8) * 255
+                    for i in range(8):
+                        row, col = i // 3, i % 3
+                        grid_img[row*160:(row+1)*160, col*160:(col+1)*160] = context[i]
+                    
+                    grid_pil = Image.fromarray(grid_img).convert('RGB')
+                    
+                    yield DataSample(
+                        sample_id=f"raven_{config_name}_{npz_file.stem}",
+                        modality=ModalityType.IMAGE,
+                        image=np.array(grid_pil),
+                        label=int(target),
+                        metadata={'config': config_name, 'source': 'raven'}
+                    )
+                except Exception:
+                    continue
     
-    def _load_maze_csv_streaming(self, path: str):
-        return iter([])  # Stub: implement if needed
+    def _load_maze_csv_streaming(self, path: str) -> Iterator[DataSample]:
+        """Stream Maze CSV dataset."""
+        print(f"Streaming Maze CSV: {path}")
+        import csv
+        try:
+            with open(path, 'r', newline='') as f:
+                reader = csv.reader(f)
+                next(reader, None)  # Skip header
+                
+                for row_idx, row in enumerate(reader):
+                    if len(row) >= 3:
+                        grid_size = int(len(row[1]) ** 0.5)
+                        yield DataSample(
+                            sample_id=f"maze_{row_idx}",
+                            modality=ModalityType.MAZE,
+                            grid=np.frombuffer(row[1].encode(), dtype=np.uint8).reshape(grid_size, grid_size),
+                            label=np.frombuffer(row[2].encode(), dtype=np.uint8).reshape(grid_size, grid_size),
+                            metadata={'type': 'maze', 'source': row[0]}
+                        )
+        except Exception as e:
+            print(f"Maze streaming failed: {e}")
+            yield from []
     
-    def _load_sudoku_streaming(self, path: str):
-        return iter([])  # Stub: implement if needed
+    def _load_sudoku_streaming(self, path: str) -> Iterator[DataSample]:
+        """Stream Sudoku dataset (CSV: quiz, solution)."""
+        print(f"Streaming Sudoku: {path}")
+        import csv
+        try:
+            with open(path, 'r') as f:
+                reader = csv.reader(f)
+                next(reader, None)
+                
+                for idx, row in enumerate(reader):
+                    if len(row) >= 2:
+                        quiz = np.array([int(c) for c in row[0]]).reshape(9, 9)
+                        solution = np.array([int(c) for c in row[1]]).reshape(9, 9)
+                        
+                        yield DataSample(
+                            sample_id=f"sudoku_{idx}",
+                            modality=ModalityType.GRID,
+                            grid=quiz,
+                            label=solution,
+                            metadata={'type': 'sudoku', 'source': path}
+                        )
+        except Exception as e:
+            print(f"FAILED: Sudoku streaming failed: {e}")
+            yield from []
     
-    def _load_text_dataset_streaming(self, path: str):
-        return iter([])  # Stub: implement if needed
+    def _load_text_dataset_streaming(self, path: str) -> Iterator[DataSample]:
+        """Stream text dataset from file, chunking on the fly."""
+        print(f"Streaming Text: {path}")
+        chunk_size = 1000
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                buffer = ""
+                idx = 0
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    
+                    # Ensure we don't split words (simple heuristic)
+                    last_space = chunk.rfind(' ')
+                    if last_space != -1 and len(chunk) == chunk_size:
+                        f.seek(f.tell() - (len(chunk) - last_space))
+                        chunk = chunk[:last_space]
+                    
+                    yield DataSample(
+                        sample_id=f"text_{Path(path).stem}_{idx}",
+                        modality=ModalityType.TEXT,
+                        text=chunk.strip(),
+                        metadata={'type': 'text', 'source': path}
+                    )
+                    idx += 1
+        except Exception as e:
+            print(f"FAILED: Text streaming failed: {e}")
+            yield from []
     
-    def _load_image_dataset_streaming(self, path: str):
-        return iter([])  # Stub: implement if needed
+    def _load_image_dataset_streaming(self, path: str) -> Iterator[DataSample]:
+        """Stream generic image dataset from directory."""
+        print(f"Streaming Images: {path}")
+        from PIL import Image
+        
+        path_obj = Path(path)
+        if not path_obj.exists():
+            return
+            
+        extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+        files = [p for p in path_obj.rglob("*") if p.suffix.lower() in extensions]
+        
+        for idx, img_path in enumerate(files):
+            try:
+                img = np.array(Image.open(img_path).convert('RGB'))
+                yield DataSample(
+                    sample_id=f"img_{img_path.stem}_{idx}",
+                    modality=ModalityType.IMAGE,
+                    image=img,
+                    metadata={'source': str(img_path)}
+                )
+            except Exception:
+                continue
     
-    def _load_from_hf_streaming(self, dataset_name: str):
-        return iter([])  # Stub: implement if needed
+    def _load_from_hf_streaming(self, dataset_name: str) -> Iterator[DataSample]:
+        """Stream from HuggingFace Hub."""
+        print(f"Streaming from HF: {dataset_name}")
+        try:
+            from datasets import load_dataset
+            ds = load_dataset(dataset_name, streaming=True, split="train")
+            
+            for idx, item in enumerate(ds):
+                # Auto-detect fields
+                text = item.get('text', item.get('content', item.get('question', '')))
+                image = item.get('image', None)
+                if image and not isinstance(image, np.ndarray):
+                    image = np.array(image.convert('RGB'))
+                
+                yield DataSample(
+                    sample_id=f"hf_{dataset_name.replace('/', '_')}_{idx}",
+                    modality=ModalityType.MULTIMODAL if image is not None else ModalityType.TEXT,
+                    text=text,
+                    image=image,
+                    label=item.get('label', item.get('answer', item.get('output'))),
+                    metadata={'source': dataset_name}
+                )
+        except Exception as e:
+            print(f"HF streaming failed: {e}")
+            yield from []
     
-    def _load_from_local_streaming(self, path: str):
-        return iter([])  # Stub: implement if needed
+    def _load_from_local_streaming(self, path: str) -> Iterator[DataSample]:
+        if "local" not in self._logged_warnings:
+            print(f"Local streaming not implemented yet. Skipping {path}")
+            self._logged_warnings.add("local")
+        return iter([])
     
     def _apply_problem_augmentation(self, samples: List[DataSample]) -> List[DataSample]:
         """Apply transformations to inputs OR outputs to create new tasks (Winner Strategy)."""
-        import random
         
         augmented = samples.copy()
         transforms = ['rotate_90', 'rotate_180', 'rotate_270', 'flip_h', 'flip_v']
@@ -752,12 +1009,11 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                 metadata={**sample.metadata, 'problem_aug': transform, 'aug_input': transform_input}
             ))
         
-        print(f"   ✓ Problem augmentation: {len(samples)} → {len(augmented)} samples (+{len(augmented)-len(samples)} new tasks)")
+        print(f"   Problem augmentation: {len(samples)} -> {len(augmented)} samples (+{len(augmented)-len(samples)} new tasks)")
         return augmented
     
     def _add_multitask_samples(self, samples: List[DataSample]) -> List[DataSample]:
         """Add Task 2: Learn input distribution (Winner Strategy - Omni-ARC)."""
-        import random
         
         multitask = samples.copy()
         
@@ -789,7 +1045,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                         metadata={**target_sample.metadata, 'task_type': 'distribution_learning'}
                     ))
         
-        print(f"   ✓ Multi-task training: {len(samples)} → {len(multitask)} samples (+{len(multitask)-len(samples)} distribution tasks)")
+        print(f"   Multi-task training: {len(samples)} -> {len(multitask)} samples (+{len(multitask)-len(samples)} distribution tasks)")
         return multitask
     
     def _parse_json_format(self, json_path: str, format_type: str) -> List[DataSample]:
@@ -804,7 +1060,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
             def json_load(f):
                 return json.load(f)
         
-        print(f"📄 Parsing {format_type.upper()}: {json_path}")
+        print(f"Parsing {format_type.upper()}: {json_path}")
         
         try:
             with open(json_path, 'rb') as f:  # orjson needs binary
@@ -822,16 +1078,16 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                             metadata={'puzzle_id': puzzle_id, 'split': split, 'type': format_type}
                         ))
             
-            print(f"   ✓ {len(samples)} samples from {len(data)} puzzles")
+            print(f"   {len(samples)} samples from {len(data)} puzzles")
             return samples
         except Exception as e:
-            print(f"❌ Failed: {e}")
+            print(f"FAILED: {e}")
             return []
     
     def _parse_csv_format(self, csv_path: str, format_type: str) -> List[DataSample]:
         """Unified CSV parser (maze, custom grids)."""
         import csv
-        print(f"📊 Parsing {format_type.upper()}: {csv_path}")
+        print(f"Parsing {format_type.upper()}: {csv_path}")
         
         try:
             samples = []
@@ -850,10 +1106,10 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
                             metadata={'type': format_type, 'source': row[0]}
                         ))
             
-            print(f"   ✓ {len(samples)} samples")
+            print(f"   {len(samples)} samples")
             return samples
         except Exception as e:
-            print(f"❌ Failed: {e}")
+            print(f"FAILED: {e}")
             return []
     
     def _chunk_text_file(self, path: str, chunk_size: int = 1000) -> List[DataSample]:
@@ -870,7 +1126,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
     
     def _load_puzzlevqa(self, path: str) -> List[DataSample]:
         """Load PuzzleVQA dataset (2K abstract visual reasoning puzzles)."""
-        print(f"🧩 Loading PuzzleVQA: {path}")
+        print(f"Loading PuzzleVQA: {path}")
         import json
         from PIL import Image
         
@@ -886,7 +1142,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
             img_dir = annot_file.parent / "images"
         
         if not annot_file.exists():
-            print(f"⚠️  PuzzleVQA annotations not found: {annot_file}")
+            print(f"PuzzleVQA annotations not found: {annot_file}")
             return []
         
         with open(annot_file) as f:
@@ -957,7 +1213,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
     
     def _load_raven(self, path: str) -> List[DataSample]:
         """Load RAVEN dataset (70K RPM-style relational reasoning puzzles)."""
-        print(f"🧠 Loading RAVEN: {path}")
+        print(f"Loading RAVEN: {path}")
         import numpy as np
         from PIL import Image
         
@@ -1119,7 +1375,7 @@ class MultimodalDatasetBuilder(BaseDatasetBuilder):
 
 def build(config: MultimodalDatasetConfig):
     """Unified dataset builder - all formats, all modalities."""
-    print(f"\n{'='*70}\n🌐 Building: {', '.join(config.source_paths)}\n{'='*70}")
+    print(f"\n{'='*70}\nBuilding: {', '.join(config.source_paths)}\n{'='*70}")
     
     # Check if dataset already exists (final or in-progress)
     import os
@@ -1131,7 +1387,7 @@ def build(config: MultimodalDatasetConfig):
     
     # Check for completed dataset
     if os.path.exists(train_path) and os.path.exists(test_path) and os.path.exists(info_path):
-        print(f"\n✅ Dataset already exists at {config.output_dir}")
+        print(f"\nDataset already exists at {config.output_dir}")
         print(f"   Skipping re-encoding to save time")
         print(f"   To rebuild: delete {config.output_dir} and re-run\n")
         
@@ -1152,7 +1408,7 @@ def build(config: MultimodalDatasetConfig):
         consolidated_files = list(Path(checkpoint_dir).glob('consolidated_*.pt'))
         
         if batch_files or consolidated_files:
-            print(f"\n♻️  Found existing progress: {len(batch_files)} batches + {len(consolidated_files)} chunks")
+            print(f"\nFound existing progress: {len(batch_files)} batches + {len(consolidated_files)} chunks")
             print(f"   Streaming encoder will resume from where it left off\n")
     
     # Build pipeline (only if not resuming)
@@ -1163,19 +1419,19 @@ def build(config: MultimodalDatasetConfig):
     import os
     import json
     
-    if 'shard_files' in dataset:
-        # Streaming format - shards already saved, just create metadata
-        print("✅ Streaming dataset built successfully")
-        print(f"   Total samples: {dataset['metadata']['num_samples']:,}")
-        print(f"   Shards: {dataset['metadata']['num_shards']}")
+    # Handle Unified Streaming Pipeline result
+    if dataset.get('metadata', {}).get('unified_pipeline'):
+        print("Unified Streaming Pipeline built successfully")
+        print(f"   Format: Safetensors (Encoded)")
+        print(f"   Checkpoints: {dataset['checkpoints_dir']}")
         
-        # Create train/test subdirectories for PuzzleDataset compatibility
+        # Create train/test subdirectories for compatibility
         train_dir = os.path.join(config.output_dir, 'train')
         test_dir = os.path.join(config.output_dir, 'test')
         os.makedirs(train_dir, exist_ok=True)
         os.makedirs(test_dir, exist_ok=True)
         
-        # Create metadata for PuzzleDataset
+        # Create metadata
         num_concepts = config.num_concepts
         vocab_size = num_concepts + 4
         
@@ -1186,84 +1442,34 @@ def build(config: MultimodalDatasetConfig):
             'vocab_size': vocab_size,
             'seq_len': 512,
             'num_puzzle_identifiers': 0,
-            'total_groups': dataset['metadata']['num_samples'],
+            'total_groups': 0, # Unknown in streaming
             'mean_puzzle_examples': 1.0,
-            'total_puzzles': dataset['metadata']['num_samples'],
+            'total_puzzles': 0,
             'sets': ['train'],
             'streaming_mode': True,
-            'shard_index': 'shard_index.json'
+            'format': 'safetensors',
+            'checkpoints_dir': dataset['checkpoints_dir']
         }
         
         # Save train metadata
         with open(os.path.join(train_dir, 'dataset.json'), 'w') as f:
             json.dump(train_metadata, f, indent=2)
         
-        # Create minimal test metadata (empty for now)
-        test_metadata = {**train_metadata, 'total_groups': 0, 'total_puzzles': 0, 'sets': ['test']}
+        # Save test metadata
+        test_metadata = {**train_metadata, 'sets': ['test']}
         with open(os.path.join(test_dir, 'dataset.json'), 'w') as f:
             json.dump(test_metadata, f, indent=2)
-        
-        print(f"✅ Dataset ready: {dataset['metadata']['num_samples']:,} samples")
-        print(f"   Format: Streaming shards (memory-efficient)")
-        print(f"   Metadata: {train_dir}/dataset.json")
+            
+        print(f"Metadata saved to {train_dir}/dataset.json")
         return
-    
-    # Old format (dict with train/test keys) - legacy support
-    train_dir = os.path.join(config.output_dir, 'train')
-    test_dir = os.path.join(config.output_dir, 'test')
-    os.makedirs(train_dir, exist_ok=True)
-    os.makedirs(test_dir, exist_ok=True)
-    
-    train_samples = dataset['train']
-    test_samples = dataset.get('test', [])
-    
-    # Save raw samples with PuzzleDataset-compatible structure
-    print("💾 Saving raw samples...")
-    
-    # Create proper metadata with all required fields
-    num_concepts = config.num_concepts
-    vocab_size = num_concepts + 4  # Concept vocab + control symbols
-    
-    train_metadata = {
-        'pad_id': 0,
-        'ignore_label_id': -100,
-        'blank_identifier_id': 0,
-        'vocab_size': vocab_size,
-        'seq_len': 512,  # Will be set by model during training
-        'num_puzzle_identifiers': 0,
-        'total_groups': len(train_samples),
-        'mean_puzzle_examples': 1.0,
-        'total_puzzles': len(train_samples),
-        'sets': ['train']
-    }
-    
-    with open(os.path.join(train_dir, 'dataset.json'), 'w') as f:
-        json.dump(train_metadata, f, indent=2)
-    torch.save(train_samples, os.path.join(train_dir, 'raw_samples.pt'))
-    
-    # Save test split (optional - only if test samples exist)
-    if test_samples:
-        test_metadata = train_metadata.copy()
-        test_metadata['total_groups'] = len(test_samples)
-        test_metadata['total_puzzles'] = len(test_samples)
-        test_metadata['sets'] = ['test']
-        
-        with open(os.path.join(test_dir, 'dataset.json'), 'w') as f:
-            json.dump(test_metadata, f, indent=2)
-        torch.save(test_samples, os.path.join(test_dir, 'raw_samples.pt'))
-    
-    # Save overall metadata
-    with open(info_path, 'w') as f:
-        json.dump({
-            'num_train_samples': len(train_samples),
-            'num_test_samples': len(test_samples),
-            'format': 'raw_samples',
-            'note': 'Images cached, TRM encodes during training'
-        }, f, indent=2)
-    
-    print(f"✅ Dataset ready: {len(train_samples)} samples")
-    print(f"   Images cached: ImageCache handles rendering + denoising")
-    print(f"   TRM encoding: During training (on-the-fly)")
+
+    # Legacy streaming format (shards) - kept for backward compatibility if needed, 
+    # but effectively disabled by BaseDatasetBuilder changes.
+    if 'shard_files' in dataset:
+        print("Received legacy shard format (unexpected)")
+        return
+
+    print("Unknown dataset build result format")
 
 
 def _post_process(config: MultimodalDatasetConfig, dataset: Dict):
@@ -1273,7 +1479,7 @@ def _post_process(config: MultimodalDatasetConfig, dataset: Dict):
     
     # Concept expansion (for text/generation) - use in-memory dataset
     if config.use_capsules and config.include_text:
-        print(f"\n📚 Building concept expansion table...")
+        print(f"\nBuilding concept expansion table...")
         try:
             from models.concept_decoder import ConceptDecoder
             from transformers import AutoTokenizer
@@ -1289,11 +1495,11 @@ def _post_process(config: MultimodalDatasetConfig, dataset: Dict):
                     config.num_concepts
                 )
                 decoder.expansion_table.save(f"{config.output_dir}/concept_expansions.json")
-                print(f"   ✓ Saved")
+                print(f"   Saved")
             else:
-                print(f"   ⚠️  No training data to process")
+                print(f"   WARNING: No training data to process")
         except Exception as e:
-            print(f"   ⚠️  {e}")
+            print(f"   WARNING: {e}")
     
     # Quality scoring removed - not implemented and adds overhead
 

@@ -8,6 +8,7 @@ Reward: task_gain - expansion_cost + reconstructability_bonus
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from models.bitnet import BitLinear
 
 
 class CapsuleDQN(nn.Module):
@@ -44,18 +45,18 @@ class CapsuleDQN(nn.Module):
         
         # Q-network
         self.q_net = nn.Sequential(
-            nn.Linear(input_dim, 512),
+            BitLinear(input_dim, 512),
             nn.ReLU(),
-            nn.Linear(512, 256),
+            BitLinear(512, 256),
             nn.ReLU(),
-            nn.Linear(256, self.num_actions)
+            BitLinear(256, self.num_actions)
         )
         
         self._init_weights()
     
     def _init_weights(self):
         for m in self.q_net:
-            if isinstance(m, nn.Linear):
+            if isinstance(m, BitLinear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
     

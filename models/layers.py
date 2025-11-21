@@ -15,7 +15,7 @@ try:
         # FlashAttention requires compute capability >= 8.0 (Ampere)
         FLASH_ATTN_AVAILABLE = compute_capability[0] >= 8
         if not FLASH_ATTN_AVAILABLE:
-            print(f"⚠️  FlashAttention disabled: GPU compute capability {compute_capability[0]}.{compute_capability[1]} < 8.0 (Ampere required)")
+            print(f"FlashAttention disabled: GPU compute capability {compute_capability[0]}.{compute_capability[1]} < 8.0 (Ampere required)")
             print("   Using PyTorch SDPA instead (slower but compatible)")
     else:
         FLASH_ATTN_AVAILABLE = False
@@ -61,6 +61,8 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, si
     return q_embed.to(orig_dtype), k_embed.to(orig_dtype)
 
 
+from models.bitnet import BitwiseQuantization, ActivationQuantization
+
 class CastedLinear(nn.Module):
     def __init__(self,
                  in_features: int,
@@ -77,7 +79,22 @@ class CastedLinear(nn.Module):
             self.bias = nn.Parameter(torch.zeros((out_features, )))
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.linear(input, self.weight.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
+        # BitNet b1.58 Quantization
+        # 1. Quantize Input (8-bit)
+        input_quant = ActivationQuantization.apply(input)
+        
+        # 2. Quantize Weights (1.58-bit)
+        # Cast weight to input dtype before quantization if needed, or just quantize the float weight
+        # The original CastedLinear cast to input.dtype.
+        # We should quantize the weight (which is float) then cast? 
+        # Or quantize the casted weight?
+        # Usually weights are kept in high precision (float32/bf16) and quantized on the fly.
+        weight_quant = BitwiseQuantization.apply(self.weight)
+        
+        # 3. Linear
+        # We use the quantized values. 
+        # Note: bias is usually not quantized in BitNet, or high precision.
+        return F.linear(input_quant, weight_quant.to(input.dtype), bias=self.bias.to(input.dtype) if self.bias is not None else None)
 
 
 class CastedEmbedding(nn.Module):

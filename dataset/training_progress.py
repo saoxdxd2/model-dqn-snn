@@ -166,7 +166,7 @@ class TrainingProgressTracker:
             True if progress was loaded successfully, False otherwise
         """
         if not self.progress_file.exists():
-            print(f"ℹ️  No training progress found: {self.progress_file}")
+            print(f"INFO: No training progress found: {self.progress_file}")
             return False
         
         try:
@@ -176,7 +176,7 @@ class TrainingProgressTracker:
             self.progress = TrainingProgress.from_dict(data)
             
             print(f"\n{'='*70}")
-            print(f"📊 LOADED TRAINING PROGRESS")
+            print(f"LOADED TRAINING PROGRESS")
             print(f"{'='*70}")
             print(f"Global step: {self.progress.global_step:,}")
             print(f"Epoch: {self.progress.epoch}")
@@ -188,7 +188,7 @@ class TrainingProgressTracker:
             
             return True
         except Exception as e:
-            print(f"⚠️  Failed to load training progress: {e}")
+            print(f"WARNING: Failed to load training progress: {e}")
             return False
     
     def save(self):
@@ -199,9 +199,9 @@ class TrainingProgressTracker:
             with open(self.progress_file, 'w') as f:
                 json.dump(self.progress.to_dict(), f, indent=2)
             
-            print(f"💾 Training progress saved: {self.progress_file}")
+            print(f"SAVED: Training progress saved: {self.progress_file}")
         except Exception as e:
-            print(f"⚠️  Failed to save training progress: {e}")
+            print(f"WARNING: Failed to save training progress: {e}")
     
     def update(
         self,
@@ -303,7 +303,7 @@ class TrainingProgressTracker:
         self.progress.current_chunk_id = 0
         self.progress.current_offset = 0
         
-        print(f"\n✅ Epoch {self.progress.epoch - 1} complete! Starting epoch {self.progress.epoch}")
+        print(f"\nEpoch {self.progress.epoch - 1} complete! Starting epoch {self.progress.epoch}")
     
     def get_statistics(self) -> Dict:
         """Get training progress statistics."""
@@ -491,18 +491,18 @@ if __name__ == "__main__":
     
     if args.action == 'show':
         print(f"\n{'='*70}")
-        print(f"📊 TRAINING PROGRESS REPORT")
+        print(f"TRAINING PROGRESS REPORT")
         print(f"{'='*70}")
         
         manifest = get_training_manifest(checkpoint_dir)
         
-        print(f"\n📦 Dataset Info:")
+        print(f"\nDataset Info:")
         print(f"   Total consolidated chunks: {manifest['total_chunks']}")
         print(f"   Available chunks: {manifest['available_chunks']}")
         
         if manifest['training_progress']:
             prog = manifest['training_progress']
-            print(f"\n🏃 Training Status:")
+            print(f"\nTraining Status:")
             print(f"   Global step: {prog['global_step']:,}")
             print(f"   Epoch: {prog['epoch']}")
             print(f"   Current chunk: {prog['current_chunk']}")
@@ -510,7 +510,7 @@ if __name__ == "__main__":
             print(f"   Completed chunks: {prog['completed_chunks']}/{prog['total_chunks']}")
             print(f"   Total samples trained: {prog['total_samples_trained']:,}")
         else:
-            print(f"\nℹ️  No training progress found (fresh start)")
+            print(f"\nINFO: No training progress found (fresh start)")
         
         print(f"\n{'='*70}\n")
     
@@ -518,6 +518,6 @@ if __name__ == "__main__":
         tracker = TrainingProgressTracker(checkpoint_dir)
         if tracker.progress_file.exists():
             tracker.progress_file.unlink()
-            print(f"✅ Training progress reset")
+            print(f"Training progress reset")
         else:
-            print(f"ℹ️  No training progress to reset")
+            print(f"INFO: No training progress to reset")

@@ -10,6 +10,8 @@ argdantic
 pydantic
 pydantic-core
 flash-attn
+safetensors
+
 
 # Numerical and scientific stack
 numba

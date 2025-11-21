@@ -225,6 +225,50 @@ class MiniAttentionQHead(nn.Module):
         return q_values
 
 
+
+class ConfidenceQHead(nn.Module):
+    """
+    Tiny MLP Q-head for Confidence Management.
+    
+    Inputs: [Hidden_State (N), Stability_Delta (1), Loop_Count (1)]
+    Actions: LOOP (0), COMMIT (1), REJECT (2)
+    """
+    
+    def __init__(self, hidden_size: int, num_actions: int = 3):
+        super().__init__()
+        self.hidden_size = hidden_size
+        # Input dim = hidden_size + stability (1) + loop_count (1)
+        input_dim = hidden_size + 2
+        
+        # Tiny MLP: Input -> 64 -> ReLU -> Actions
+        self.net = nn.Sequential(
+            CastedLinear(input_dim, 64, bias=True),
+            nn.ReLU(),
+            CastedLinear(64, num_actions, bias=True)
+        )
+        
+        # Init to near-zero to prevent random actions at start
+        with torch.no_grad():
+            self.net[-1].weight.zero_()
+            self.net[-1].bias.fill_(-0.1) # Slight negative bias
+            
+    def forward(self, hidden_state: torch.Tensor, stability: torch.Tensor, loop_count: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            hidden_state: [batch, hidden_size]
+            stability: [batch, 1] (Cosine similarity delta)
+            loop_count: [batch, 1] (Normalized loop count 0.0-1.0)
+        Returns:
+            q_values: [batch, num_actions]
+        """
+        if hidden_state.dim() == 3:
+            hidden_state = hidden_state[:, 0]
+            
+        # Concatenate inputs
+        x = torch.cat([hidden_state, stability, loop_count], dim=-1)
+        return self.net(x)
+
+
 def create_q_head(config) -> nn.Module:
     """Factory function to create Q-head based on config."""
     q_head_type = getattr(config, 'q_head_type', 'mlp')
@@ -241,5 +285,7 @@ def create_q_head(config) -> nn.Module:
         num_heads = getattr(config, 'q_head_num_layers', 4)  # Reuse for num_heads
         context_window = getattr(config, 'q_head_hidden_size', 128) // 16  # 8 for default
         return MiniAttentionQHead(hidden_size, num_actions, num_heads, context_window)
+    elif q_head_type == 'confidence':
+        return ConfidenceQHead(hidden_size, num_actions)
     else:
         raise ValueError(f"Unknown q_head_type: {q_head_type}")

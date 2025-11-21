@@ -10,7 +10,14 @@ import sys
 from pathlib import Path
 from typing import Dict, Optional
 import json
+import json
 import yaml
+try:
+    from safetensors.torch import load_file as safe_load_file
+    SAFETENSORS_AVAILABLE = True
+except ImportError:
+    SAFETENSORS_AVAILABLE = False
+
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -57,7 +64,13 @@ class ModelLoader:
                 weights_only=False  # Need False for full checkpoint with config
             )
         except Exception as e:
+            # Try safetensors if available and file extension matches or fallback
+            if SAFETENSORS_AVAILABLE and str(self.checkpoint_path).endswith('.safetensors'):
+                print(f"Loading safetensors from {self.checkpoint_path}")
+                return safe_load_file(self.checkpoint_path)
+                
             print(f"Warning: Failed to load with weights_only=False, trying pickle_module...")
+
             checkpoint = torch.load(
                 self.checkpoint_path,
                 map_location=self.device

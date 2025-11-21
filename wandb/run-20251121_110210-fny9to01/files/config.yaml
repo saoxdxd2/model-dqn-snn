@@ -1,0 +1,227 @@
+_wandb:
+    value:
+        cli_version: 0.22.2
+        e:
+            s27bppar0e2j5x6he4ziw34o0dy26cdi:
+                args:
+                    - --config-path
+                    - config\arch
+                    - --config-name
+                    - hybrid_pretrained
+                codePath: pretrain.py
+                codePathLocal: pretrain.py
+                email: tajdinenizare@gmail.com
+                executable: C:\Users\sao\AppData\Local\Programs\Python\Python312\python.exe
+                git:
+                    commit: bf794522471a0006b16cd9473f6a708a95db70ad
+                    remote: https://github.com/saoxdxd2/model-dqn-snn.git
+                host: DESKTOP-9MRPNT8
+                os: Windows-10-10.0.19044-SP0
+                program: C:\Users\sao\Documents\model-engine\pretrain.py
+                python: CPython 3.12.10
+                root: C:\Users\sao\Documents\model-engine
+                startedAt: "2025-11-21T10:02:10.039346Z"
+                writerId: s27bppar0e2j5x6he4ziw34o0dy26cdi
+        m: []
+        python_version: 3.12.10
+        t:
+            "1":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 50
+                - 53
+                - 71
+                - 105
+            "2":
+                - 1
+                - 5
+                - 11
+                - 41
+                - 49
+                - 50
+                - 53
+                - 71
+                - 105
+            "3":
+                - 13
+                - 16
+                - 61
+            "4": 3.12.10
+            "5": 0.22.2
+            "6": 4.55.4
+            "8":
+                - 3
+            "12": 0.22.2
+            "13": windows-amd64
+arch:
+    value:
+        H_cycles: 5
+        H_layers: 0
+        L_cycles: 5
+        L_layers: 4
+        checksum_halt_threshold: 0.5
+        cpu_optimized: false
+        curiosity_count_beta: 0.05
+        curiosity_rnd_weight: 0.1
+        deep_supervision_steps: 3
+        dqn_batch_size: 128
+        dqn_buffer_capacity: 500000
+        dqn_buffer_min_size: 1000
+        dqn_epsilon_decay_steps: 200000
+        dqn_epsilon_end: 0.05
+        dqn_epsilon_start: 0.3
+        dqn_gamma: 0.99
+        dqn_warmstart_steps: 10000
+        ema_decay: 0.999
+        enable_adaptive_hcycles: true
+        enable_capsule_expansion: false
+        enable_count_curiosity: true
+        enable_dqn: true
+        enable_entropy_regularization: false
+        enable_gradient_checkpointing: true
+        enable_hierarchical_attention: true
+        enable_latent_planning: true
+        enable_memory: true
+        enable_mtp: true
+        enable_prioritized_replay: false
+        enable_rnd_curiosity: true
+        encoder_H_cycles: 4
+        encoder_L_cycles: 5
+        encoder_num_layers: 4
+        entropy_regularization_weight: 0.01
+        expansion: 4
+        ffn_expansion_ratio: 4
+        forward_dtype: float16
+        halt_exploration_prob: 0.1
+        halt_max_steps: 64
+        hcycle_confidence_threshold: 2
+        hidden_size: 1024
+        latent_num_paths: 4
+        latent_planning_depth: 2
+        latent_use_adaptive_gate: true
+        loss:
+            loss_type: stablemax_cross_entropy
+            name: losses@ACTLossHead
+        memory_capacity: 512
+        memory_dropout: 0.1
+        memory_num_heads: 16
+        memory_reward_bonus: 0.5
+        memory_reward_threshold: 0.05
+        mlp_t: false
+        mtp_loss_weight: 0.5
+        mtp_num_depths: 3
+        mtp_share_embeddings: true
+        mtp_share_output_head: true
+        name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+        no_ACT_continue: true
+        num_heads: 16
+        num_key_value_heads: 16
+        per_alpha: 0.6
+        per_beta: 0.4
+        pos_encodings: rope
+        puzzle_emb_len: 16
+        puzzle_emb_ndim: 1024
+        q_head_hidden_size: 128
+        q_head_num_actions: 3
+        q_head_num_layers: 1
+        q_head_type: mlp
+        reconstruction_weight: 0.5
+        reward_step_penalty: 0.01
+        reward_terminal_correct: 1
+        reward_terminal_incorrect: -0.5
+        rope_theta: 10000
+        use_ema: true
+        use_gelu: true
+beta1:
+    value: 0.9
+beta2:
+    value: 0.98
+checkpoint_every_eval:
+    value: true
+checkpoint_path:
+    value: checkpoints/hybrid_pretrained
+data_paths:
+    value:
+        - datasets/vision_unified
+data_paths_test:
+    value: []
+dqn_warmup_ratio:
+    value: 0.2
+dqn_warmup_steps:
+    value: 5000
+ema:
+    value: true
+ema_rate:
+    value: 0.999
+enable_optimizer_fallback:
+    value: true
+enable_q_temperature_annealing:
+    value: true
+epochs:
+    value: 1000000
+eval_interval:
+    value: 5
+eval_save_outputs:
+    value: []
+evaluators:
+    value:
+        - name: arc@ARC
+expansion_anneal_ratio:
+    value: 0.5
+expansion_anneal_steps:
+    value: 50000
+expansion_penalty_end:
+    value: 0.001
+expansion_penalty_schedule:
+    value: cosine
+expansion_penalty_start:
+    value: 0.1
+freeze_representation_during_warmup:
+    value: true
+freeze_weights:
+    value: false
+global_batch_size:
+    value: 32
+load_checkpoint:
+    value: null
+lr:
+    value: 5e-05
+lr_min_ratio:
+    value: 0.1
+lr_warmup_steps:
+    value: 3000
+max_steps:
+    value: null
+min_eval_interval:
+    value: 0
+nan_threshold_for_fallback:
+    value: 3
+optimizer_type:
+    value: adamatan2
+project_name:
+    value: Vision_unified-ACT-torch
+puzzle_emb_lr:
+    value: 0.01
+puzzle_emb_weight_decay:
+    value: 0.1
+q_temperature_anneal_ratio:
+    value: 1
+q_temperature_end:
+    value: 0.1
+q_temperature_schedule:
+    value: exponential
+q_temperature_start:
+    value: 1
+replay_max_age:
+    value: 100000
+replay_recent_fraction:
+    value: 0.25
+run_name:
+    value: TinyRecursiveReasoningModel_ACTV1 faithful-quoll
+seed:
+    value: 0
+weight_decay:
+    value: 0.1

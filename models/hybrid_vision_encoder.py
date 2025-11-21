@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+from models.bitnet import BitLinear
 
 
 class AdaptiveFusion(nn.Module):
@@ -38,18 +39,18 @@ class AdaptiveFusion(nn.Module):
         if fusion_type == 'gated':
             # Simple gating: learnable per-patch weight
             self.gate = nn.Sequential(
-                nn.Linear(feature_dim * 2, feature_dim),
+                BitLinear(feature_dim * 2, feature_dim),
                 nn.GELU(),
-                nn.Linear(feature_dim, 1),
+                BitLinear(feature_dim, 1),
                 nn.Sigmoid()
             )
         elif fusion_type == 'attention':
             # Attention-based fusion
-            self.query = nn.Linear(feature_dim, feature_dim)
-            self.key_pretrained = nn.Linear(feature_dim, feature_dim)
-            self.key_trainable = nn.Linear(feature_dim, feature_dim)
-            self.value_pretrained = nn.Linear(feature_dim, feature_dim)
-            self.value_trainable = nn.Linear(feature_dim, feature_dim)
+            self.query = BitLinear(feature_dim, feature_dim)
+            self.key_pretrained = BitLinear(feature_dim, feature_dim)
+            self.key_trainable = BitLinear(feature_dim, feature_dim)
+            self.value_pretrained = BitLinear(feature_dim, feature_dim)
+            self.value_trainable = BitLinear(feature_dim, feature_dim)
         elif fusion_type == 'learned_avg':
             # Simple learnable scalar weights
             self.alpha = nn.Parameter(torch.tensor(0.5))  # Start 50-50
@@ -157,7 +158,7 @@ class HybridVisionEncoder(nn.Module):
         )
         
         # Project CLIP features (768) to match ViT dimension (1024)
-        self.pretrained_projection = nn.Linear(768, hidden_size)
+        self.pretrained_projection = BitLinear(768, hidden_size)
         
         # Path 2: Trainable encoder (custom ViT)
         self.trainable_path = self._build_trainable_encoder(hidden_size)
@@ -176,7 +177,7 @@ class HybridVisionEncoder(nn.Module):
             num_layers=3
         )
         
-        print(f"\n🔧 Initialized HybridVisionEncoder:")
+        print(f"\nInitialized HybridVisionEncoder:")
         print(f"   Pretrained: {pretrained_model} (frozen={freeze_pretrained})")
         print(f"   Trainable: Custom ViT")
         print(f"   Fusion: {fusion_type}")
@@ -336,10 +337,10 @@ def test_hybrid_encoder():
             bias = trainer.get_fusion_bias(step)
             print(f"   Step {step}: {bias:+.3f}")
         
-        print("\n✅ All tests passed!")
+        print("\nAll tests passed!")
         
     except Exception as e:
-        print(f"\n⚠️  Test skipped (missing dependencies): {e}")
+        print(f"\nTest skipped (missing dependencies): {e}")
         print("   Install: pip install transformers")
 
 

@@ -90,7 +90,10 @@ class PuzzleDataset(IterableDataset):
             total_puzzles += current_metadata.total_puzzles
             total_groups += current_metadata.total_groups
             num_identifiers += current_metadata.num_puzzle_identifiers
-        mean_puzzle_examples = mean_puzzle_examples / total_puzzles
+        if total_puzzles > 0:
+            mean_puzzle_examples = mean_puzzle_examples / total_puzzles
+        else:
+            mean_puzzle_examples = 0
 
         self.metadata = PuzzleDatasetMetadata(
             seq_len=prev_seq_len,
@@ -298,107 +301,81 @@ class PuzzleDataset(IterableDataset):
                 "puzzle_identifiers": self.metadata.blank_identifier_id
             }
             batch = {k: np.pad(v, ((0, pad_size), ) + ((0, 0), ) * (v.ndim - 1), constant_values=pad_values[k]) for k, v in batch.items()}
+        
+        return batch
 
-        # To tensor
-        return {k: torch.from_numpy(v) for k, v in batch.items()}
-    
-    def _iter_test(self):
-        for set_i, (set_name, dataset) in enumerate(self._data.items()):  # type: ignore
-            # Handle raw_samples format
-            if "raw_samples" in dataset:
-                total_examples = len(dataset["raw_samples"])
-            else:
-                total_examples = len(dataset["inputs"])
-
-            # Load examples one by one
-            start_index = 0
-            while start_index < total_examples:
-                # Compute indices
-                end_index = min(total_examples, start_index + self.config.global_batch_size)
-                
-                local_start = start_index + self.config.rank * self.local_batch_size
-                local_end   = min(start_index + (self.config.rank + 1) * self.local_batch_size, end_index)
-                
-                # Get batch of examples, and also puzzle IDs
-                puzzle_indices = []
-                puzzle_index = np.searchsorted(dataset["puzzle_indices"], local_start, side="right") - 1
-                for i in range(local_start, local_end):
-                    while puzzle_index + 1 < len(dataset["puzzle_indices"]) and i >= dataset["puzzle_indices"][puzzle_index + 1]:
-                        puzzle_index += 1
-
-                    puzzle_indices.append(puzzle_index)
-                
-                # Handle raw_samples format (vision-unified)
-                if "raw_samples" in dataset:
-                    batch_samples = [dataset["raw_samples"][idx] for idx in range(local_start, local_end)]
-                    batch = {
-                        "raw_samples": batch_samples,
-                        "puzzle_identifiers": torch.from_numpy(dataset["puzzle_identifiers"][puzzle_indices].astype(np.int32))
-                    }
-                else:
-                    batch = self._collate_batch({
-                        "inputs": dataset["inputs"][local_start: local_end],
-                        "labels": dataset["labels"][local_start: local_end],
-                        "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_indices]
-                    })
-
-                yield set_name, batch, end_index - start_index
-                
-                # Advance to next batch
-                start_index += self.config.global_batch_size
+    def _package_batch(self, dataset, sample_indices, puzzle_identifier_indices):
+        if "raw_samples" in dataset:
+            batch_samples = [dataset["raw_samples"][i] for i in sample_indices]
+            return {
+                "raw_samples": batch_samples,
+                "puzzle_identifiers": torch.from_numpy(dataset["puzzle_identifiers"][puzzle_identifier_indices].astype(np.int32))
+            }
+        else:
+            return self._collate_batch({
+                "inputs": dataset["inputs"][sample_indices],
+                "labels": dataset["labels"][sample_indices],
+                "puzzle_identifiers": dataset["puzzle_identifiers"][puzzle_identifier_indices]
+            })
 
     def _iter_train(self):
-        for set_name, dataset in self._data.items():  # type: ignore
-            # Increase epoch count
+        worker_info = get_worker_info()
+        num_workers = worker_info.num_workers if worker_info else 1
+        worker_id = worker_info.id if worker_info else 0
+        
+        rng = np.random.default_rng(self.config.seed + worker_id)
+        
+        while True:
             self._iters += 1
-
-            # Randomly shuffle groups
-            rng = np.random.Generator(np.random.Philox(seed=self.config.seed + self._iters))
-
-            group_order = np.concatenate([rng.permutation(dataset["group_indices"].size - 1) for _i in range(self.config.epochs_per_iter)])
-            start_index = 0
+            set_names = list(self._data.keys())
+            rng.shuffle(set_names)
             
-            while start_index < group_order.size:
-                start_index, batch_indices, batch_puzzle_indices = _sample_batch(
-                    rng,
-                    group_order=group_order,
-                    puzzle_indices=dataset["puzzle_indices"],
-                    group_indices=dataset["group_indices"],
-                    start_index=start_index,
-                    global_batch_size=self.config.global_batch_size,
-                )
-
-                # Select current rank and collate
-                global_effective_batch_size = batch_puzzle_indices.size  # Global effective batch size, excluding pads
-
-                # Drop last batch
-                if global_effective_batch_size < self.config.global_batch_size:
-                    break
-
-                batch_indices        = batch_indices       [self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
-                batch_puzzle_indices = batch_puzzle_indices[self.config.rank * self.local_batch_size: (self.config.rank + 1) * self.local_batch_size]
+            for set_name in set_names:
+                dataset = self._data[set_name]
+                group_indices = dataset["group_indices"]
+                total_groups = len(group_indices) - 1
                 
-                # Handle raw_samples format (vision-unified)
-                if "raw_samples" in dataset:
-                    # Extract raw samples and return as-is (will be processed by model)
-                    batch_samples = [dataset["raw_samples"][idx] for idx in batch_indices]
-                    batch = {
-                        "raw_samples": batch_samples,
-                        "puzzle_identifiers": torch.from_numpy(dataset["puzzle_identifiers"][batch_puzzle_indices].astype(np.int32))
-                    }
-                else:
-                    # Standard format with pre-encoded inputs
-                    batch = self._collate_batch({
-                        "inputs": dataset["inputs"][batch_indices],
-                        "labels": dataset["labels"][batch_indices],
-                        "puzzle_identifiers": dataset["puzzle_identifiers"][batch_puzzle_indices]
-                    })
+                # Shard groups
+                group_order = np.arange(total_groups, dtype=np.int32)
+                rng.shuffle(group_order)
+                group_order = group_order[worker_id::num_workers]
+                
+                start_index = 0
+                while start_index < len(group_order):
+                    start_index, batch_indices, batch_puzzle_indices = _sample_batch(
+                        rng, group_order, dataset["puzzle_indices"], dataset["group_indices"],
+                        start_index, self.local_batch_size
+                    )
+                    
+                    if len(batch_indices) == 0:
+                        break
+                        
+                    batch = self._package_batch(dataset, batch_indices, batch_puzzle_indices)
+                    yield set_name, batch, self.config.global_batch_size
 
-                yield set_name, batch, global_effective_batch_size
+    def _iter_test(self):
+        worker_info = get_worker_info()
+        num_workers = worker_info.num_workers if worker_info else 1
+        worker_id = worker_info.id if worker_info else 0
+        
+        for set_name, dataset in self._data.items():
+            # Iterate over all samples
+            num_samples = dataset["puzzle_identifiers"].shape[0]
+            indices = np.arange(num_samples)
+            
+            # Shard indices
+            my_indices = indices[worker_id::num_workers]
+            
+            for i in range(0, len(my_indices), self.local_batch_size):
+                batch_indices = my_indices[i : i + self.local_batch_size]
+                # For test, puzzle_identifiers align with samples
+                batch = self._package_batch(dataset, batch_indices, batch_indices)
+                yield set_name, batch, self.config.global_batch_size
+
                 
     def __iter__(self):
         worker_info = get_worker_info()
-        assert worker_info is None or worker_info.num_workers == 1, "Multithreaded data loading is not currently supported."
+        # assert worker_info is None or worker_info.num_workers == 1, "Multithreaded data loading is not currently supported."
         
         self._lazy_load_dataset()
         
@@ -407,4 +384,49 @@ class PuzzleDataset(IterableDataset):
             yield from self._iter_test()
         else:
             yield from self._iter_train()
+
+
+class CapsuleDataLoaderWrapper:
+    """
+    Wraps a standard DataLoader to yield batches in the format expected by the training loop.
+    Used for multimodal capsule datasets.
+    """
+    def __init__(self, raw_loader, global_batch_size):
+        self.raw_loader = raw_loader
+        self.global_batch_size = global_batch_size
+    
+    def __iter__(self):
+        for batch_data in self.raw_loader:
+            # batch_data is tuple of (sketches,) or (sketches, checksums) or (sketches, checksums, children)
+            # Sketches are already [B, 12, 512] from encoder.sketch_projection
+            if len(batch_data) == 3:
+                sketches = batch_data[0]  # [B, 12, 512]
+                batch = {
+                    'inputs': sketches,
+                    'checksums': batch_data[1],
+                    'children': batch_data[2],
+                    'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long)
+                }
+            elif len(batch_data) == 2:
+                sketches = batch_data[0]  # [B, 12, 512]
+                batch = {
+                    'inputs': sketches,
+                    'checksums': batch_data[1],
+                    'children': None,
+                    'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long)
+                }
+            else:
+                sketches = batch_data[0]  # [B, 12, 512]
+                batch = {
+                    'inputs': sketches,
+                    'checksums': None,
+                    'children': None,
+                    'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long)
+                }
+            
+            # Yield in expected format: (set_name, batch, global_batch_size)
+            yield 'capsule', batch, self.global_batch_size
+    
+    def __len__(self):
+        return len(self.raw_loader)
 

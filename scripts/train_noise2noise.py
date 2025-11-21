@@ -140,7 +140,7 @@ def train_noise2noise(
         device: 'cuda' or 'cpu'
     """
     print("="*70)
-    print("🎨 NOISE2NOISE DENOISER TRAINING")
+    print(" NOISE2NOISE DENOISER TRAINING")
     print("="*70)
     print(f"Device: {device}")
     print(f"Samples: {num_samples:,}")
@@ -150,18 +150,18 @@ def train_noise2noise(
     print("="*70 + "\n")
     
     # Generate training texts
-    print("📝 Generating training texts...")
+    print(" Generating training texts...")
     texts = generate_training_texts(num_samples)
     print(f"✓ Generated {len(texts):,} text samples\n")
     
     # Initialize renderer and variant generator
-    print("🎨 Initializing renderers...")
+    print(" Initializing renderers...")
     renderer = TextRenderer(width=224, height=224, font_size=12)
     variant_gen = NoisyVariantGenerator(renderer)
     print("✓ Renderers initialized\n")
     
     # Create dataset and dataloader
-    print("📦 Creating dataset...")
+    print(" Creating dataset...")
     dataset = TextRenderDataset(texts, renderer, variant_gen)
     dataloader = DataLoader(
         dataset,
@@ -173,7 +173,7 @@ def train_noise2noise(
     print(f"✓ Dataset ready: {len(dataset):,} samples\n")
     
     # Initialize model
-    print("🧠 Initializing Noise2Noise model...")
+    print(" Initializing Noise2Noise model...")
     denoiser = Noise2NoiseDenoiser(device=device)
     optimizer = optim.Adam(denoiser.model.parameters(), lr=lr)
     
@@ -186,7 +186,7 @@ def train_noise2noise(
     print(f"✓ Model initialized: {params:,} parameters\n")
     
     # Training loop
-    print("🚀 Starting training...\n")
+    print(" Starting training...\n")
     best_loss = float('inf')
     
     for epoch in range(epochs):
@@ -215,7 +215,7 @@ def train_noise2noise(
             print(f"   💾 Best model saved (loss: {best_loss:.6f})\n")
     
     print("\n" + "="*70)
-    print("✅ TRAINING COMPLETE")
+    print(" TRAINING COMPLETE")
     print("="*70)
     print(f"Best loss: {best_loss:.6f}")
     print(f"Model saved to: {output_path}")

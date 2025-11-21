@@ -1,0 +1,23 @@
+{
+  "os": "Windows-10-10.0.19044-SP0",
+  "python": "CPython 3.12.10",
+  "startedAt": "2025-11-21T10:02:10.039346Z",
+  "args": [
+    "--config-path",
+    "config\\arch",
+    "--config-name",
+    "hybrid_pretrained"
+  ],
+  "program": "C:\\Users\\sao\\Documents\\model-engine\\pretrain.py",
+  "codePath": "pretrain.py",
+  "codePathLocal": "pretrain.py",
+  "git": {
+    "remote": "https://github.com/saoxdxd2/model-dqn-snn.git",
+    "commit": "bf794522471a0006b16cd9473f6a708a95db70ad"
+  },
+  "email": "tajdinenizare@gmail.com",
+  "root": "C:\\Users\\sao\\Documents\\model-engine",
+  "host": "DESKTOP-9MRPNT8",
+  "executable": "C:\\Users\\sao\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+  "writerId": "s27bppar0e2j5x6he4ziw34o0dy26cdi"
+}

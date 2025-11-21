@@ -11,6 +11,10 @@ import torch
 import sys
 from pathlib import Path
 
+print("WARNING: This script is deprecated. Please use 'scripts/export_model.py' instead.")
+print("Example: python scripts/export_model.py --model checkpoint.pt --output model.pt --target cpu --quantization int8")
+
+
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 

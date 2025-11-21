@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+from models.bitnet import BitLinear
 
 
 class ConceptCodebook(nn.Module):
@@ -238,7 +239,7 @@ class HybridOutputHead(nn.Module):
             self.codebook = ConceptCodebook(num_concepts, concept_dim)
         
         # Output projection: hidden → concept logits
-        self.output_proj = nn.Linear(hidden_size, self.total_vocab)
+        self.output_proj = BitLinear(hidden_size, self.total_vocab)
         
         # Control symbol embeddings (learnable)
         self.control_embeddings = nn.Embedding(self.NUM_CONTROL, concept_dim)

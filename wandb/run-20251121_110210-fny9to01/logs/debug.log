@@ -1,0 +1,64 @@
+2025-11-21 11:02:10,043 INFO    MainThread:33508 [wandb_setup.py:_flush():81] Current SDK version is 0.22.2
+2025-11-21 11:02:10,044 INFO    MainThread:33508 [wandb_setup.py:_flush():81] Configure stats pid to 33508
+2025-11-21 11:02:10,044 INFO    MainThread:33508 [wandb_setup.py:_flush():81] Loading settings from C:\Users\sao\.config\wandb\settings
+2025-11-21 11:02:10,044 INFO    MainThread:33508 [wandb_setup.py:_flush():81] Loading settings from C:\Users\sao\Documents\model-engine\wandb\settings
+2025-11-21 11:02:10,044 INFO    MainThread:33508 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2025-11-21 11:02:10,045 INFO    MainThread:33508 [wandb_init.py:setup_run_log_directory():705] Logging user logs to C:\Users\sao\Documents\model-engine\wandb\run-20251121_110210-fny9to01\logs\debug.log
+2025-11-21 11:02:10,045 INFO    MainThread:33508 [wandb_init.py:setup_run_log_directory():706] Logging internal logs to C:\Users\sao\Documents\model-engine\wandb\run-20251121_110210-fny9to01\logs\debug-internal.log
+2025-11-21 11:02:10,045 INFO    MainThread:33508 [wandb_init.py:init():832] calling init triggers
+2025-11-21 11:02:10,046 INFO    MainThread:33508 [wandb_init.py:init():837] wandb.init called with sweep_config: {}
+config: {'arch': {'name': 'recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1', 'loss': {'name': 'losses@ACTLossHead', 'loss_type': 'stablemax_cross_entropy'}, 'H_cycles': 5, 'L_cycles': 5, 'halt_exploration_prob': 0.1, 'halt_max_steps': 64, 'H_layers': 0, 'L_layers': 4, 'hidden_size': 1024, 'num_heads': 16, 'num_key_value_heads': 16, 'expansion': 4, 'encoder_num_layers': 4, 'encoder_H_cycles': 4, 'encoder_L_cycles': 5, 'puzzle_emb_ndim': 1024, 'puzzle_emb_len': 16, 'pos_encodings': 'rope', 'forward_dtype': 'float16', 'rope_theta': 10000, 'mlp_t': False, 'no_ACT_continue': True, 'deep_supervision_steps': 3, 'enable_gradient_checkpointing': True, 'use_ema': True, 'ema_decay': 0.999, 'enable_dqn': True, 'dqn_buffer_capacity': 500000, 'dqn_buffer_min_size': 1000, 'dqn_batch_size': 128, 'dqn_gamma': 0.99, 'dqn_epsilon_start': 0.3, 'dqn_epsilon_end': 0.05, 'dqn_epsilon_decay_steps': 200000, 'dqn_warmstart_steps': 10000, 'reward_step_penalty': 0.01, 'reward_terminal_correct': 1.0, 'reward_terminal_incorrect': -0.5, 'q_head_type': 'mlp', 'q_head_hidden_size': 128, 'q_head_num_layers': 1, 'q_head_num_actions': 3, 'enable_latent_planning': True, 'latent_num_paths': 4, 'latent_planning_depth': 2, 'latent_use_adaptive_gate': True, 'enable_memory': True, 'memory_capacity': 512, 'memory_num_heads': 16, 'memory_dropout': 0.1, 'memory_reward_bonus': 0.5, 'memory_reward_threshold': 0.05, 'enable_count_curiosity': True, 'enable_rnd_curiosity': True, 'curiosity_count_beta': 0.05, 'curiosity_rnd_weight': 0.1, 'enable_entropy_regularization': False, 'entropy_regularization_weight': 0.01, 'enable_prioritized_replay': False, 'per_alpha': 0.6, 'per_beta': 0.4, 'enable_mtp': True, 'mtp_num_depths': 3, 'mtp_loss_weight': 0.5, 'mtp_share_embeddings': True, 'mtp_share_output_head': True, 'enable_adaptive_hcycles': True, 'hcycle_confidence_threshold': 2.0, 'enable_hierarchical_attention': True, 'enable_capsule_expansion': False, 'reconstruction_weight': 0.5, 'checksum_halt_threshold': 0.5, 'cpu_optimized': False, 'use_gelu': True, 'ffn_expansion_ratio': 4.0}, 'data_paths': ['datasets/vision_unified'], 'data_paths_test': [], 'evaluators': [{'name': 'arc@ARC'}], 'global_batch_size': 32, 'epochs': 1000000, 'max_steps': None, 'lr': 5e-05, 'lr_min_ratio': 0.1, 'lr_warmup_steps': 3000, 'weight_decay': 0.1, 'beta1': 0.9, 'beta2': 0.98, 'puzzle_emb_lr': 0.01, 'puzzle_emb_weight_decay': 0.1, 'project_name': 'Vision_unified-ACT-torch', 'run_name': 'TinyRecursiveReasoningModel_ACTV1 faithful-quoll', 'load_checkpoint': None, 'checkpoint_path': 'checkpoints/hybrid_pretrained', 'seed': 0, 'checkpoint_every_eval': True, 'eval_interval': 5, 'min_eval_interval': 0, 'eval_save_outputs': [], 'ema': True, 'ema_rate': 0.999, 'freeze_weights': False, 'dqn_warmup_ratio': 0.2, 'dqn_warmup_steps': 5000, 'freeze_representation_during_warmup': True, 'optimizer_type': 'adamatan2', 'enable_optimizer_fallback': True, 'nan_threshold_for_fallback': 3, 'expansion_penalty_schedule': 'cosine', 'expansion_penalty_start': 0.1, 'expansion_penalty_end': 0.001, 'expansion_anneal_ratio': 0.5, 'expansion_anneal_steps': 50000, 'replay_recent_fraction': 0.25, 'replay_max_age': 100000, 'enable_q_temperature_annealing': True, 'q_temperature_start': 1.0, 'q_temperature_end': 0.1, 'q_temperature_anneal_ratio': 1.0, 'q_temperature_schedule': 'exponential', '_wandb': {}}
+2025-11-21 11:02:10,046 INFO    MainThread:33508 [wandb_init.py:init():880] starting backend
+2025-11-21 11:02:12,750 INFO    MainThread:33508 [wandb_init.py:init():883] sending inform_init request
+2025-11-21 11:02:12,860 INFO    MainThread:33508 [wandb_init.py:init():891] backend started and connected
+2025-11-21 11:02:12,868 INFO    MainThread:33508 [wandb_init.py:init():961] updated telemetry
+2025-11-21 11:02:13,425 INFO    MainThread:33508 [wandb_init.py:init():985] communicating run to backend with 90.0 second timeout
+2025-11-21 11:02:13,959 INFO    MainThread:33508 [wandb_init.py:init():1036] starting run threads in backend
+2025-11-21 11:02:14,602 INFO    MainThread:33508 [wandb_run.py:_console_start():2509] atexit reg
+2025-11-21 11:02:14,602 INFO    MainThread:33508 [wandb_run.py:_redirect():2357] redirect: wrap_raw
+2025-11-21 11:02:14,603 INFO    MainThread:33508 [wandb_run.py:_redirect():2426] Wrapping output streams.
+2025-11-21 11:02:14,603 INFO    MainThread:33508 [wandb_run.py:_redirect():2449] Redirects installed.
+2025-11-21 11:02:14,611 INFO    MainThread:33508 [wandb_init.py:init():1076] run started, returning control to user process
+2025-11-21 11:02:14,665 INFO    wandb-AsyncioManager-main:33508 [service_client.py:_forward_responses():80] Reached EOF.
+2025-11-21 11:02:14,665 INFO    wandb-AsyncioManager-main:33508 [mailbox.py:close():137] Closing mailbox, abandoning 2 handles.
+2025-11-21 11:02:16,205 ERROR   MainThread:33508 [redirect.py:_on_write():664] [all runs] error in stdout callback
+Traceback (most recent call last):
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\lib\redirect.py", line 662, in _on_write
+    cb(written_data)
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\wandb_run.py", line 2430, in <lambda>
+    lambda data: self._console_raw_callback("stdout", data),
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\wandb_run.py", line 399, in wrapper
+    return func(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\wandb_run.py", line 457, in wrapper_fn
+    return func(self, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\wandb_run.py", line 1595, in _console_raw_callback
+    self._backend.interface.publish_output_raw(name, data)
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\interface\interface.py", line 802, in publish_output_raw
+    self._publish_output_raw(o)
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\interface\interface_shared.py", line 37, in _publish_output_raw
+    self._publish(rec)
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\interface\interface_sock.py", line 43, in _publish
+    self._asyncer.run(lambda: self._client.publish(request))
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\lib\asyncio_manager.py", line 136, in run
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\_base.py", line 456, in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\concurrent\futures\_base.py", line 401, in __get_result
+    raise self._exception
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\lib\asyncio_manager.py", line 219, in _wrap
+    return await fn()
+           ^^^^^^^^^^
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\lib\service\service_client.py", line 38, in publish
+    await self._send_server_request(request)
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\site-packages\wandb\sdk\lib\service\service_client.py", line 64, in _send_server_request
+    await self._writer.drain()
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\asyncio\streams.py", line 392, in drain
+    await self._protocol._drain_helper()
+  File "C:\Users\sao\AppData\Local\Programs\Python\Python312\Lib\asyncio\streams.py", line 166, in _drain_helper
+    raise ConnectionResetError('Connection lost')
+ConnectionResetError: Connection lost

@@ -1,246 +1,200 @@
-"""
-Disk-based image cache for text rendering.
-
-Renders text to images once and saves to disk. Subsequent runs load from cache.
-Reduces 2M render operations to disk I/O (10x+ faster).
-"""
-
-import numpy as np
+import os
+import sys
+import json
+import time
+import shutil
 import hashlib
 import pickle
+import numpy as np
+import torch
 from pathlib import Path
-from typing import Optional, List
+from PIL import Image
+import multiprocessing as mp
+from typing import List, Optional, Tuple, Union, Any, Dict
 from tqdm import tqdm
-from multiprocessing import Pool, cpu_count
-import atexit
 
-# Global renderer and denoiser for worker processes (initialized once per worker)
-_worker_renderer = None
-_worker_denoiser = None
-
-def _init_worker():
-    """Initialize worker process with persistent TextRenderer and Denoiser.
-    
-    CRITICAL FIX: Without this, each worker recreates renderer for EVERY sample,
-    causing massive duplication and slowdown.
-    """
-    global _worker_renderer, _worker_denoiser
-    if _worker_renderer is None:
-        from models.text_renderer import TextRenderer
-        _worker_renderer = TextRenderer(width=224, height=224)
-    
-    if _worker_denoiser is None:
-        try:
-            from models.noise2noise_denoiser import SEALNoise2Noise
-            _worker_denoiser = SEALNoise2Noise()
-        except:
-            _worker_denoiser = None  # Fallback
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 class ImageCache:
-    """Cache rendered images with mandatory SEAL Noise2Noise denoising.
+    """
+    Persistent disk-based cache for rendered text images.
     
-    SEAL (Self-Evolving Adaptive Learning) denoising is ALWAYS enabled:
-    - Improves text rendering quality
-    - Minimal overhead (~10ms per batch)
-    - Essential for hybrid pretrained pipeline
+    Features:
+    - SHA256 hashing of text content for unique keys
+    - 2-level directory structure to avoid filesystem limits (ab/abcdef...)
+    - Metadata tracking (hit rates, total size)
+    - Multiprocessing support for parallel rendering
+    - Automatic denoising of rendered images (optional)
     """
     
-    def __init__(self, cache_dir: str = "datasets/vision_unified/text_cache", num_workers: int = None, denoiser_path: str = "models/checkpoints/n2n_denoiser.pt"):
+    def __init__(self, cache_dir: str = "text_cache", num_workers: int = 10):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.num_workers = num_workers
         
-        # Metadata file tracks cached samples
-        self.metadata_file = self.cache_dir / "metadata.pkl"
+        # Metadata
+        self.metadata_file = self.cache_dir / "cache_metadata.json"
         self.metadata = self._load_metadata()
         
-        # Persistent worker pool (reuse instead of recreating)
-        self.num_workers = num_workers or max(2, cpu_count() // 2)  # Don't overwhelm system
-        self._pool = None
-        self._pool_active = False
-        
-        # MANDATORY: Initialize SEAL denoiser
+        # Denoising (loaded lazily/per-worker)
         self.denoiser = None
-        self._init_denoiser_mandatory(denoiser_path)
-    
-    def _init_denoiser_mandatory(self, denoiser_path: Optional[str]):
-        """Initialize SEAL denoiser - MANDATORY for hybrid pipeline.
+        self.device = 'cpu'
         
-        SEAL provides:
-        - Adaptive learning (improves over time)
-        - Better text rendering quality
-        - Cross-modal alignment (text vs native images)
-        """
-        try:
-            from models.noise2noise_denoiser import SEALNoise2Noise, Noise2NoiseDenoiser
-            
-            # Try SEAL-enhanced first (adaptive learning)
-            adaptive_path = denoiser_path.replace('.pt', '_adaptive.pt') if denoiser_path else None
-            
-            if adaptive_path and Path(adaptive_path).exists():
-                self.denoiser = SEALNoise2Noise(
-                    denoiser_path=denoiser_path,
-                    adaptive_gen_path=adaptive_path
-                )
-                print(f"✅ SEAL denoiser loaded: {adaptive_path}")
-            elif denoiser_path and Path(denoiser_path).exists():
-                self.denoiser = Noise2NoiseDenoiser(model_path=denoiser_path)
-                print(f"✅ N2N denoiser loaded: {denoiser_path}")
-                print(f"   💡 Tip: Train adaptive SEAL for better results")
-            else:
-                # No pretrained - use default initialization
-                print(f"ℹ️  No pretrained denoiser - using default N2N")
-                self.denoiser = Noise2NoiseDenoiser()  # Initialize with random weights
-        except Exception as e:
-            print(f"❌ CRITICAL: Denoiser initialization failed: {e}")
-            print(f"   Hybrid pipeline requires denoising for quality")
-            # Use minimal fallback instead of None
-            from models.noise2noise_denoiser import Noise2NoiseDenoiser
-            self.denoiser = Noise2NoiseDenoiser()
+        # Multiprocessing pool (lazy init)
+        self.pool = None
         
-        # Register cleanup
-        atexit.register(self._cleanup_pool)
-        
-    def _load_metadata(self):
-        """Load cache metadata."""
-        if self.metadata_file.exists():
-            try:
-                with open(self.metadata_file, 'rb') as f:
-                    return pickle.load(f)
-            except (EOFError, pickle.UnpicklingError):
-                # Corrupted metadata file, start fresh
-                return {}
-        return {}
-    
-    def _save_metadata(self):
-        """Save cache metadata."""
-        with open(self.metadata_file, 'wb') as f:
-            pickle.dump(self.metadata, f)
-    
+        print(f"Image Cache initialized at: {self.cache_dir}")
+        print(f"   Entries: {self.metadata.get('count', 0):,}")
+        print(f"   Size: {self.metadata.get('size_mb', 0):.2f} MB")
+
     def _get_cache_key(self, text: str, width: int, height: int) -> str:
-        """Generate cache key for text + dimensions."""
-        content = f"{text}|{width}|{height}".encode('utf-8')
-        return hashlib.md5(content).hexdigest()
-    
-    def _get_cache_path(self, cache_key: str) -> Path:
-        """Get file path for cached image."""
-        # Shard into subdirectories to avoid too many files in one dir
-        subdir = cache_key[:2]
-        return self.cache_dir / subdir / f"{cache_key}.npy"
-    
-    def has_been_cached(self, text: str, width: int, height: int) -> bool:
-        """Check if sample was cached (even if image file deleted to save space)."""
-        cache_key = self._get_cache_key(text, width, height)
-        return cache_key in self.metadata
-    
-    def get(self, text: str, width: int, height: int) -> Optional[np.ndarray]:
-        """Get cached image if exists."""
-        cache_key = self._get_cache_key(text, width, height)
-        cache_path = self._get_cache_path(cache_key)
+        """Generate unique hash for text + dimensions."""
+        content = f"{text}_{width}_{height}"
+        return hashlib.sha256(content.encode('utf-8')).hexdigest()
+
+    def _get_cache_path(self, key: str) -> Path:
+        """Get file path with 2-level sharding (e.g., ab/abcdef...)."""
+        # Use first 2 chars for subdirectory to avoid 100k+ files in one dir
+        subdir = self.cache_dir / key[:2]
+        subdir.mkdir(exist_ok=True)
+        return subdir / f"{key}.npy"
+
+    def put(self, text: str, width: int, height: int, image_array: np.ndarray) -> None:
+        """Save image to cache (compressed numpy)."""
+        key = self._get_cache_key(text, width, height)
+        path = self._get_cache_path(key)
         
-        if cache_path.exists():
+        # Save as compressed numpy (uint8) to save space
+        # .npy is faster than PNG for loading
+        np.save(path, image_array.astype(np.uint8))
+        
+        # Update metadata (approximate)
+        if not path.exists():
+            self.metadata['count'] = self.metadata.get('count', 0) + 1
+
+    def get(self, text: str, width: int, height: int) -> Optional[np.ndarray]:
+        """Retrieve image from cache if exists."""
+        key = self._get_cache_key(text, width, height)
+        path = self._get_cache_path(key)
+        
+        if path.exists():
             try:
-                img = np.load(cache_path)
-                # Validate shape matches expected dimensions
-                expected_shape = (height, width, 3)
-                if img.shape != expected_shape:
-                    # Corrupted cache, delete and return None
-                    cache_path.unlink()
-                    if cache_key in self.metadata:
-                        del self.metadata[cache_key]
-                    return None
-                return img
-            except Exception as e:
-                # Corrupted file, delete and return None
-                cache_path.unlink()
-                if cache_key in self.metadata:
-                    del self.metadata[cache_key]
+                return np.load(path)
+            except Exception:
                 return None
         return None
-    
-    def put(self, text: str, width: int, height: int, image: np.ndarray):
-        """Cache rendered image with optional denoising."""
-        cache_key = self._get_cache_key(text, width, height)
-        cache_path = self._get_cache_path(cache_key)
-        cache_path.parent.mkdir(exist_ok=True)
-        
-        # Unified denoising (handles SEAL/standard/none automatically)
-        if self.denoiser is not None:
+
+    def has_been_cached(self, text: str, width: int, height: int) -> bool:
+        """Check if text is already in cache (fast check)."""
+        key = self._get_cache_key(text, width, height)
+        path = self._get_cache_path(key)
+        return path.exists()
+
+    def _init_denoiser_mandatory(self) -> None:
+        """Initialize denoiser - MANDATORY for all rendered images."""
+        if self.denoiser is None:
             try:
-                image = self.denoiser.denoise(image)
-            except Exception:
-                pass  # Fallback to original on error
-        
-        # Save and track
-        np.save(cache_path, image)
-        self.metadata[cache_key] = {
-            'text_hash': cache_key,
-            'width': width,
-            'height': height,
-            'path': str(cache_path),
-            'denoised': self.denoiser is not None
-        }
-    
-    def _render_sample(self, args):
-        """Helper for parallel rendering (must be picklable)."""
-        global _worker_renderer
-        
-        sample, width, height = args
-        
-        # Initialize renderer if needed (once per worker)
-        if _worker_renderer is None:
-            _init_worker_renderer(width, height)
-        
-        # Extract text
-        if hasattr(sample, 'text'):
-            text = sample.text
-        elif hasattr(sample, 'question'):
-            text = sample.question
-        elif isinstance(sample, dict):
-            text = sample.get('text', '') or sample.get('question', '') or str(sample)
+                # Try importing fastdncnn first
+                from models.fastdncnn import FastDNCNN
+                self.denoiser = FastDNCNN(in_nc=1, out_nc=1, nc=64, nb=17, act_mode='BR')
+                
+                # Load pretrained weights
+                weights_path = Path("weights/fastdncnn_gray.pth")
+                if weights_path.exists():
+                    self.denoiser.load_state_dict(torch.load(weights_path, map_location='cpu'))
+                else:
+                    print(f"WARNING: Denoiser weights not found at {weights_path}, using random init (suboptimal)")
+                
+                self.denoiser.eval()
+                # Keep on CPU for workers to avoid CUDA context issues in multiprocessing
+                self.denoiser.to('cpu') 
+            except ImportError:
+                print("ERROR: Could not import FastDNCNN. Denoising disabled (quality may suffer).")
+                self.denoiser = None
+            except Exception as e:
+                print(f"Error initializing denoiser: {e}")
+                self.denoiser = None
+
+    def _denoise_image(self, img_array: np.ndarray) -> np.ndarray:
+        """Apply denoising to rendered image."""
+        if self.denoiser is None:
+            self._init_denoiser_mandatory()
+            
+        if self.denoiser is None:
+            return img_array
+
+        # Prepare for model (H,W,C) -> (1,1,H,W)
+        # Assuming grayscale/binary rendering for now, but keeping 3 channels
+        img_tensor = torch.from_numpy(img_array).float() / 255.0
+        if img_tensor.ndim == 3 and img_tensor.shape[2] == 3:
+            # Convert to grayscale for denoising
+            gray = 0.299 * img_tensor[:,:,0] + 0.587 * img_tensor[:,:,1] + 0.114 * img_tensor[:,:,2]
+            gray = gray.unsqueeze(0).unsqueeze(0) # (1,1,H,W)
         else:
-            text = str(sample)
+            gray = img_tensor.permute(2, 0, 1).unsqueeze(0)
+
+        with torch.no_grad():
+            denoised = self.denoiser(gray)
         
-        # Check if already cached
-        cache_key = self._get_cache_key(text, width, height)
-        cache_path = self._get_cache_path(cache_key)
+        # Convert back
+        denoised = denoised.squeeze().clamp(0, 1).numpy()
+        denoised = (denoised * 255).astype(np.uint8)
         
-        if cache_path.exists():
-            return None, text  # Already cached
-        
-        # Render using global renderer (already initialized)
-        pil_img = _worker_renderer.render_plain_text(text)
-        img_array = np.array(pil_img)
-        
-        return img_array, text
-    
-    def _get_or_create_pool(self):
-        """Get persistent pool or create if needed with proper worker initialization."""
-        if self._pool is None or not self._pool_active:
-            self._pool = Pool(
-                processes=self.num_workers,
-                initializer=_init_worker  # Uses global renderer/denoiser
-            )
-            self._pool_active = True
-        return self._pool
-    
-    def _cleanup_pool(self):
-        """Cleanup worker pool."""
-        if self._pool is not None and self._pool_active:
-            try:
-                self._pool.close()
-                self._pool.join()
-            except:
-                pass
-            self._pool_active = False
-    
-    def _render_samples_parallel(self, samples, num_workers=None):
-        """Render samples in parallel (helper for streaming).
-        
-        Optimizations:
-        - Reuses persistent pool (no recreation overhead)
-        - Skips multiprocessing for small batches (< 50 samples)
-        - Workers initialize TextRenderer once
+        # Restore to 3 channels
+        return np.stack([denoised]*3, axis=-1)
+
+    def populate_cache(self, samples: List[Any], renderer_fn, batch_size: int = 100) -> Tuple[int, int]:
         """
+        Populate cache for a list of samples.
+        Returns (cached_count, newly_rendered_count).
+        """
+        total = len(samples)
+        cached_count = 0
+        newly_rendered = 0
+        
+        # Filter out already cached
+        uncached_samples = []
+        print(f"🔍 Checking cache for {total} samples...")
+        
+        for sample in tqdm(samples, desc="Checking cache"):
+            # Extract text
+            if hasattr(sample, 'text'):
+                text = sample.text
+            elif hasattr(sample, 'question'):
+                text = sample.question
+            elif isinstance(sample, dict):
+                text = sample.get('text', '') or sample.get('question', '')
+            else:
+                text = str(sample)
+            
+            if self.has_been_cached(text, 224, 224):
+                cached_count += 1
+            else:
+                uncached_samples.append(sample)
+        
+        if not uncached_samples:
+            return cached_count, 0
+            
+        print(f"Rendering {len(uncached_samples)} new samples...")
+        
+        # Render in parallel
+        self._render_samples_parallel(uncached_samples)
+        newly_rendered = len(uncached_samples)
+        
+        self._save_metadata()
+        return cached_count, newly_rendered
+
+    def _get_or_create_pool(self) -> mp.Pool:
+        """Get existing pool or create new one."""
+        if self.pool is None:
+            # Use 'spawn' context for compatibility with PyTorch
+            ctx = mp.get_context('spawn')
+            self.pool = ctx.Pool(processes=self.num_workers)
+        return self.pool
+
+    def _render_samples_parallel(self, samples: List[Any], num_workers: Optional[int] = None) -> List[Tuple[Optional[np.ndarray], str]]:
+        """Render samples in parallel (helper for streaming)."""
         # For very small batches, multiprocessing overhead exceeds benefit
         if len(samples) < 50:
             # Single-threaded rendering for small batches
@@ -260,10 +214,10 @@ class ImageCache:
                     text = str(sample)
                 
                 # Check if already cached
-                cache_key = self._get_cache_key(text, 224, 224)
-                cache_path = self._get_cache_path(cache_key)
+                key = self._get_cache_key(text, 224, 224)
+                path = self._get_cache_path(key)
                 
-                if cache_path.exists():
+                if path.exists():
                     results.append((None, text))
                 else:
                     pil_img = renderer.render_plain_text(text)
@@ -291,94 +245,49 @@ class ImageCache:
                 self.put(text, 224, 224, img_array)
         
         return results
-    
-    def populate_cache(self, samples, renderer=None, batch_size=1000, save_every=5, num_workers=None):
-        """Pre-populate cache with optimized parallel rendering.
+
+    @staticmethod
+    def _render_sample(args: Tuple[Any, int, int]) -> Tuple[Optional[np.ndarray], str]:
+        """Static worker method for multiprocessing."""
+        sample, width, height = args
         
-        Optimizations:
-        - Reuses persistent worker pool
-        - Skips multiprocessing for small batches
-        - Workers initialize once
-        """
-        if num_workers is not None:
-            # Override default worker count if specified
-            self.num_workers = num_workers
-        
-        print(f"📦 Pre-populating image cache (parallel: {self.num_workers} workers)...")
-        
-        total = len(samples)
-        cached = 0
-        rendered = 0
-        batch_count = 0
-        
-        # Process in smaller chunks for better progress tracking
-        chunk_size = batch_size
-        
-        # Get persistent pool (reuse across chunks)
-        pool = self._get_or_create_pool()
+        # Extract text
+        if hasattr(sample, 'text'):
+            text = sample.text
+        elif hasattr(sample, 'question'):
+            text = sample.question
+        elif isinstance(sample, dict):
+            text = sample.get('text', '') or sample.get('question', '') or str(sample)
+        else:
+            text = str(sample)
+            
+        # Re-instantiate renderer in worker process
+        # This is fast enough and avoids pickling complex objects
+        from models.text_renderer import TextRenderer
+        renderer = TextRenderer(width=width, height=height)
         
         try:
-            for i in tqdm(range(0, total, chunk_size), desc="Caching"):
-                chunk = samples[i:i+chunk_size]
-                
-                # Skip multiprocessing for tiny chunks
-                if len(chunk) < 50:
-                    # Single-threaded for tiny chunks
-                    from models.text_renderer import TextRenderer
-                    single_renderer = TextRenderer(width=224, height=224)
-                    
-                    for sample in chunk:
-                        # Extract text
-                        if hasattr(sample, 'text'):
-                            text = sample.text
-                        elif hasattr(sample, 'question'):
-                            text = sample.question
-                        elif isinstance(sample, dict):
-                            text = sample.get('text', '') or sample.get('question', '') or str(sample)
-                        else:
-                            text = str(sample)
-                        
-                        cache_key = self._get_cache_key(text, 224, 224)
-                        cache_path = self._get_cache_path(cache_key)
-                        
-                        if cache_path.exists():
-                            cached += 1
-                        else:
-                            pil_img = single_renderer.render_plain_text(text)
-                            img_array = np.array(pil_img)
-                            self.put(text, 224, 224, img_array)
-                            rendered += 1
-                else:
-                    # Parallel render for larger chunks
-                    args_list = [(sample, 224, 224) for sample in chunk]
-                    chunksize = max(1, len(chunk) // (self.num_workers * 4))
-                    results = pool.map(self._render_sample, args_list, chunksize=chunksize)
-                    
-                    # Save rendered images
-                    for img_array, text in results:
-                        if img_array is None:
-                            cached += 1
-                        else:
-                            self.put(text, 224, 224, img_array)
-                            rendered += 1
-                
-                batch_count += 1
-                
-                # Save metadata periodically
-                if batch_count % save_every == 0:
-                    self._save_metadata()
-        
-        finally:
-            # Don't close pool - reuse for next call
+            pil_img = renderer.render_plain_text(text)
+            return np.array(pil_img), text
+        except Exception as e:
+            # Return blank image on failure
+            print(f"Render failed for '{text[:20]}...': {e}")
+            return np.ones((height, width, 3), dtype=np.uint8) * 255, text
+
+    def _save_metadata(self) -> None:
+        """Save cache metadata to disk."""
+        try:
+            with open(self.metadata_file, 'w') as f:
+                json.dump(self.metadata, f)
+        except Exception:
             pass
-        
-        # Final metadata save
-        self._save_metadata()
-        
-        print(f"✅ Cache populated:")
-        print(f"   Cached (reused): {cached}")
-        print(f"   Rendered (new): {rendered}")
-        print(f"   Total: {total}")
-        print(f"   Cache dir: {self.cache_dir}")
-        
-        return cached, rendered
+
+    def _load_metadata(self) -> Dict[str, Any]:
+        """Load cache metadata from disk."""
+        if self.metadata_file.exists():
+            try:
+                with open(self.metadata_file, 'r') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {'count': 0, 'size_mb': 0.0}

@@ -1,0 +1,124 @@
+arch:
+  H_cycles: 5
+  H_layers: 0
+  L_cycles: 5
+  L_layers: 4
+  checksum_halt_threshold: 0.5
+  cpu_optimized: false
+  curiosity_count_beta: 0.05
+  curiosity_rnd_weight: 0.1
+  deep_supervision_steps: 3
+  dqn_batch_size: 128
+  dqn_buffer_capacity: 500000
+  dqn_buffer_min_size: 1000
+  dqn_epsilon_decay_steps: 200000
+  dqn_epsilon_end: 0.05
+  dqn_epsilon_start: 0.3
+  dqn_gamma: 0.99
+  dqn_warmstart_steps: 10000
+  ema_decay: 0.999
+  enable_adaptive_hcycles: true
+  enable_capsule_expansion: false
+  enable_count_curiosity: true
+  enable_dqn: true
+  enable_entropy_regularization: false
+  enable_gradient_checkpointing: true
+  enable_hierarchical_attention: true
+  enable_latent_planning: true
+  enable_memory: true
+  enable_mtp: true
+  enable_prioritized_replay: false
+  enable_rnd_curiosity: true
+  encoder_H_cycles: 4
+  encoder_L_cycles: 5
+  encoder_num_layers: 4
+  entropy_regularization_weight: 0.01
+  expansion: 4
+  ffn_expansion_ratio: 4.0
+  forward_dtype: float16
+  halt_exploration_prob: 0.1
+  halt_max_steps: 64
+  hcycle_confidence_threshold: 2.0
+  hidden_size: 1024
+  latent_num_paths: 4
+  latent_planning_depth: 2
+  latent_use_adaptive_gate: true
+  loss:
+    loss_type: stablemax_cross_entropy
+    name: losses@ACTLossHead
+  memory_capacity: 512
+  memory_dropout: 0.1
+  memory_num_heads: 16
+  memory_reward_bonus: 0.5
+  memory_reward_threshold: 0.05
+  mlp_t: false
+  mtp_loss_weight: 0.5
+  mtp_num_depths: 3
+  mtp_share_embeddings: true
+  mtp_share_output_head: true
+  name: recursive_reasoning.trm@TinyRecursiveReasoningModel_ACTV1
+  no_ACT_continue: true
+  num_heads: 16
+  num_key_value_heads: 16
+  per_alpha: 0.6
+  per_beta: 0.4
+  pos_encodings: rope
+  puzzle_emb_len: 16
+  puzzle_emb_ndim: 1024
+  q_head_hidden_size: 128
+  q_head_num_actions: 3
+  q_head_num_layers: 1
+  q_head_type: mlp
+  reconstruction_weight: 0.5
+  reward_step_penalty: 0.01
+  reward_terminal_correct: 1.0
+  reward_terminal_incorrect: -0.5
+  rope_theta: 10000
+  use_ema: true
+  use_gelu: true
+beta1: 0.9
+beta2: 0.98
+checkpoint_every_eval: true
+checkpoint_path: checkpoints/hybrid_pretrained
+data_paths:
+- datasets/vision_unified
+data_paths_test: []
+dqn_warmup_ratio: 0.2
+dqn_warmup_steps: 5000
+ema: true
+ema_rate: 0.999
+enable_optimizer_fallback: true
+enable_q_temperature_annealing: true
+epochs: 1000000
+eval_interval: 5
+eval_save_outputs: []
+evaluators:
+- name: arc@ARC
+expansion_anneal_ratio: 0.5
+expansion_anneal_steps: 50000
+expansion_penalty_end: 0.001
+expansion_penalty_schedule: cosine
+expansion_penalty_start: 0.1
+freeze_representation_during_warmup: true
+freeze_weights: false
+global_batch_size: 32
+load_checkpoint: null
+lr: 5.0e-05
+lr_min_ratio: 0.1
+lr_warmup_steps: 3000
+max_steps: null
+min_eval_interval: 0
+nan_threshold_for_fallback: 3
+optimizer_type: adamatan2
+project_name: Vision_unified-ACT-torch
+puzzle_emb_lr: 0.01
+puzzle_emb_weight_decay: 0.1
+q_temperature_anneal_ratio: 1.0
+q_temperature_end: 0.1
+q_temperature_schedule: exponential
+q_temperature_start: 1.0
+replay_max_age: 100000
+replay_recent_fraction: 0.25
+run_name: TinyRecursiveReasoningModel_ACTV1 premium-junglefowl
+seed: 0
+weight_decay: 0.1

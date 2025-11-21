@@ -1,0 +1,11 @@
+   Total parameters: 366,048,955
+Error executing job with overrides: []
+Traceback (most recent call last):
+  File "C:\Users\sao\Documents\model-engine\pretrain.py", line 1506, in launch
+    save_code_and_config(config)
+  File "C:\Users\sao\Documents\model-engine\pretrain.py", line 1344, in save_code_and_config
+    shutil.copy(code_file, os.path.join(config.checkpoint_path, code_name))
+    ^^^^^^
+NameError: name 'shutil' is not defined. Did you forget to import 'shutil'
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.

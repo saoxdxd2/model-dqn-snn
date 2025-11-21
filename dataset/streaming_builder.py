@@ -9,11 +9,55 @@ import threading
 import queue
 import gc
 import time
+import os
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from pathlib import Path
-from typing import List
+from typing import List, Optional, Dict, Any
+import json
+from safetensors.torch import save_file, load_file
+from dataset.image_cache import ImageCache
+
+
+class CachedDataset(Dataset):
+    """Custom dataset that loads from cache."""
+    def __init__(self, samples: List[Any], cache: ImageCache):
+        self.samples = samples
+        self.cache = cache
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        # Extract text safely
+        # Extract cache key (unified logic)
+        if hasattr(sample, '_cache_key'):
+            key = sample._cache_key
+        else:
+            # Fallback key generation
+            if hasattr(sample, 'image') and sample.image is not None:
+                key = f"IMG:{sample.sample_id}"
+            elif hasattr(sample, 'grid') and sample.grid is not None:
+                key = f"GRID:{sample.sample_id}"
+            else:
+                if hasattr(sample, 'text') and sample.text:
+                    key = sample.text
+                elif hasattr(sample, 'question') and sample.question:
+                    key = sample.question
+                elif isinstance(sample, dict):
+                    key = sample.get('text', '') or sample.get('question', '')
+                else:
+                    key = str(sample)
+        
+        # Load from cache (all samples should be cached now)
+        img = self.cache.get(key, 224, 224)
+        if img is None:
+            # This should ideally not happen if synchronization is correct
+            # But if it does, we might want to retry or raise a more informative error
+            raise ValueError(f"Sample {idx} not in cache: {text[:50]}...")
+        return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
 
 
 class StreamingCacheEncoder:
@@ -48,306 +92,285 @@ class StreamingCacheEncoder:
         self.cached_count = 0  # Number of samples cached so far
         self.cache_threshold_reached = threading.Event()  # Signal when threshold reached
         self.new_batches_start_idx = 0  # Index where NEW batches start (after resume)
-        self.consolidation_pause = threading.Event()  # Pause threads during consolidation
-        self.consolidation_pause.set()  # Start unpaused
-        self.threads_paused_count = 0  # Track how many threads are paused
-        self.threads_paused_lock = threading.Lock()  # Lock for paused counter
+        self.new_batches_start_idx = 0  # Index where NEW batches start (after resume)
         
     def producer_thread(self, samples, renderer, start_threshold=50000):
         """
-        CPU thread: Render samples and add to cache.
-        Signals GPU thread once threshold is reached.
+        CPU thread: Render samples (text/grid/image) -> ImageCache.
+        Ensures ALL modalities are converted to images before GPU encoding.
         """
-        print(f"📦 Producer: Rendering samples (parallel CPUs)...")
-        
-        from dataset.image_cache import ImageCache
+        print(f"Producer: Processing samples -> Images (parallel CPUs)...")
         
         # Render in batches (skip already cached)
-        # Small batches = frequent pause checks (responds to consolidation faster)
         batch_size = 100
-        total = len(samples)
         cached_count = 0
         skipped_count = 0
         
         # Progress bar for caching
-        pbar = tqdm(total=total, desc="📦 Caching", unit="samples")
+        pbar = tqdm(desc="Caching", unit="samples")
         
-        for i in range(0, total, batch_size):
-            # Always check pause state (returns immediately if not paused)
-            # Prevents race condition where pause happens between check and processing
-            if not self.consolidation_pause.is_set():
-                pbar.write("🔴 Producer: Pause requested, pausing...")
-                with self.threads_paused_lock:
-                    self.threads_paused_count += 1
-                try:
-                    self.consolidation_pause.wait()
-                    pbar.write("🟢 Producer: Resuming after pause")
-                finally:
-                    with self.threads_paused_lock:
-                        self.threads_paused_count -= 1
+        # Handle generator or list
+        batch_buffer = []
+        
+        for sample in samples:
+
             
-            batch = samples[i:i+batch_size]
+            batch_buffer.append(sample)
+            print(f"DEBUG: Producer received sample: {str(sample)[:50]}")
             
-            # Filter out already-cached samples
-            uncached = []
-            for sample in batch:
-                # Extract text from DataSample object
-                if hasattr(sample, 'text'):
-                    text = sample.text
-                elif hasattr(sample, 'question'):
-                    text = sample.question
-                elif isinstance(sample, dict):
-                    text = sample.get('text', '') or sample.get('question', '')
-                else:
-                    text = str(sample)
+            if len(batch_buffer) >= batch_size:
+                print(f"DEBUG: Producer processing batch of {len(batch_buffer)}")
+                self._process_batch(batch_buffer, renderer, pbar)
+                batch_buffer = []
                 
-                # Fast metadata check (memory lookup, no disk I/O)
-                # Metadata is preserved and valid since we don't auto-clear cache anymore
-                if not self.cache.has_been_cached(text, 224, 224):
-                    uncached.append(sample)
-                else:
-                    skipped_count += 1
+        # Process remaining
+        if batch_buffer:
+            print(f"DEBUG: Producer processing remaining batch of {len(batch_buffer)}")
+            self._process_batch(batch_buffer, renderer, pbar)
             
-            # Only render uncached samples
-            if uncached:
-                self.cache._render_samples_parallel(uncached, num_workers=10)
-                cached_count += len(uncached)
-                # Parallel rendering handles disk writes - no verification needed
-            
-            # Update progress bar
-            pbar.update(len(batch))
-            pbar.set_postfix({
-                'cached': cached_count,
-                'skipped': skipped_count
-            })
-            
-            # Update cached count for consumer
-            processed_so_far = i + len(batch)
-            with self.lock:
-                self.cached_count = processed_so_far
-                # Signal GPU to start after threshold
-                if processed_so_far >= start_threshold and not self.cache_threshold_reached.is_set():
-                    pbar.write(f"✅ GPU starting after {processed_so_far} samples cached")
-                    self.cache_threshold_reached.set()
-            
-            # Periodic metadata save
-            if (i // batch_size) % 5 == 0:
-                self.cache._save_metadata()
-        
         # Signal completion
         pbar.close()
         self.cache_complete.set()
         self.ready_queue.put(None)  # Sentinel to stop consumer
-        print(f"✅ Caching complete! {total} samples processed")
-        print(f"   {skipped_count} already cached (skipped)")
-        print(f"   {cached_count} newly rendered")
-    
-    def consumer_thread(self, samples):
-        """
-        GPU thread: Start after threshold, encode only cached samples in parallel with caching.
-        Saves each batch immediately to disk.
-        """
-        # Wait for threshold to be reached
-        print(f"⏳ Consumer: Waiting for initial cache threshold...")
-        self.cache_threshold_reached.wait()
-        print(f"🚀 Consumer: Starting GPU encoding (caching continues in parallel)...") 
+        print(f"Caching complete!")
+
+    def _process_batch(self, batch, renderer, pbar):
+        """Process a batch of samples: cache -> queue."""
+        uncached = []
+        for sample in batch:
+            # Determine cache key based on modality
+            if sample.image is not None:
+                key = f"IMG:{sample.sample_id}"
+            elif sample.grid is not None:
+                key = f"GRID:{sample.sample_id}"
+            else:
+                if hasattr(sample, 'text') and sample.text:
+                    key = sample.text
+                elif hasattr(sample, 'question') and sample.question:
+                    key = sample.question
+                else:
+                    key = str(sample)
+            
+            sample._cache_key = key
+            
+            if not self.cache.has_been_cached(key, 224, 224):
+                uncached.append(sample)
         
-        # Custom dataset that loads from cache
-        class CachedDataset(torch.utils.data.Dataset):
-            def __init__(self, samples, cache):
-                self.samples = samples
-                self.cache = cache
+        if uncached:
+            self._process_batch_to_cache(uncached, renderer)
+            self.cached_count += len(uncached)
             
-            def __len__(self):
-                return len(self.samples)
-            
-            def __getitem__(self, idx):
-                sample = self.samples[idx]
-                text = sample.get('text', '') or sample.get('question', '')
+            # Check threshold
+            if self.cached_count >= 50000 and not self.cache_threshold_reached.is_set():
+                self.cache_threshold_reached.set()
+                print(f"Cache threshold reached ({self.cached_count}), signaling GPU...")
+        
+        # Push lightweight samples to queue for consumer
+        for sample in batch:
+            # Clear heavy data to save RAM
+            sample.image = None
+            sample.grid = None
+            self.ready_queue.put(sample)
+            pbar.update(1)
+
                 
-                # Load from cache (all samples should be cached now)
-                img = self.cache.get(text, 224, 224)
-                if img is None:
-                    raise ValueError(f"Sample {idx} not in cache: {text[:50]}...")
-                return torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+    def _process_batch_to_cache(self, samples, renderer):
+        """Helper: Convert batch of mixed samples to images and save to cache."""
+        import numpy as np
+        from PIL import Image
+        import cv2
         
-        # Process samples in order, only encoding what's been cached
-        import gc
-        import os
+        for sample in samples:
+            key = getattr(sample, '_cache_key', str(sample))
+            img_array = None
+            
+            try:
+                # 1. Existing Image
+                if sample.image is not None:
+                    if isinstance(sample.image, np.ndarray):
+                        img = sample.image
+                    elif isinstance(sample.image, Image.Image):
+                        img = np.array(sample.image)
+                    else:
+                        continue # Skip invalid
+                        
+                    # Resize if needed
+                    if img.shape[0] != 224 or img.shape[1] != 224:
+                        img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_LANCZOS4)
+                    
+                    img_array = img
+                
+                # 2. Grid -> Image
+                elif sample.grid is not None:
+                    # Simple grid visualization
+                    # Normalize to 0-255
+                    grid = sample.grid.astype(np.float32)
+                    if grid.max() > 0:
+                        grid = (grid / grid.max() * 255).astype(np.uint8)
+                    else:
+                        grid = grid.astype(np.uint8)
+                    
+                    # Resize nearest neighbor to preserve grid structure
+                    img = cv2.resize(grid, (224, 224), interpolation=cv2.INTER_NEAREST)
+                    # Convert to RGB
+                    img_array = np.stack([img]*3, axis=-1)
+                
+                # 3. Text -> Image (Renderer)
+                else:
+                    # Use renderer
+                    pil_img = renderer.render_plain_text(key) # key is the text for text samples
+                    img_array = np.array(pil_img)
+                
+                # Save to cache
+                if img_array is not None:
+                    print(f"DEBUG: Caching {key[:20]}...")
+                    self.cache.put(key, 224, 224, img_array)
+                    
+            except Exception as e:
+                print(f"Failed to process sample {sample.sample_id}: {e}")
+    
+    def consumer_thread(self, samples=None):
+        """
+        GPU thread: Pull from queue, encode cached samples.
+        """
+        print(f"Consumer: Starting GPU encoding loop...") 
         
         # Calculate starting batch number accounting for consolidated files
-        # CRITICAL: Batch numbers must be ABSOLUTE, not relative to sliced array
         num_consolidated_batches = len(self.drive_checkpoints) * 100
-        batch_count = num_consolidated_batches  # Start from first unconsolidated batch
-        sample_idx = 0  # But sample_idx=0 in the SLICED array
-        total_batches = (len(samples) + self.batch_size - 1) // self.batch_size
+        batch_count = num_consolidated_batches
         
-        # Fast-forward: find first missing batch AFTER consolidated batches
-        if self.checkpoint_dir:
-            print(f"🔍 Fast-forwarding to first unencoded batch...")
-            # Start checking from first unconsolidated batch number
-            for check_batch in range(num_consolidated_batches, num_consolidated_batches + total_batches):
-                batch_file = os.path.join(self.checkpoint_dir, f"batch_{check_batch:05d}.pt")
-                if not os.path.exists(batch_file):
-                    # Found first missing batch
-                    batch_count = check_batch
-                    sample_idx = 0  # Start of sliced array
-                    
-                    # Register existing batch files in the unconsolidated range
-                    for i in range(num_consolidated_batches, check_batch):
-                        existing_file = os.path.join(self.checkpoint_dir, f"batch_{i:05d}.pt")
-                        if os.path.exists(existing_file):
-                            with self.lock:
-                                self.batch_files.append(existing_file)
-                    
-                    # Mark where new batches start (for consolidation)
-                    with self.lock:
-                        self.new_batches_start_idx = check_batch
-                    
-                    skipped = check_batch - num_consolidated_batches
-                    if skipped > 0:
-                        print(f"⏩ Skipped {skipped} existing batches (already in checkpoint files)")
-                    print(f"▶️  Starting encoding from batch {batch_count} (sample 0 of remaining {len(samples):,})")
-                    break
+        # Fast-forward logic would need to consume queue until match...
+        # For now, we assume streaming starts from where we left off or 0
+        # If resuming, producer should skip samples before pushing to queue
         
-        pbar = tqdm(total=total_batches, initial=batch_count, desc="GPU Encoding")
+        pbar = tqdm(desc="GPU Encoding", unit="batches")
+        
+        batch_buffer = []
         
         with torch.no_grad():
-            while sample_idx < len(samples):
-                # NOTE: Consumer does NOT pause - it's the one calling consolidation!
-                # Only the producer (caching) thread pauses during consolidation.
-                
-                # Wait until this batch is fully cached
-                batch_end = min(sample_idx + self.batch_size, len(samples))
-                while True:
-                    # Consumer never pauses - just wait for cache
-                    with self.lock:
-                        if self.cached_count >= batch_end:
-                            break
-                    # Wait for more samples to be cached
+            while True:
+                # Get sample from queue
+                try:
+                    sample = self.ready_queue.get(timeout=1.0)
+                except queue.Empty:
                     if self.cache_complete.is_set():
                         break
-                    time.sleep(0.1)
-                
-                # Load this batch from cache
-                batch_samples = samples[sample_idx:batch_end]
-                batch_images = []
-                missing_count = 0
-                
-                for sample in batch_samples:
-                    if hasattr(sample, 'text'):
-                        text = sample.text
-                    elif hasattr(sample, 'question'):
-                        text = sample.question
-                    elif isinstance(sample, dict):
-                        text = sample.get('text', '') or sample.get('question', '')
-                    else:
-                        text = str(sample)
-                    
-                    img = self.cache.get(text, 224, 224)
-                    if img is not None:
-                        batch_images.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
-                    else:
-                        missing_count += 1
-                
-                # If batch is incomplete, wait a bit longer
-                if missing_count > 0:
-                    if not self.cache_complete.is_set():
-                        pbar.write(f"⏳ Batch {batch_count}: {missing_count}/{len(batch_samples)} samples not cached yet, waiting...")
-                        time.sleep(1)
-                        continue  # Retry this batch
-                    else:
-                        pbar.write(f"⚠️  Batch {batch_count}: {missing_count} samples missing (cache complete)")
-                
-                if not batch_images:
-                    # Skip this batch if no images available
-                    sample_idx = batch_end
-                    pbar.update(1)
                     continue
                 
-                # Setup batch file path and check if already exists
-                batch_file = None
-                if self.checkpoint_dir:
-                    os.makedirs(self.checkpoint_dir, exist_ok=True)  # Ensure directory exists
-                    batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_count:05d}.pt")
+                if sample is None: # Sentinel
+                    break
+                
+                batch_buffer.append(sample)
+                
+                if len(batch_buffer) >= self.batch_size:
+                    self._encode_batch(batch_buffer, batch_count, pbar)
+                    batch_buffer = []
+                    batch_count += 1
                     
-                    if os.path.exists(batch_file):
-                        # Batch already encoded, skip and register
-                        with self.lock:
-                            self.batch_files.append(batch_file)
-                        sample_idx = batch_end
-                        batch_count += 1
-                        pbar.update(1)
-                        pbar.write(f"⏭️  Batch {batch_count-1} already exists, skipping")
-                        continue
-                
-                # Encode batch
-                batch_images = torch.stack(batch_images).to(self.device)
-                result = self.encoder(images=batch_images, return_children=True)
-                
-                # Save this batch immediately to disk (GPU -> Disk)
-                if batch_file is not None:
-                    batch_data = {
-                        'sketches': result['sketches'].half().cpu(),
-                        'checksums': result['checksums'].half().cpu() if 'checksums' in result else None,
-                        'children': result['children'].half().cpu() if 'children' in result else None
-                    }
-                    torch.save(batch_data, batch_file)
+                    # Cleanup every 10 batches
+                    if batch_count % 10 == 0:
+                        gc.collect()
+                        torch.cuda.empty_cache()
                     
-                    with self.lock:
-                        self.batch_files.append(batch_file)
-                        
-                        # Record batch in progress tracker
-                        if hasattr(self, 'progress_tracker'):
-                            batch_id = int(batch_file.stem.split('_')[1])
-                            self.progress_tracker.record_batch_built(batch_id)
-                
-                del batch_images, result, batch_data
-                batch_count += 1
-                
-                # Cleanup every 10 batches
-                if batch_count % 10 == 0:
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                
-                # Progress update every 500 batches
-                if batch_count % 500 == 0:
-                    pbar.write(f"💾 Saved {batch_count} batches to disk")
-                
-                # Consolidate every 100 batches to prevent disk overflow (critical for Colab)
-                if batch_count % 100 == 0 and self.checkpoint_dir:
-                    pbar.write(f"📤 Consolidating batches to free disk space...")
-                    self._consolidate_to_drive(batch_count)
-                
-                # Move to next batch
-                sample_idx = batch_end
-                pbar.update(1)
+                    # Consolidate every 100 batches
+                    if batch_count % 100 == 0 and self.checkpoint_dir:
+                        pbar.write(f"Consolidating batches...")
+                        self._consolidate_to_drive(batch_count)
+
+            # Process remaining
+            if batch_buffer:
+                self._encode_batch(batch_buffer, batch_count, pbar)
         
         pbar.close()
-        print(f"✅ Consumer: Encoding complete")
-    
-    def _consolidate_to_drive(self, up_to_batch):
-        """Consolidate processed batches using unified progress tracker."""
-        import os
-        import gc
+        print(f"Consumer: Encoding complete")
+
+    def _encode_batch(self, batch_samples, batch_count, pbar):
+        """Helper to encode a batch."""
+        batch_images = []
+        missing_count = 0
         
+        for sample in batch_samples:
+            key = getattr(sample, '_cache_key', str(sample))
+            img = self.cache.get(key, 224, 224)
+            if img is not None:
+                batch_images.append(torch.from_numpy(img).permute(2, 0, 1).float() / 255.0)
+            else:
+                print(f"DEBUG: Missing in cache: {key[:20]}")
+                missing_count += 1
+        
+        if not batch_images:
+            print("DEBUG: No images in batch, skipping encode")
+            return
+
+        # Setup batch file path
+        if self.checkpoint_dir:
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
+            batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_count:05d}.safetensors")
+            meta_file = os.path.join(self.checkpoint_dir, f"batch_{batch_count:05d}_meta.json")
+            
+            if os.path.exists(batch_file):
+                pbar.update(1)
+                return
+
+        # Encode
+        batch_images = torch.stack(batch_images).to(self.device)
+        result = self.encoder(images=batch_images, return_children=True)
+        
+        # Save
+        if self.checkpoint_dir:
+            tensors = {'sketches': result['sketches'].half().cpu()}
+            
+            # Sanitize metadata for JSON
+            checksums = result.get('checksums', [])
+            if hasattr(checksums, 'tolist'):
+                checksums = checksums.tolist()
+            
+            if checksums and isinstance(checksums[0], bytes):
+                checksums = [c.decode('utf-8') for c in checksums]
+                
+            metadata = {
+                'checksums': checksums,
+                'children': result['children'].tolist() if 'children' in result else []
+            }
+            
+            try:
+                save_file(tensors, batch_file)
+                with open(meta_file, 'w') as f:
+                    json.dump(metadata, f)
+            except Exception as e:
+                print(f"Error saving batch {batch_count}: {e}")
+                # Try to delete corrupted files
+                if os.path.exists(batch_file): os.remove(batch_file)
+                if os.path.exists(meta_file): os.remove(meta_file)
+            
+            with self.lock:
+                self.batch_files.append(batch_file)
+                if hasattr(self, 'progress_tracker'):
+                    self.progress_tracker.record_batch_built(batch_count)
+        
+        pbar.update(1)
+    
+    def _consolidate_to_drive(self, up_to_batch, final=False):
+        """Consolidate processed batches using unified progress tracker."""
         # Use progress tracker to determine what to consolidate
         if not hasattr(self, 'progress_tracker'):
-            return  # No tracker initialized yet
+            # Fallback for simple usage
+            start_batch = len(self.drive_checkpoints) * 100
+            end_batch = up_to_batch
+            next_chunk_id = len(self.drive_checkpoints)
+        else:
+            # Get next chunk to consolidate
+            start_batch, end_batch, next_chunk_id = self.progress_tracker.get_batches_to_consolidate()
+            if end_batch == 0:
+                return
         
-        # Get batches to consolidate from tracker
-        start_batch, end_batch, next_chunk_id = self.progress_tracker.get_batches_to_consolidate()
-        
-        if end_batch == 0:
-            return  # Not enough batches for a complete chunk
-        
-        # Only consolidate up to the requested batch limit
+        # Ensure we don't go beyond what's available
         end_batch = min(end_batch, up_to_batch)
         
         # Build list of batch files to consolidate
         batch_subset = []
         for batch_num in range(start_batch, end_batch):
-            batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_num:05d}.pt")
+            batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_num:05d}.safetensors")
             if os.path.exists(batch_file):
                 batch_subset.append(batch_file)
         
@@ -356,28 +379,10 @@ class StreamingCacheEncoder:
         
         chunk_size = end_batch - start_batch
         
-        # Pause producer thread during consolidation
-        # NOTE: Consumer (GPU) thread is the one calling this, so it can't pause itself!
-        # Only pause the producer (caching) thread
-        self.consolidation_pause.clear()
-        print(f"⏸️  Pausing caching thread...")
+
         
-        # Wait for producer thread to pause (NOT consumer - it's calling this!)
-        import time
-        wait_start = time.time()
-        while True:
-            with self.threads_paused_lock:
-                paused = self.threads_paused_count
-                if paused >= 1:  # Only wait for 1 thread (producer)
-                    break
-            
-            # Debug: Show waiting status every 5 seconds
-            elapsed = time.time() - wait_start
-            if int(elapsed) % 5 == 0 and elapsed > 0:
-                print(f"⏳ Waiting for producer to pause... ({paused}/1 paused, {elapsed:.0f}s elapsed)")
-            time.sleep(0.1)
-        
-        print(f"📤 Consolidating chunk {next_chunk_id}: batches {start_batch}-{end_batch-1}...")
+        print(f"Consolidating chunk {next_chunk_id}: batches {start_batch}-{end_batch-1}...")
+        print(f"DEBUG: Consolidating batch subset: {len(batch_subset)} files")
         
         # Load and concatenate in smaller chunks to avoid OOM
         # Process 20 batches at a time instead of all 100+
@@ -394,74 +399,107 @@ class StreamingCacheEncoder:
             for batch_file in mini_batch_files:
                 if os.path.exists(batch_file):
                     try:
-                        batch = torch.load(batch_file, map_location='cpu')
-                        for key in chunk_data:
-                            if key in batch and batch[key] is not None:
-                                chunk_data[key].append(batch[key])
+                        # Load tensors
+                        batch = load_file(batch_file)
+                        print(f"DEBUG: Loaded batch {batch_file} keys: {list(batch.keys())}")
+                        if 'sketches' in batch:
+                            chunk_data['sketches'].append(batch['sketches'])
+                        
+                        # Load metadata
+                        meta_file = batch_file.replace('.safetensors', '_meta.json')
+                        if os.path.exists(meta_file):
+                            with open(meta_file, 'r') as f:
+                                meta = json.load(f)
+                                if 'checksums' in meta:
+                                    chunk_data['checksums'].extend(meta['checksums'])
+                                if 'children' in meta:
+                                    chunk_data['children'].extend(meta['children'])
                         del batch
                     except Exception as e:
                         corrupted_files.append(batch_file)
                         continue
             
             # Concatenate this mini chunk
-            for key in chunk_data:
-                if chunk_data[key]:
-                    mini_concat = torch.cat(chunk_data[key], dim=0)
-                    all_consolidated[key].append(mini_concat)
-                    del mini_concat
+            # Concatenate this mini chunk
+            if chunk_data['sketches']:
+                mini_concat = torch.cat(chunk_data['sketches'], dim=0)
+                all_consolidated['sketches'].append(mini_concat)
+                del mini_concat
+            
+            # Extend lists for metadata
+            all_consolidated['checksums'].extend(chunk_data['checksums'])
+            all_consolidated['children'].extend(chunk_data['children'])
+            
             del chunk_data
             gc.collect()
         
         # Final concatenation
-        consolidated = {}
-        for key in all_consolidated:
-            if all_consolidated[key]:
-                consolidated[key] = torch.cat(all_consolidated[key], dim=0)
+        consolidated_tensors = {}
+        if all_consolidated['sketches']:
+            consolidated_tensors['sketches'] = torch.cat(all_consolidated['sketches'], dim=0)
+            
+        consolidated_meta = {
+            'checksums': all_consolidated['checksums'],
+            'children': all_consolidated['children']
+        }
         del all_consolidated
         
         # Save to drive_dir if available, otherwise checkpoint_dir
         save_dir = self.drive_dir if self.drive_dir else self.checkpoint_dir
-        consolidated_file = os.path.join(save_dir, f"consolidated_{next_chunk_id:03d}.pt")
+        consolidated_file = os.path.join(save_dir, f"consolidated_{next_chunk_id:03d}.safetensors")
+        consolidated_meta_file = os.path.join(save_dir, f"consolidated_{next_chunk_id:03d}_meta.json")
         
-        torch.save(consolidated, consolidated_file)
+        if consolidated_tensors:
+            save_file(consolidated_tensors, consolidated_file)
+        with open(consolidated_meta_file, 'w') as f:
+            json.dump(consolidated_meta, f)
+            
         self.drive_checkpoints.append(consolidated_file)
-        del consolidated
+        print(f"DEBUG: Appended to drive_checkpoints: {consolidated_file}")
+        del consolidated_tensors
+        del consolidated_meta
         gc.collect()
         
         chunk_size_mb = os.path.getsize(consolidated_file) / 1024 / 1024
-        print(f"✅ Saved consolidated chunk {next_chunk_id} ({chunk_size_mb:.1f}MB)")
+        print(f"Saved consolidated chunk {next_chunk_id} ({chunk_size_mb:.1f}MB)")
         
         # Report corrupted files that were skipped
         if corrupted_files:
-            print(f"⚠️  Skipped {len(corrupted_files)} corrupted batch files from previous session")
+            print(f"Skipped {len(corrupted_files)} corrupted batch files from previous session")
         
         # Record consolidation in progress tracker
-        batch_ids = list(range(start_batch, end_batch))
-        self.progress_tracker.record_consolidation(
-            chunk_id=next_chunk_id,
-            batch_ids=batch_ids
-        )
-        print(f"📊 Recorded consolidation: chunk {next_chunk_id} <- batches {start_batch}-{end_batch-1}")
+        if hasattr(self, 'progress_tracker'):
+            batch_ids = list(range(start_batch, end_batch))
+            self.progress_tracker.record_consolidation(
+                chunk_id=next_chunk_id,
+                batch_ids=batch_ids
+            )
+            print(f"Recorded consolidation: chunk {next_chunk_id} <- batches {start_batch}-{end_batch-1}")
         
         # Delete individual batch files by batch NUMBER, not list index
         # batch_files list may have gaps from previous consolidations
         deleted_count = 0
         freed_mb = 0
         for batch_num in range(start_batch, end_batch):
-            batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_num:05d}.pt")
+            batch_file = os.path.join(self.checkpoint_dir, f"batch_{batch_num:05d}.safetensors")
+            meta_file = os.path.join(self.checkpoint_dir, f"batch_{batch_num:05d}_meta.json")
+            
             if os.path.exists(batch_file):
                 batch_size_mb = os.path.getsize(batch_file) / 1024 / 1024
                 os.remove(batch_file)
+                if os.path.exists(meta_file):
+                    os.remove(meta_file)
                 deleted_count += 1
                 freed_mb += batch_size_mb
         
-        print(f"🧹 Deleted {deleted_count} individual batch files ({freed_mb:.1f}MB freed from Colab)")
+        print(f"Deleted {deleted_count} individual batch files ({freed_mb:.1f}MB freed from Colab)")
         print(f"   Drive location: {self.drive_dir}")
         print(f"   Will sync to: C:\\Users\\sao\\Documents\\model-engine")
         
-        # Resume producer and consumer threads
-        self.consolidation_pause.set()
-        print(f"▶️  Resuming encoding and caching...\n")
+        # Resume producer        # Resume threads
+        if not final:
+            self.consolidation_pause.set()
+        print(f"Resuming encoding and caching...\n")
         
         # Cache management: Keep all cached images for now
         # Can manually clear if disk space critical
@@ -472,8 +510,6 @@ class StreamingCacheEncoder:
         Returns:
             (samples_already_encoded, existing_batch_files, existing_consolidated_files)
         """
-        import os
-        from pathlib import Path
         from dataset.training_progress import TrainingProgressTracker
         
         checkpoint_dir = Path(self.checkpoint_dir)
@@ -492,8 +528,8 @@ class StreamingCacheEncoder:
             tracker.load()
         
         # Get actual batch files (for registration)
-        batch_files = sorted(checkpoint_dir.glob("batch_*.pt"))
-        consolidated_files = sorted(checkpoint_dir.glob("consolidated_*.pt"))
+        batch_files = sorted(checkpoint_dir.glob("batch_*.safetensors"))
+        consolidated_files = sorted(checkpoint_dir.glob("consolidated_*.safetensors"))
         
         # Calculate samples from tracker (source of truth)
         if tracker.progress.consolidation_progress:
@@ -530,7 +566,7 @@ class StreamingCacheEncoder:
         samples_encoded, existing_batches, existing_consolidated = self._check_resume_state()
         
         if samples_encoded > 0:
-            print(f"\n🔄 RESUME MODE: Found existing progress")
+            print(f"\nRESUME MODE: Found existing progress")
             print(f"   Consolidated files: {len(existing_consolidated)} ({len(existing_consolidated) * 100} batches)")
             print(f"   Batch files: {len(existing_batches)}")
             print(f"   Samples already encoded: {samples_encoded:,}/{len(samples):,} ({samples_encoded/len(samples)*100:.1f}%)")
@@ -541,25 +577,24 @@ class StreamingCacheEncoder:
             self.drive_checkpoints.extend(existing_consolidated)
             
             # Skip already processed samples
-            samples = samples[samples_encoded:]
-            
-            if len(samples) == 0:
-                print("✅ All samples already encoded!")
-                # Load and return existing results
-                return self._load_existing_results()
+            if samples_encoded > 0:
+                print(f"Skipping {samples_encoded} already processed samples...")
+                import itertools
+                # Consume the generator to skip items
+                samples = itertools.islice(samples, samples_encoded, None)
         
         # Adjust threshold based on initial cache
         if initial_cache_percent < 5:
             # If cache is empty/minimal, start GPU after just 1 batch
             actual_threshold = self.batch_size
             if samples_encoded == 0:
-                print(f"\n⚡ No cache found - using fast start mode")
+                print(f"\nNo cache found - using fast start mode")
         else:
             actual_threshold = start_threshold
         
         print(f"\n{'='*70}")
-        print(f"🌊 PARALLEL STREAMING PIPELINE")
-        print(f"   CPU: Caching {len(samples)} samples (parallel workers)")
+        print(f"PARALLEL STREAMING PIPELINE")
+        print(f"   CPU: Caching samples (parallel workers)")
         print(f"   GPU: Starts after {actual_threshold} cached (batch={self.batch_size})")
         print(f"   Strategy: CPU + GPU run simultaneously")
         print(f"   Memory: Each batch saved directly to disk (minimal RAM)")
@@ -575,8 +610,7 @@ class StreamingCacheEncoder:
         
         # Start consumer thread
         consumer = threading.Thread(
-            target=self.consumer_thread,
-            args=(samples,)
+            target=self.consumer_thread
         )
         consumer.start()
         
@@ -585,21 +619,16 @@ class StreamingCacheEncoder:
         consumer.join()
         
         # Consolidate any remaining batches
-        import os
-        import gc
-        
         if self.checkpoint_dir:
             remaining_batches = len(self.batch_files) - (len(self.drive_checkpoints) * 100)
             if remaining_batches > 0:
                 print(f"\n📤 Consolidating final {remaining_batches} batches...")
-                self._consolidate_to_drive(len(self.batch_files))
+                self._consolidate_to_drive(len(self.batch_files), final=True)
         
         return self._load_existing_results()
     
     def _load_existing_results(self):
         """Load results from existing consolidated files and remaining batches."""
-        import os
-        import gc
         
         # Load from local consolidated files
         print(f"\n📚 Loading {len(self.drive_checkpoints)} consolidated chunks from local disk...")
@@ -607,22 +636,36 @@ class StreamingCacheEncoder:
         
         for i, chunk_file in enumerate(self.drive_checkpoints):
             if os.path.exists(chunk_file):
-                chunk = torch.load(chunk_file, map_location='cpu')
-                for key in all_results:
-                    if key in chunk:
-                        all_results[key].append(chunk[key])
+                # Load tensors
+                chunk = load_file(chunk_file)
+                if 'sketches' in chunk:
+                    all_results['sketches'].append(chunk['sketches'])
+                
+                # Load metadata
+                meta_file = str(chunk_file).replace('.safetensors', '_meta.json')
+                if os.path.exists(meta_file):
+                    with open(meta_file, 'r') as f:
+                        meta = json.load(f)
+                        if 'checksums' in meta:
+                            all_results['checksums'].extend(meta['checksums'])
+                        if 'children' in meta:
+                            all_results['children'].extend(meta['children'])
+                
                 del chunk
                 gc.collect()
                 print(f"  Loaded chunk {i+1}/{len(self.drive_checkpoints)}")
         
         # Final concatenation
-        print(f"⚙️  Final concatenation...")
+        print(f"Final concatenation...")
         result = {}
-        for key, chunks in all_results.items():
-            if chunks:
-                result[key] = torch.cat(chunks, dim=0).float()  # Convert back to FP32
-            else:
-                result[key] = torch.empty(0)
+        
+        if all_results['sketches']:
+            result['sketches'] = torch.cat(all_results['sketches'], dim=0).float()
+        else:
+            result['sketches'] = torch.empty(0)
+            
+        result['checksums'] = all_results['checksums']
+        result['children'] = torch.tensor(all_results['children']) if all_results['children'] else torch.empty(0)
         
         # Cleanup any remaining batch files from Colab
         remaining_files = [f for f in self.batch_files if os.path.exists(f)]
@@ -630,6 +673,9 @@ class StreamingCacheEncoder:
             print(f"🧹 Cleaning up {len(remaining_files)} remaining batch files from Colab...")
             for batch_file in remaining_files:
                 os.remove(batch_file)
+                meta_file = str(batch_file).replace('.safetensors', '_meta.json')
+                if os.path.exists(meta_file):
+                    os.remove(meta_file)
         
         # Keep Drive chunks - they will sync to local machine
         print(f"💾 Kept {len(self.drive_checkpoints)} chunks in Drive (syncing to local machine)")
@@ -637,5 +683,5 @@ class StreamingCacheEncoder:
         print(f"   Will sync to: C:\\Users\\sao\\Documents\\model-engine")
         print(f"   You can delete from Drive after confirming sync completed")
         
-        print(f"✅ Complete! Final shape: {result['sketches'].shape}")
+        print(f"Complete! Final shape: {result['sketches'].shape}")
         return result

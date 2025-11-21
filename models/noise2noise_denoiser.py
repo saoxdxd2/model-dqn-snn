@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 import numpy as np
 from PIL import Image
+from models.bitnet import BitLinear
 
 
 class UNet(nn.Module):
@@ -245,13 +246,13 @@ class Noise2NoiseDenoiser:
                 'depth': 4
             }
         }, path)
-        print(f"✅ Model saved to {path}")
+        print(f"Model saved to {path}")
     
     def load(self, path: str):
         """Load model weights."""
         checkpoint = torch.load(path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"✅ Model loaded from {path}")
+        print(f"Model loaded from {path}")
 
 
 class NoisyVariantGenerator:
@@ -383,18 +384,18 @@ class AdaptiveNoiseGenerator(nn.Module):
         super().__init__()
         
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            BitLinear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim),
+            BitLinear(hidden_dim, hidden_dim),
             nn.ReLU()
         )
         
         # Predict noise parameters ("self-edit" generation)
-        self.font_size_head = nn.Linear(hidden_dim, 7)  # -3 to +3
-        self.position_x_head = nn.Linear(hidden_dim, 11)  # -5 to +5
-        self.position_y_head = nn.Linear(hidden_dim, 11)  # -5 to +5
-        self.strength_head = nn.Linear(hidden_dim, 1)  # 0.0 to 1.0 (denoising strength)
+        self.font_size_head = BitLinear(hidden_dim, 7)  # -3 to +3
+        self.position_x_head = BitLinear(hidden_dim, 11)  # -5 to +5
+        self.position_y_head = BitLinear(hidden_dim, 11)  # -5 to +5
+        self.strength_head = BitLinear(hidden_dim, 1)  # 0.0 to 1.0 (denoising strength)
         
     def forward(self, text_features: torch.Tensor) -> dict:
         """
@@ -627,7 +628,7 @@ class N2NFeatureAdapter(nn.Module):
         
         # Optional: learnable denoising strength per patch
         self.strength_head = nn.Sequential(
-            nn.Linear(input_dim, 1),
+            BitLinear(input_dim, 1),
             nn.Sigmoid()
         )
         
@@ -705,9 +706,11 @@ class PretrainedVisionBackbone(nn.Module):
         
         self.model_name = model_name
         
+        device_map = "cpu" if not torch.cuda.is_available() else None
+        
         if model_name == 'clip':
             from transformers import CLIPVisionModel
-            self.encoder = CLIPVisionModel.from_pretrained('openai/clip-vit-base-patch16')
+            self.encoder = CLIPVisionModel.from_pretrained('openai/clip-vit-base-patch16', device_map=device_map)
             self.feature_dim = 768
         elif model_name == 'dinov2':
             # DINOv2 has better features for dense tasks
@@ -715,7 +718,7 @@ class PretrainedVisionBackbone(nn.Module):
             self.feature_dim = 768
         elif model_name == 'siglip':
             from transformers import SiglipVisionModel
-            self.encoder = SiglipVisionModel.from_pretrained('google/siglip-base-patch16-224')
+            self.encoder = SiglipVisionModel.from_pretrained('google/siglip-base-patch16-224', device_map=device_map)
             self.feature_dim = 768
         else:
             raise ValueError(f"Unknown model: {model_name}")
@@ -725,7 +728,7 @@ class PretrainedVisionBackbone(nn.Module):
                 param.requires_grad = False
             self.encoder.eval()
         
-        print(f"✓ Loaded {model_name} (frozen={freeze}, dim={self.feature_dim})")
+        print(f"Loaded {model_name} (frozen={freeze}, dim={self.feature_dim})")
     
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
@@ -797,6 +800,6 @@ if __name__ == "__main__":
         features = backbone(images)
         print(f"✓ CLIP features: {features.shape}")
     except Exception as e:
-        print(f"⚠️  CLIP test skipped: {e}")
+        print(f"CLIP test skipped: {e}")
     
-    print("\n✅ All tests passed!")
+    print("\nAll tests passed!")

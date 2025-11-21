@@ -3,43 +3,17 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import sys
-
-# Memory optimization: Reduce CUDA memory fragmentation and enable expandable segments
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128'
-
-# Explicitly disable CUDA graphs to save ~1.5GB memory
-os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
-os.environ['TORCHINDUCTOR_CUDAGRAPHS'] = '0'
-
-print("\n" + "="*70)
-print("🔍 DEBUG: Environment Variables Set")
-print(f"  PYTORCH_CUDA_ALLOC_CONF = {os.environ.get('PYTORCH_CUDA_ALLOC_CONF', 'NOT SET')}")
-print(f"  TORCHINDUCTOR_CUDAGRAPHS = {os.environ.get('TORCHINDUCTOR_CUDAGRAPHS', 'NOT SET')}")
-print(f"  TORCHINDUCTOR_COMPILE_THREADS = {os.environ.get('TORCHINDUCTOR_COMPILE_THREADS', 'NOT SET')}")
-print("="*70 + "\n")
-
-import math
-import yaml
-import shutil
-import copy
-import hashlib
-import json
 import signal
+import shutil
+import yaml
 
 import torch
+import torch.nn as nn
 import torch.distributed as dist
-from torch import nn
+import numpy as np
 from torch.utils.data import DataLoader
-
-# Enable memory-efficient attention backend (40-60% memory reduction for attention)
-try:
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-    # Force memory-efficient backend (works on T4, doesn't require Ampere)
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
-    torch.backends.cuda.enable_flash_sdp(False)  # T4 doesn't support Flash
-    torch.backends.cuda.enable_math_sdp(False)   # Math is slower and uses more memory
-except (ImportError, AttributeError):
-    pass  # Older PyTorch versions
+from utils.env_setup import setup_training_env
+setup_training_env()
 
 import tqdm
 import wandb
@@ -53,7 +27,7 @@ try:
     BNB_AVAILABLE = True
 except ImportError:
     BNB_AVAILABLE = False
-    print("⚠️  bitsandbytes not available - using standard optimizers (4x more memory)")
+    print("WARNING: bitsandbytes not available - using standard optimizers (4x more memory)")
 
 # Global flag for graceful shutdown
 shutdown_requested = False
@@ -67,16 +41,18 @@ def shutdown_signal_handler(sig, frame):
     global shutdown_requested
     shutdown_requested = True
     print("\n" + "="*70)
-    print("  🛑 SHUTDOWN REQUESTED (Ctrl+C detected)")
-    print("  ⏳ Will save checkpoint at next safe point...")
-    print("  ⚠️  Press Ctrl+C again to force quit (may lose progress!)")
+    print("  STOP: SHUTDOWN REQUESTED (Ctrl+C detected)")
+    print("  WAIT: Will save checkpoint at next safe point...")
+    print("  WARNING: Press Ctrl+C again to force quit (may lose progress!)")
     print("="*70 + "\n")
 
-from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata
+from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig, PuzzleDatasetMetadata, CapsuleDataLoaderWrapper
 from utils.functions import load_model_class, get_model_source_path
 from models.sparse_embedding import CastedSparseEmbeddingSignSGD_Distributed
 from models.ema import EMAHelper
 from utils.gradient_monitor import GradientFlowMonitor
+from utils.checkpointing import AsyncCheckpointManager
+from utils.data_processing import process_vision_batch, detect_dataset_features
 from utils.annealing import compute_expansion_penalty, compute_q_temperature, compute_warmup_progress
 from dataset.training_progress import TrainingProgressTracker, get_training_manifest
 
@@ -109,6 +85,7 @@ class PretrainConfig(pydantic.BaseModel):
     # Hyperparams
     global_batch_size: int
     epochs: int
+    max_steps: Optional[int] = None  # Debugging/Verification limit
 
     lr: float
     lr_min_ratio: float
@@ -239,48 +216,7 @@ class TrainState:
     nan_count: int = 0  # Track NaN occurrences for optimizer fallback
 
 
-def detect_dataset_features(data_path: str) -> dict:
-    """Auto-detect dataset type and features from data."""
-    import torch
-    
-    features = {
-        'is_capsule': False,
-        'is_vision': False,
-        'is_text': False,
-        'has_checksums': False,
-        'has_children': False,
-        'enable_dqn': False,
-        'enable_expansion': False
-    }
-    
-    # Try loading as capsule dataset
-    capsule_paths = [
-        data_path.replace('semantic_embeddings', 'capsule_dataset'),
-        os.path.join(data_path, 'capsule_dataset.pt')
-    ]
-    
-    for path in capsule_paths:
-        if os.path.exists(path):
-            try:
-                data = torch.load(path, map_location='cpu')
-                if 'sketches' in data:
-                    features['is_capsule'] = True
-                    features['has_checksums'] = 'checksums' in data
-                    features['has_children'] = 'children' in data
-                    features['enable_expansion'] = features['has_children']
-                    features['enable_dqn'] = features['enable_expansion']
-                    return features
-            except Exception:
-                pass
-    
-    # Detect from path patterns
-    path_lower = data_path.lower()
-    if 'arc' in path_lower or 'vision' in path_lower or 'cifar' in path_lower or 'image' in path_lower:
-        features['is_vision'] = True
-    elif 'text' in path_lower or 'wikitext' in path_lower or 'stories' in path_lower:
-        features['is_text'] = True
-    
-    return features
+
 
 
 def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str = 'train'):
@@ -377,47 +313,6 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
             num_workers=0,
             pin_memory=True
         )
-        
-        # Wrap dataloader to match expected format: (set_name, batch, global_batch_size)
-        class CapsuleDataLoaderWrapper:
-            def __init__(self, raw_loader, global_batch_size):
-                self.raw_loader = raw_loader
-                self.global_batch_size = global_batch_size
-            
-            def __iter__(self):
-                for batch_data in self.raw_loader:
-                    # batch_data is tuple of (sketches,) or (sketches, checksums) or (sketches, checksums, children)
-                    # Sketches are already [B, 12, 512] from encoder.sketch_projection
-                    if len(batch_data) == 3:
-                        sketches = batch_data[0]  # [B, 12, 512]
-                        batch = {
-                            'inputs': sketches,
-                            'checksums': batch_data[1],
-                            'children': batch_data[2],
-                            'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long)
-                        }
-                    elif len(batch_data) == 2:
-                        sketches = batch_data[0]  # [B, 12, 512]
-                        batch = {
-                            'inputs': sketches,
-                            'checksums': batch_data[1],
-                            'children': None,
-                            'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long)
-                        }
-                    else:
-                        sketches = batch_data[0]  # [B, 12, 512]
-                        batch = {
-                            'inputs': sketches,
-                            'checksums': None,
-                            'children': None,
-                            'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long)
-                        }
-                    
-                    # Yield in expected format: (set_name, batch, global_batch_size)
-                    yield 'capsule', batch, self.global_batch_size
-            
-            def __len__(self):
-                return len(self.raw_loader)
         
         wrapped_dataloader = CapsuleDataLoaderWrapper(raw_dataloader, config.global_batch_size)
         return wrapped_dataloader, metadata
@@ -519,7 +414,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     enable_capsule_expansion = getattr(config.arch, 'enable_capsule_expansion', False)
     
     if rank == 0:
-        print(f"\n🔍 Dataset Analysis:")
+        print(f"\nDEBUG: Dataset Analysis:")
         print(f"   Semantic/Capsule mode: {semantic_mode}")
         print(f"   Capsule expansion: {enable_capsule_expansion}")
     
@@ -532,7 +427,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     if semantic_mode and enable_capsule_expansion:
         if 'enable_dqn' not in extra_config or not extra_config['enable_dqn']:
             if rank == 0:
-                print(f"   ⚙️  Auto-enabling DQN for capsule expansion control")
+                print(f"   DEBUG: Auto-enabling DQN for capsule expansion control")
             extra_config['enable_dqn'] = True
             # Set expansion-friendly DQN params
             if 'dqn_loss_weight' not in extra_config:
@@ -553,7 +448,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     model_cfg['total_steps'] = total_steps  # For annealing schedules
     
     if rank == 0:
-        print(f"\n📐 Model Config:")
+        print(f"\nDEBUG: Model Config:")
         print(f"   arch: {config.arch.name}")
         print(f"   input_vocab_size: {model_cfg.get('input_vocab_size', 'NOT SET')}")
         print(f"   output_vocab_size: {model_cfg.get('output_vocab_size', 'NOT SET')}")
@@ -565,7 +460,8 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
 
-    with torch.device("cuda"):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    with torch.device(device):
         model: nn.Module = model_cls(model_cfg)
         print(model)
         # Pass total_steps to loss head for annealing schedules
@@ -584,9 +480,9 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             print("   Trade-off: ~20-30% slower but fits in memory")
             print("   Set ENABLE_COMPILE=1 to force enable (will likely OOM)\n")
 
-        # Load checkpoint
-        if rank == 0:
-            load_checkpoint(model, config)
+        # Load checkpoint (handled by AsyncCheckpointManager outside this function)
+        # if rank == 0:
+        #     load_checkpoint(model, config)
 
         # Broadcast parameters from rank 0
         if world_size > 1:
@@ -714,7 +610,7 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     dataset_size = train_metadata.total_groups
     
     if rank == 0:
-        print(f"\n⚙️  Auto-tuning hyperparameters:")
+        print(f"\nDEBUG: Auto-tuning hyperparameters:")
         print(f"   Dataset size: {dataset_size:,} samples")
     
     # Adjust learning rate based on dataset size and mode
@@ -723,12 +619,12 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         # Capsule mode: can use higher LR due to compressed inputs
         adjusted_lr = config.lr * 1.5
         if rank == 0:
-            print(f"   LR boost for capsule mode: {config.lr:.2e} → {adjusted_lr:.2e}")
+            print(f"   LR boost for capsule mode: {config.lr:.2e} -> {adjusted_lr:.2e}")
     elif dataset_size < 1000:
         # Small dataset: reduce LR to prevent overfitting
         adjusted_lr = config.lr * 0.5
         if rank == 0:
-            print(f"   LR reduction for small dataset: {config.lr:.2e} → {adjusted_lr:.2e}")
+            print(f"   LR reduction for small dataset: {config.lr:.2e} -> {adjusted_lr:.2e}")
     
     # Store adjusted hyperparameters
     config.lr = adjusted_lr
@@ -753,11 +649,18 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     
     # torch.compile for 25% speedup (T4 compatible)
     # NOTE: torch.compile DISABLED - even eager backend triggers AUTOTUNE and OOM
-    # AUTOTUNE benchmarks multiple kernel implementations, allocating 14GB+ temporary buffers
-    if False:  # Permanently disabled for memory safety
+    # AUTOTUNE benchmarks multiple kernel implementations
+    # Re-enabled with safer configuration
+    if getattr(config, 'compile_model', True):
         if rank == 0:
-            print(f"   🚀 Compiling model with torch.compile (25% speedup)...")
-        model = torch.compile(model, mode='max-autotune')
+            print(f"   🚀 Compiling model with torch.compile (mode='default')...")
+        # Use 'default' mode which is safer than 'max-autotune' for memory
+        # 'reduce-overhead' is also good for small batches but can be memory hungry
+        try:
+            model = torch.compile(model, mode='default')
+        except Exception as e:
+            if rank == 0:
+                print(f"   ⚠️  torch.compile failed: {e}. Proceeding without compilation.")
 
     return TrainState(
         step=0,
@@ -806,236 +709,31 @@ def get_checkpoint_name(dataset_path: str) -> str:
         return f"{dataset_name.replace('/', '_').replace('-', '_')}.pt"
 
 
-def compute_file_checksum(filepath: str) -> str:
-    """Compute SHA256 checksum of a file."""
-    sha256_hash = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        # Read in 64KB chunks for memory efficiency
-        for byte_block in iter(lambda: f.read(65536), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
-
-
-def save_checkpoint_atomic(checkpoint: dict, filepath: str):
-    """Save checkpoint atomically with checksum verification.
-    
-    Uses atomic write (temp file + rename) to prevent corruption during save.
-    Generates SHA256 checksum for compression safety.
-    Creates backup of previous checkpoint for rollback.
-    """
-    # Define all temp file paths upfront to avoid scope issues
-    temp_checkpoint = filepath + ".tmp"
-    backup_file = filepath + ".backup"
-    checksum_file = filepath + ".sha256"
-    checksum_temp = checksum_file + ".tmp"
-    
-    try:
-        # Backup existing checkpoint before overwriting
-        if os.path.exists(filepath):
-            try:
-                shutil.copy2(filepath, backup_file)
-            except Exception as e:
-                print(f"⚠️  Failed to create backup: {e}")
-        
-        # Save checkpoint file atomically
-        try:
-            torch.save(checkpoint, temp_checkpoint)
-            
-            # Verify integrity before committing
-            try:
-                test_load = torch.load(temp_checkpoint, map_location='cpu')
-                del test_load  # Free memory
-            except Exception as e:
-                print(f"❌ Checkpoint verification failed: {e}")
-                if os.path.exists(backup_file):
-                    print("   Restoring from backup...")
-                    shutil.copy2(backup_file, filepath)
-                raise e
-            
-            # Move atomically (crash-safe)
-            shutil.move(temp_checkpoint, filepath)
-            
-        except Exception as e:
-            # Clean up failed temp file
-            if os.path.exists(temp_checkpoint):
-                os.remove(temp_checkpoint)
-            raise e
-        
-        # Compute checksum
-        checksum = compute_file_checksum(filepath)
-        
-        # Save checksum metadata
-        metadata = {
-            "checksum": checksum,
-            "step": checkpoint.get('step', 0),
-            "size_bytes": os.path.getsize(filepath),
-            "timestamp": os.path.getmtime(filepath)
-        }
-        with open(checksum_temp, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        # Atomic rename (this is the actual "commit" point)
-        # If interrupted here, temp files exist but original is intact
-        os.replace(checksum_temp, checksum_file)
-        
-        return checksum
-        
-    except Exception as e:
-        # Clean up temp files on error (now all variables are in scope)
-        if os.path.exists(temp_checkpoint):
-            os.remove(temp_checkpoint)
-        if os.path.exists(checksum_temp):
-            os.remove(checksum_temp)
-        raise e
-
-
-def save_train_state(config: PretrainConfig, train_state: TrainState, progress_tracker: Optional[TrainingProgressTracker] = None):
-    """Save complete training state with corruption protection and backup.
-    
-    Features:
-    - Atomic writes (temp file + rename)
-    - SHA256 checksum verification
-    - Safe for compression/transfer
-    - Creates backup of previous checkpoint for rollback.
-    - Saves training progress through consolidated chunks
-    """
-    if config.checkpoint_path is None:
-        return
-
-    os.makedirs(config.checkpoint_path, exist_ok=True)
-    
-    # Update last checkpoint step
-    train_state.last_checkpoint_step = train_state.step
-    
-    checkpoint = {
-        'step': train_state.step,
-        'model_state_dict': train_state.original_model.state_dict(),  # Use unwrapped model
-        'optimizer_states': [opt.state_dict() for opt in train_state.optimizers],
-        'carry': train_state.carry,  # Save RNN/memory states
-        
-        # Training metadata for phase completion tracking
-        'config_epochs': config.epochs,
-        'total_steps': train_state.total_steps,
-        'dataset': config.data_paths[0] if config.data_paths else 'unknown',
-    }
-    
-    # Save training progress through consolidated chunks
-    if progress_tracker is not None:
-        progress_tracker.save()
-        checkpoint['has_training_progress'] = True
-    
-    # Save DQN-specific state if enabled
-    if hasattr(train_state.model, 'replay_buffer'):
-        checkpoint['replay_buffer_size'] = len(train_state.model.replay_buffer)
-        checkpoint['dqn_step_counter'] = getattr(train_state.model, 'dqn_step_counter', 0)
-    
-    # Get dataset-specific checkpoint name (e.g., text.pt, arc.pt, vision.pt)
-    checkpoint_name = get_checkpoint_name(config.data_paths[0] if config.data_paths else 'model')
-    checkpoint_file = os.path.join(config.checkpoint_path, checkpoint_name)
-    backup_file = checkpoint_file + ".backup"
-    
-    # Save single checkpoint file with atomic write + checksum
-    checksum = save_checkpoint_atomic(checkpoint, checkpoint_file)
-    
-    # Log save info
-    print(f"   💾 Saved: {checkpoint_name}")
-    print(f"   SHA256: {checksum[:16]}...")
-
-
-def verify_checkpoint_integrity(checkpoint_path: str) -> bool:
-    """Verify checkpoint integrity using SHA256 checksum.
-    
-    Returns True if checksum matches or no checksum file exists (legacy).
-    Returns False if checksum verification fails.
-    """
-    checksum_file = checkpoint_path + ".sha256"
-    
-    # If no checksum file, assume legacy checkpoint (skip verification)
-    if not os.path.exists(checksum_file):
-        print("   ⚠️  No checksum file found (legacy checkpoint)")
-        return True
-    
-    try:
-        # Load expected checksum
-        with open(checksum_file, 'r') as f:
-            metadata = json.load(f)
-        expected_checksum = metadata['checksum']
-        
-        # Compute actual checksum
-        print("   🔍 Verifying checkpoint integrity...")
-        actual_checksum = compute_file_checksum(checkpoint_path)
-        
-        if actual_checksum == expected_checksum:
-            print(f"   ✅ Checksum verified: {actual_checksum[:16]}...")
-            return True
-        else:
-            print(f"   ❌ CHECKSUM MISMATCH!")
-            print(f"      Expected: {expected_checksum[:16]}...")
-            print(f"      Got:      {actual_checksum[:16]}...")
-            print(f"      ⚠️  Checkpoint may be corrupted!")
-            return False
-            
-    except Exception as e:
-        print(f"   ⚠️  Checksum verification failed: {e}")
-        return True  # Allow loading if verification fails
-
-
 def load_checkpoint(model: nn.Module, config: PretrainConfig, optimizers=None, train_state=None):
     """Load checkpoint with integrity verification.
     
     Supports cross-dataset loading (e.g., load text.pt into vision training).
     """
-    if config.load_checkpoint is not None:
-        print(f"Loading checkpoint {config.load_checkpoint}")
-        
-        # Verify integrity before loading
-        if not verify_checkpoint_integrity(config.load_checkpoint):
-            print("\n⚠️  WARNING: Checkpoint failed integrity check!")
-            response = input("   Continue loading anyway? [y/N]: ")
-            if response.lower() != 'y':
-                raise RuntimeError("Checkpoint verification failed. Aborting.")
+    # Initialize Async Checkpoint Manager
+    checkpoint_manager = AsyncCheckpointManager(
+        checkpoint_dir=config.checkpoint_path,
+        max_keep=3,
+        use_safetensors=True
+    )
 
-        # Load checkpoint
-        checkpoint = torch.load(config.load_checkpoint, map_location="cuda")
-        
-        # Show checkpoint info (for cross-dataset loading)
-        if 'dataset' in checkpoint:
-            print(f"   Source dataset: {checkpoint['dataset']}")
-        if 'step' in checkpoint:
-            print(f"   Checkpoint step: {checkpoint.get('step', 0):,}")
-        
-        # Handle both old format (dict with state_dict) and new format (dict with model_state_dict)
-        if 'model_state_dict' in checkpoint:
-            # New format with full training state
-            state_dict = checkpoint['model_state_dict']
+    # Load checkpoint if exists
+    start_step = 0
+    if config.load_checkpoint:
+        try:
+            extra_data = checkpoint_manager.load(config.load_checkpoint, model, optimizers)
+            start_step = extra_data.get('step', 0)
+            if train_state:
+                train_state.step = start_step
+            print(f"Resumed from step {start_step}")
+        except Exception as e:
+            print(f"Failed to load checkpoint: {e}. Starting from scratch.")
             
-            # Load optimizer states if provided
-            if optimizers is not None and 'optimizer_states' in checkpoint:
-                print(f"Restoring optimizer states from checkpoint")
-                for opt, opt_state in zip(optimizers, checkpoint['optimizer_states']):
-                    opt.load_state_dict(opt_state)
-            
-            # Restore training step
-            if train_state is not None and 'step' in checkpoint:
-                train_state.step = checkpoint['step']
-                print(f"Resuming from step {train_state.step}")
-        else:
-            # Old format: checkpoint is the state_dict directly
-            state_dict = checkpoint
-
-        # Resize and reset puzzle emb if needed (only if model has puzzle embeddings)
-        puzzle_emb_name = "_orig_mod.model.inner.puzzle_emb.weights"
-        if hasattr(model.model, 'puzzle_emb') and model.model.puzzle_emb is not None:
-            expected_shape: torch.Size = model.model.puzzle_emb.weights.shape  # type: ignore
-            if puzzle_emb_name in state_dict:
-                puzzle_emb = state_dict[puzzle_emb_name]
-                if puzzle_emb.shape != expected_shape:
-                    print(f"Resetting puzzle embedding as shape is different. Found {puzzle_emb.shape}, Expected {expected_shape}")
-                    # Re-initialize using mean
-                    state_dict[puzzle_emb_name] = (
-                        torch.mean(puzzle_emb, dim=0, keepdim=True).expand(expected_shape).contiguous()
-                    )
-        model.load_state_dict(state_dict, assign=True)
+    return start_step
 
 
 def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
@@ -1065,6 +763,10 @@ def create_evaluators(config: PretrainConfig, eval_metadata: PuzzleDatasetMetada
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int, gradient_monitor=None):
     train_state.step += 1
     if train_state.step > train_state.total_steps:  # At most train_total_steps
+        return
+    
+    # Debug/Verification limit
+    if config.max_steps is not None and train_state.step > config.max_steps:
         return
     
     # DQN Warmup: Freeze representation layers during early training
@@ -1107,96 +809,19 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     # Handle raw_samples format (vision-unified pipeline)
     if isinstance(batch, dict) and 'raw_samples' in batch:
-        import torchvision.transforms as transforms
-        from PIL import Image
-        import numpy as np
+        batch = process_vision_batch(batch)
         
-        # Extract images from raw samples
-        raw_samples = batch['raw_samples']
-        batch_size = len(raw_samples)
-        
-        # Stack input and output images
-        # Each sample: {'input_image': PIL.Image, 'output_image': PIL.Image, 'task_id': str}
-        input_images = []
-        output_images = []
-        
-        # Convert PIL images to tensors (normalized to [0, 1])
-        to_tensor = transforms.ToTensor()
-        
-        for sample in raw_samples:
-            # DataSample has different fields based on modality: text, image, grid
-            img = None
-            
-            # 1. If image field is populated (direct image)
-            if sample.image is not None:
-                if isinstance(sample.image, np.ndarray):
-                    img = Image.fromarray(sample.image.astype(np.uint8))
-                else:
-                    img = sample.image  # Already PIL Image
-            
-            # 2. If grid field (ARC/maze) - visualize as image
-            elif sample.grid is not None:
-                # Convert grid to RGB image (simple colormap)
-                grid = sample.grid
-                if grid.dtype == np.int32 or grid.dtype == np.int64:
-                    # Normalize to 0-255 range
-                    grid_norm = ((grid - grid.min()) / (grid.max() - grid.min() + 1e-8) * 255).astype(np.uint8)
-                    # Create RGB by repeating grayscale
-                    img = Image.fromarray(grid_norm).convert('RGB')
-                else:
-                    img = Image.fromarray((grid * 255).astype(np.uint8)).convert('RGB')
-                # Resize to standard 224x224 (ARC grids have variable sizes)
-                img = img.resize((224, 224), Image.NEAREST)
-            
-            # 3. If text field - skip for now (would need text_renderer.py)
-            elif sample.text is not None:
-                # Create blank placeholder for text samples
-                img = Image.new('RGB', (224, 224), color=(128, 128, 128))
-            
-            else:
-                # Empty sample - create blank
-                img = Image.new('RGB', (224, 224), color=(0, 0, 0))
-            
-            # Resize to standard 224x224 for consistency
-            if img.size != (224, 224):
-                img = img.resize((224, 224), Image.BILINEAR)
-            
-            # Convert to tensor
-            input_img = to_tensor(img)
-            
-            # For output: check label field
-            if sample.label is not None:
-                if isinstance(sample.label, np.ndarray):
-                    if sample.label.ndim == 2:  # Grid
-                        label_grid = ((sample.label - sample.label.min()) / (sample.label.max() - sample.label.min() + 1e-8) * 255).astype(np.uint8)
-                        output_img_pil = Image.fromarray(label_grid).convert('RGB')
-                        output_img_pil = output_img_pil.resize((224, 224), Image.NEAREST)
-                        output_img = to_tensor(output_img_pil)
-                    else:
-                        output_img_pil = Image.fromarray(sample.label.astype(np.uint8))
-                        output_img_pil = output_img_pil.resize((224, 224), Image.BILINEAR)
-                        output_img = to_tensor(output_img_pil)
-                elif hasattr(sample.label, 'convert'):  # PIL Image
-                    output_img_pil = sample.label.resize((224, 224), Image.BILINEAR)
-                    output_img = to_tensor(output_img_pil)
-                else:
-                    output_img = input_img.clone()  # Fallback
-            else:
-                output_img = input_img.clone()  # Same as input
-            
-            input_images.append(input_img)
-            output_images.append(output_img)
-        
-        # Stack into batches [B, 3, H, W]
-        input_batch = torch.stack(input_images).cuda()
-        output_batch = torch.stack(output_images).cuda()
-        
-        # Create batch dict in expected format
+        # Move new tensors to device
+        if 'images' in batch:
+            batch['images'] = batch['images'].to(train_state.device, non_blocking=True)
+        if 'target_images' in batch:
+            batch['target_images'] = batch['target_images'].to(train_state.device, non_blocking=True)
+        # Map to model inputs
         batch = {
-            'inputs': input_batch,  # Model expects 'inputs' key
-            'targets': output_batch,
-            'puzzle_identifiers': batch['puzzle_identifiers'].cuda(),
-            'labels': torch.zeros(batch_size, dtype=torch.long).cuda()  # Placeholder
+            'inputs': batch['images'],
+            'targets': batch['target_images'],
+            'puzzle_identifiers': batch['puzzle_identifiers'].to(train_state.device),
+            'labels': torch.zeros(batch['images'].shape[0], dtype=torch.long, device=train_state.device)
         }
     # Handle HESC capsules (tuple) vs dict batches
     elif isinstance(batch, tuple):
@@ -1205,37 +830,37 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             # Capsules with children: (sketches, checksums, children)
             sketches, checksums, children = batch
             batch = {
-                'inputs': sketches.cuda(),
-                'capsule_sketches': sketches.cuda(),
-                'capsule_checksums': checksums.cuda(),
-                'capsule_children': children.cuda(),
-                'labels': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
-                'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
-                'num_expansions': torch.zeros(sketches.shape[0], dtype=torch.long).cuda()
+                'inputs': sketches.to(device),
+                'capsule_sketches': sketches.to(device),
+                'capsule_checksums': checksums.to(device),
+                'capsule_children': children.to(device),
+                'labels': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
+                'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
+                'num_expansions': torch.zeros(sketches.shape[0], dtype=torch.long).to(device)
             }
         elif len(batch) == 2:
             # Capsules without children: (sketches, checksums)
             sketches, checksums = batch
             batch = {
-                'inputs': sketches.cuda(),
-                'capsule_sketches': sketches.cuda(),
-                'capsule_checksums': checksums.cuda(),
-                'labels': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
-                'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
-                'num_expansions': torch.zeros(sketches.shape[0], dtype=torch.long).cuda()
+                'inputs': sketches.to(device),
+                'capsule_sketches': sketches.to(device),
+                'capsule_checksums': checksums.to(device),
+                'labels': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
+                'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
+                'num_expansions': torch.zeros(sketches.shape[0], dtype=torch.long).to(device)
             }
         else:
             # Legacy semantic: (embeddings,)
-            embeddings = batch[0].cuda()
+            embeddings = batch[0].to(device)
             batch = {
                 'inputs': embeddings,  # Changed from 'input' for consistency
-                'labels': torch.zeros(embeddings.shape[0], dtype=torch.long).cuda(),
-                'puzzle_identifiers': torch.zeros(embeddings.shape[0], dtype=torch.long).cuda()
+                'labels': torch.zeros(embeddings.shape[0], dtype=torch.long).to(device),
+                'puzzle_identifiers': torch.zeros(embeddings.shape[0], dtype=torch.long).to(device)
             }
     else:
         # Standard token mode: batch is dict
         # Handle None values (e.g., missing children/checksums in capsule mode)
-        batch = {k: v.cuda() if v is not None else None for k, v in batch.items()}
+        batch = {k: v.to(device) if v is not None else None for k, v in batch.items()}
         
     # Add CapsuleState for expansion tracking (if enabled)
     # Works for both tuple and dict batch modes
@@ -1255,7 +880,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     # Init carry if it is None
     if train_state.carry is None:
-        with torch.device("cuda"):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        with torch.device(device):
             train_state.carry = train_state.original_model.initial_carry(batch)  # type: ignore
 
     # Task-Based Training (ALWAYS ENABLED - Single Unified Pipeline)
@@ -1273,10 +899,16 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     for think_step in range(max_thinking_steps):
         if think_step == 0 and rank == 0:
             print(f"\n📊 GPU Memory at FIRST forward pass (step {train_state.step}):")
+        if torch.cuda.is_available():
             print(f"  Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
             print(f"  Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
             print(f"  Max Allocated: {torch.cuda.max_memory_allocated()/1e9:.2f} GB")
             print(f"  Free: {(torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated())/1e9:.2f} GB\n")
+        else:
+            import psutil
+            vm = psutil.virtual_memory()
+            print(f"  RAM Used: {vm.used/1e9:.2f} GB")
+            print(f"  RAM Total: {vm.total/1e9:.2f} GB\n")
         
         # Use PyTorch native CPU offloading for activations (saves 3-4GB GPU memory)
         # This moves intermediate activations to pinned CPU memory during forward pass
@@ -1285,10 +917,11 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 # Use mixed precision training
                 if not hasattr(train_state, 'scaler'):
                     from torch.amp import GradScaler
-                    train_state.scaler = GradScaler('cuda')
+                    train_state.scaler = GradScaler(enabled=torch.cuda.is_available())
                 
                 from torch.amp import autocast
-                with autocast('cuda'):
+                device_type = "cuda" if torch.cuda.is_available() else "cpu"
+                with autocast(device_type):
                     train_state.carry, step_loss, step_metrics, _, _ = train_state.model(
                         carry=train_state.carry, 
                         batch=batch, 
@@ -1451,7 +1084,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
         metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
         # Reduce and reconstruct
-        metric_values = torch.stack([torch.as_tensor(metrics[k], device='cuda') if not isinstance(metrics[k], torch.Tensor) else metrics[k] for k in metric_keys])
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        metric_values = torch.stack([torch.as_tensor(metrics[k], device=device) if not isinstance(metrics[k], torch.Tensor) else metrics[k] for k in metric_keys])
         if world_size > 1:
             dist.reduce(metric_values, dst=0)
 
@@ -1544,32 +1178,32 @@ def evaluate(
                 if len(batch) == 3:
                     sketches, checksums, children = batch
                     batch = {
-                        'inputs': sketches.cuda(),
-                        'capsule_sketches': sketches.cuda(),
-                        'capsule_checksums': checksums.cuda(),
-                        'capsule_children': children.cuda(),
-                        'labels': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
-                        'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).cuda()
+                        'inputs': sketches.to(device),
+                        'capsule_sketches': sketches.to(device),
+                        'capsule_checksums': checksums.to(device),
+                        'capsule_children': children.to(device),
+                        'labels': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
+                        'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).to(device)
                     }
                 elif len(batch) == 2:
                     sketches, checksums = batch
                     batch = {
-                        'inputs': sketches.cuda(),
-                        'capsule_sketches': sketches.cuda(),
-                        'capsule_checksums': checksums.cuda(),
-                        'labels': torch.zeros(sketches.shape[0], dtype=torch.long).cuda(),
-                        'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).cuda()
+                        'inputs': sketches.to(device),
+                        'capsule_sketches': sketches.to(device),
+                        'capsule_checksums': checksums.to(device),
+                        'labels': torch.zeros(sketches.shape[0], dtype=torch.long).to(device),
+                        'puzzle_identifiers': torch.zeros(sketches.shape[0], dtype=torch.long).to(device)
                     }
                 else:
-                    embeddings = batch[0].cuda()
+                    embeddings = batch[0].to(device)
                     batch = {
                         'inputs': embeddings,
-                        'labels': torch.zeros(embeddings.shape[0], dtype=torch.long).cuda(),
-                        'puzzle_identifiers': torch.zeros(embeddings.shape[0], dtype=torch.long).cuda()
+                        'labels': torch.zeros(embeddings.shape[0], dtype=torch.long).to(device),
+                        'puzzle_identifiers': torch.zeros(embeddings.shape[0], dtype=torch.long).to(device)
                     }
             else:
                 # Standard dict mode
-                batch = {k: v.cuda() for k, v in batch.items()}
+                batch = {k: v.to(device) for k, v in batch.items()}
                 
                 # Add CapsuleState for expansion tracking (if enabled)
                 if hasattr(config.arch, 'enable_capsule_expansion') and config.arch.enable_capsule_expansion:
@@ -1586,7 +1220,8 @@ def evaluate(
                             checksums=checksums,  # Reconstructability tracking
                         )
                         batch['capsule_state'] = capsule_state
-            with torch.device("cuda"):
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            with torch.device(device):
                 carry = train_state.original_model.initial_carry(batch)  # type: ignore
 
             # Forward
@@ -1622,10 +1257,10 @@ def evaluate(
                     sorted(metrics.keys())
                 )  # Sort keys to guarantee all processes use the same order.
                 metric_values = torch.zeros(
-                    (len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda"
+                    (len(set_ids), len(metrics.values())), dtype=torch.float32, device=device
                 )
 
-            metric_values[set_id] += torch.stack([torch.as_tensor(metrics[k], device='cuda') if not isinstance(metrics[k], torch.Tensor) else metrics[k] for k in metric_keys])
+            metric_values[set_id] += torch.stack([torch.as_tensor(metrics[k], device=device) if not isinstance(metrics[k], torch.Tensor) else metrics[k] for k in metric_keys])
 
             del metrics
 
@@ -1746,15 +1381,18 @@ def launch(hydra_config: DictConfig):
     WORLD_SIZE = 1
     CPU_PROCESS_GROUP = None
 
+    CPU_PROCESS_GROUP = None
+
     # Initialize distributed training if in distributed environment (e.g. torchrun)
     if "LOCAL_RANK" in os.environ:
         # Initialize distributed, default device and dtype
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
 
         RANK = dist.get_rank()
         WORLD_SIZE = dist.get_world_size()
 
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         
         # CPU GLOO process group
         CPU_PROCESS_GROUP = dist.new_group(backend="gloo")
@@ -1780,8 +1418,8 @@ def launch(hydra_config: DictConfig):
     if RANK == 0:
         signal.signal(signal.SIGINT, shutdown_signal_handler)
         print("\n" + "="*70)
-        print("  📌 Graceful shutdown enabled")
-        print("  💡 Press Ctrl+C to stop training and save checkpoint")
+        print("  INFO: Graceful shutdown enabled")
+        print("  TIP: Press Ctrl+C to stop training and save checkpoint")
         print("="*70 + "\n")
 
     # Auto-resume: Check if checkpoint exists and auto-load if not specified
@@ -1797,8 +1435,8 @@ def launch(hydra_config: DictConfig):
         if os.path.exists(checkpoint_file):
             if RANK == 0:
                 print(f"\n{'='*70}")
-                print(f"  🔄 AUTO-RESUME: Found existing checkpoint")
-                print(f"  📁 Loading from: {checkpoint_file}")
+                print(f"  AUTO-RESUME: Found existing checkpoint")
+                print(f"  Loading from: {checkpoint_file}")
                 print(f"{'='*70}\n")
             config.load_checkpoint = checkpoint_file
     
@@ -1822,7 +1460,7 @@ def launch(hydra_config: DictConfig):
                 checkpoint_dir = data_path.parent / 'stream_checkpoints'
                 if checkpoint_dir.exists():
                     manifest = get_training_manifest(checkpoint_dir)
-                    print(f"\n📦 Dataset Manifest:")
+                    print(f"\nDataset Manifest:")
                     print(f"   Available chunks: {len(manifest['available_chunks'])}")
                     print(f"   Chunks IDs: {manifest['available_chunks'][:10]}..." if len(manifest['available_chunks']) > 10 else f"   Chunk IDs: {manifest['available_chunks']}")
     
@@ -1840,7 +1478,7 @@ def launch(hydra_config: DictConfig):
         eval_loader,  eval_metadata  = load_datasets(config, rank=RANK, world_size=WORLD_SIZE, split="test")
     except Exception as e:
         if RANK == 0:
-            print(f"⚠️  No eval data found: {e}")
+            print(f"WARNING: No eval data found: {e}")
             print("   Training will continue without evaluation")
         eval_loader = eval_metadata = None
 
@@ -1848,7 +1486,7 @@ def launch(hydra_config: DictConfig):
         evaluators = create_evaluators(config, eval_metadata)
     except Exception as e:
         if RANK == 0:
-            print(f"⚠️  Failed to create evaluators: {e}")
+            print(f"WARNING: Failed to create evaluators: {e}")
             print("   Training will continue without custom evaluators")
         evaluators = []
 
@@ -1878,6 +1516,13 @@ def launch(hydra_config: DictConfig):
         ema_helper = EMAHelper(mu=config.ema_rate)
         ema_helper.register(train_state.original_model)  # Use unwrapped model for EMA
 
+    # Initialize Async Checkpoint Manager
+    checkpoint_manager = AsyncCheckpointManager(
+        checkpoint_dir=config.checkpoint_path,
+        max_keep=3,
+        use_safetensors=True
+    )
+
     # Training Loop
     # Calculate starting iteration from restored step (for auto-resume)
     steps_per_iter = train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size
@@ -1900,7 +1545,22 @@ def launch(hydra_config: DictConfig):
                     print("  💾 GRACEFUL SHUTDOWN IN PROGRESS")
                     print("="*70)
                     print(f"\n  Saving checkpoint at step {train_state.step}...")
-                    save_train_state(config, train_state, progress_tracker)
+                    print(f"\n  Saving checkpoint at step {train_state.step}...")
+                    if RANK == 0:
+                        checkpoint_manager.save_async(
+                            step=train_state.step,
+                            model=train_state.original_model,
+                            optimizer=train_state.optimizers,
+                            scaler=None,
+                            scheduler=None,
+                            extra_data={
+                                'carry': train_state.carry,
+                                'config_epochs': config.epochs,
+                                'total_steps': train_state.total_steps,
+                                'dataset': config.data_paths[0] if config.data_paths else 'unknown',
+                            }
+                        )
+                        checkpoint_manager.wait_for_completion()
                     print("\n✅ Training stopped successfully!")
                     print(f"   Final step: {train_state.step}/{train_state.total_steps}")
                     print(f"   Progress: {(train_state.step/train_state.total_steps)*100:.1f}%")
@@ -1911,6 +1571,7 @@ def launch(hydra_config: DictConfig):
                 if dist.is_initialized():
                     dist.destroy_process_group()
                 if RANK == 0:
+                    checkpoint_manager.shutdown()
                     wandb.finish()
                 return  # Exit gracefully
             
@@ -1926,7 +1587,7 @@ def launch(hydra_config: DictConfig):
                 # Periodic memory cleanup to prevent leaks
                 if RANK == 0 and train_state.step % 1000 == 0 and gradient_monitor is not None:
                     gradient_monitor.clear_old_data(keep_last_n=100)
-                    torch.cuda.empty_cache()
+                    gradient_monitor.clear_old_data(keep_last_n=100)
 
                 if RANK == 0 and metrics is not None:
                     wandb.log(metrics, step=train_state.step)
@@ -1961,7 +1622,19 @@ def launch(hydra_config: DictConfig):
                 if RANK == 0:
                     print("SAVE CHECKPOINT")
                 if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
-                    save_train_state(config, train_state_eval, progress_tracker)
+                    checkpoint_manager.save_async(
+                        step=train_state.step,
+                        model=train_state.original_model,
+                        optimizer=train_state.optimizers,
+                        scaler=None,
+                        scheduler=None,
+                        extra_data={
+                            'carry': train_state.carry,
+                            'config_epochs': config.epochs,
+                            'total_steps': train_state.total_steps,
+                            'dataset': config.data_paths[0] if config.data_paths else 'unknown',
+                        }
+                    )
 
                 if config.ema:
                     del train_state_eval
@@ -1969,15 +1642,15 @@ def launch(hydra_config: DictConfig):
     except KeyboardInterrupt:
         if RANK == 0:
             print("\n" + "="*70)
-            print("  🛑 TRAINING INTERRUPTED (Ctrl+C)")
+            print("  STOP: TRAINING INTERRUPTED (Ctrl+C)")
             print("="*70)
             
             # Calculate lost progress
             lost_steps = train_state.step - train_state.last_checkpoint_step
             progress_pct = (train_state.last_checkpoint_step / train_state.total_steps) * 100 if train_state.total_steps > 0 else 0
             
-            print("\n⚠️  NOT saving current state (may be unsafe during training)")
-            print("\n📍 Checkpoint Status:")
+            print("\nWARNING: NOT saving current state (may be unsafe during training)")
+            print("\nCheckpoint Status:")
             print(f"   Last safe checkpoint: Step {train_state.last_checkpoint_step:,}")
             print(f"   Current training step: Step {train_state.step:,}")
             print(f"   Lost progress: {lost_steps:,} steps")
@@ -1985,11 +1658,11 @@ def launch(hydra_config: DictConfig):
             
             if config.checkpoint_path and config.data_paths:
                 checkpoint_name = get_checkpoint_name(config.data_paths[0])
-                print(f"\n💾 Last checkpoint: {config.checkpoint_path}/{checkpoint_name}")
+                print(f"\nLast checkpoint: {config.checkpoint_path}/{checkpoint_name}")
             
-            print("\n💡 Resume training with the same command to continue from last checkpoint.")
+            print("\nINFO: Resume training with the same command to continue from last checkpoint.")
             print("\n" + "="*70)
-            print("  👋 Training stopped by user")
+            print("  Training stopped by user")
             print("="*70 + "\n")
         
         # Clean up

@@ -50,7 +50,7 @@ class CapsuleEncoder(nn.Module):
         
         # Always use hybrid encoder (pretrained + trainable + N2N)
         # No downsides - only benefits
-        print(f"\n🔧 Initializing CapsuleEncoder (HYBRID):")
+        print(f"\nInitializing CapsuleEncoder (HYBRID):")
         print(f"   Pretrained: {pretrained_model} (frozen)")
         print(f"   Trainable: Custom ViT")
         print(f"   Fusion: {fusion_type}")

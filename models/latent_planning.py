@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Optional
+from models.bitnet import BitLinear
 
 
 class LatentPlanningModule(nn.Module):
@@ -45,9 +46,9 @@ class LatentPlanningModule(nn.Module):
         # Path exploration: project hidden state to multiple paths
         self.path_projections = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(hidden_size, hidden_size),
+                BitLinear(hidden_size, hidden_size),
                 nn.GELU(),
-                nn.Linear(hidden_size, hidden_size)
+                BitLinear(hidden_size, hidden_size)
             ) for _ in range(num_paths)
         ])
         
@@ -66,14 +67,14 @@ class LatentPlanningModule(nn.Module):
         
         # Path scoring: estimate value of each reasoning path
         self.path_scorer = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
+            BitLinear(hidden_size, hidden_size // 2),
             nn.GELU(),
-            nn.Linear(hidden_size // 2, 1)
+            BitLinear(hidden_size // 2, 1)
         )
         
         # Path aggregation: combine selected paths
         self.aggregation = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
+            BitLinear(hidden_size, hidden_size),
             nn.GELU(),
             nn.LayerNorm(hidden_size)
         )
@@ -197,9 +198,9 @@ class AdaptiveLatentPlanning(nn.Module):
         # Adaptive gate: decides if planning is needed
         if use_adaptive_gate:
             self.complexity_gate = nn.Sequential(
-                nn.Linear(hidden_size, hidden_size // 4),
+                BitLinear(hidden_size, hidden_size // 4),
                 nn.GELU(),
-                nn.Linear(hidden_size // 4, 1),
+                BitLinear(hidden_size // 4, 1),
                 nn.Sigmoid()
             )
             print(f"   Adaptive gating: enabled")

@@ -7,6 +7,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from typing import Optional
+from models.bitnet import BitLinear
 
 
 class AssociativeMemoryBank(nn.Module):
@@ -28,9 +29,9 @@ class AssociativeMemoryBank(nn.Module):
         
         # Gating mechanism (learn when to use memory)
         self.gate = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 4),
+            BitLinear(hidden_size, hidden_size // 4),
             nn.ReLU(),
-            nn.Linear(hidden_size // 4, 1),
+            BitLinear(hidden_size // 4, 1),
             nn.Sigmoid()
         )
         
@@ -292,7 +293,7 @@ class SparseMemoryBank(nn.Module):
         )
         
         # Simple output projection
-        self.output_proj = nn.Linear(hidden_size, hidden_size)
+        self.output_proj = BitLinear(hidden_size, hidden_size)
         
     def _compute_hash(self, x: torch.Tensor) -> torch.Tensor:
         """

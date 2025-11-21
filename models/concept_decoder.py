@@ -93,6 +93,7 @@ class ConceptDecoder(nn.Module):
         control_symbols: torch.Tensor,
         expand_mask: torch.Tensor,
         tokenizer,
+        show_thoughts: bool = True,
     ) -> List[str]:
         """
         Decode concept sequence to text.
@@ -127,6 +128,12 @@ class ConceptDecoder(nn.Module):
                         # Remove space between tokens
                         if bpe_tokens and bpe_tokens[-1] == tokenizer.encode(' ')[0]:
                             bpe_tokens.pop()
+                    elif cid == self.num_concepts + 3:  # <THOUGHT>
+                        if show_thoughts:
+                            bpe_tokens.extend(tokenizer.encode("<THOUGHT>"))
+                    elif cid == self.num_concepts + 4:  # <END_THOUGHT>
+                        if show_thoughts:
+                            bpe_tokens.extend(tokenizer.encode("<END_THOUGHT>"))
                     continue
                 
                 # Semantic concept
@@ -223,6 +230,6 @@ class ConceptDecoder(nn.Module):
                         representative_text
                     )
         
-        print(f"   ✅ Built {len(self.expansion_table.expansions)} concept expansions")
+        print(f"   Built {len(self.expansion_table.expansions)} concept expansions")
         
         return self.expansion_table

@@ -5,16 +5,22 @@ Supports multimodal data: text, images, mazes, puzzles.
 
 import sys
 import json
+import numpy as np
+import torch
 from pathlib import Path
+from abc import ABC, abstractmethod
+from typing import Dict, List, Optional, Union, Any
+from pydantic import BaseModel
+from torch.utils.data import Dataset, DataLoader
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
+import gc
+
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from abc import ABC, abstractmethod
-from typing import Dict, List, Optional, Union, Any
-import numpy as np
-import torch
-from pydantic import BaseModel
 from dataset.common import PuzzleDatasetMetadata
+from dataset.image_cache import ImageCache
 
 
 class ModalityType:
@@ -50,6 +56,45 @@ class DataSample(BaseModel):
         arbitrary_types_allowed = True
 
 
+def collate_images(batch):
+    """Convert batch of numpy images [H,W,C] to tensor [B,C,H,W]."""
+    batch_array = np.stack(batch, axis=0)  # [B, H, W, C]
+    batch_tensor = torch.from_numpy(batch_array).permute(0, 3, 1, 2)  # [B, C, H, W]
+    return batch_tensor.float() / 255.0  # Normalize to [0, 1]
+
+
+class SampleDataset(Dataset):
+    """Custom Dataset with cache support."""
+    def __init__(self, samples, image_converter, cache):
+        self.samples = samples
+        self.image_converter = image_converter
+        self.cache = cache
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        
+        # Handle both dict and Pydantic DataSample objects
+        if hasattr(sample, 'text'):
+            text = sample.text
+        elif hasattr(sample, 'question'):
+            text = sample.question
+        elif isinstance(sample, dict):
+            text = sample.get('text', '') or sample.get('question', '') or str(sample)
+        else:
+            text = str(sample)
+        
+        # Try cache first (instant)
+        cached_img = self.cache.get(text, 224, 224)
+        if cached_img is not None:
+            return cached_img
+        
+        # Fallback to rendering (shouldn't happen after pre-population)
+        return self.image_converter(sample)
+
+
 class BaseDatasetBuilder(ABC):
     """
     Abstract base class for vision-unified dataset builders.
@@ -68,6 +113,7 @@ class BaseDatasetBuilder(ABC):
         self.config = config
         self.encoder = None
         self.samples: List[DataSample] = []
+        self.text_renderer = None
     
     @abstractmethod
     def load_raw_data(self) -> List[DataSample]:
@@ -87,78 +133,72 @@ class BaseDatasetBuilder(ABC):
         return [sample]  # No augmentation by default
     
     def build_dataset(self) -> Dict[str, Any]:
-        """Streaming pipeline: Generator → Batch encode → Save shards (constant memory)."""
-        print("\n🔨 Building dataset (streaming mode - zero accumulation)...")
+        """
+        Unified Streaming Pipeline:
+        Generator -> Producer (Cache) -> Queue -> Consumer (Encode) -> Safetensors
         
-        # Get generator (not list!)
-        print("📥 Streaming raw data...")
-        sample_generator = self.load_raw_data()
+        Uses StreamingCacheEncoder to overlap CPU rendering with GPU encoding.
+        """
+        print("\nBuilding dataset (Unified Streaming Pipeline)...")
         
-        # Process in batches and save to disk progressively
-        print("⚙️  Processing in batches (constant memory)...")
+        # Imports
+        from dataset.streaming_builder import StreamingCacheEncoder
+        from models.text_renderer import TextRenderer
         
+        # 1. Setup Components
         output_dir = Path(self.config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        batch_size = 256  # Process 256 samples at a time
-        shard_files = []
-        batch_buffer = []
-        total_processed = 0
-        shard_idx = 0
+        # Cache
+        cache_dir = output_dir / "cache"
+        cache = ImageCache(str(cache_dir))
         
-        # Consume generator in batches
-        for sample in sample_generator:
-            batch_buffer.append(sample)
+        # Renderer
+        renderer = TextRenderer(
+            font_family=getattr(self.config, 'font_path', "arial.ttf"),
+            width=224,
+            height=224
+        )
+        
+        # Encoder
+        self._init_encoder()
+        
+        # Streaming Builder
+        streamer = StreamingCacheEncoder(
+            cache=cache,
+            encoder=self.encoder,
+            device=next(self.encoder.parameters()).device,
+            batch_size=getattr(self.config, 'batch_size', 256),
+            checkpoint_dir=str(output_dir / "checkpoints"),
+            drive_dir=getattr(self.config, 'drive_dir', None)
+        )
+        
+        # 2. Start Streaming Build
+        print("Streaming raw data...")
+        sample_generator = self.load_raw_data()
+        
+        try:
+            streamer.stream_build(sample_generator, renderer)
+        except KeyboardInterrupt:
+            print("\nSTOPPED: Build interrupted by user.")
+            return {}
+        except Exception as e:
+            print(f"\nFAILED: Build failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return {}
             
-            # When batch is full, save to disk
-            if len(batch_buffer) >= batch_size:
-                shard_file = output_dir / f"shard_{shard_idx:05d}.pt"
-                torch.save({
-                    'samples': batch_buffer,
-                    'count': len(batch_buffer)
-                }, shard_file)
-                
-                shard_files.append(str(shard_file))
-                total_processed += len(batch_buffer)
-                
-                if shard_idx % 10 == 0:  # Progress every 10 shards
-                    print(f"   💾 Saved {total_processed:,} samples ({shard_idx+1} shards)")
-                
-                # Clear batch (free memory)
-                batch_buffer = []
-                shard_idx += 1
+        # 3. Finalize
+        # (Consolidation is handled by streamer)
         
-        # Save remaining samples
-        if batch_buffer:
-            shard_file = output_dir / f"shard_{shard_idx:05d}.pt"
-            torch.save({
-                'samples': batch_buffer,
-                'count': len(batch_buffer)
-            }, shard_file)
-            shard_files.append(str(shard_file))
-            total_processed += len(batch_buffer)
-        
-        print(f"\n✅ Streaming complete: {total_processed:,} samples in {len(shard_files)} shards")
-        print(f"   Memory usage: Constant (~2KB buffer)")
-        print(f"   Shards saved to: {output_dir}")
-        
-        # Save shard index for training
-        index_file = output_dir / "shard_index.json"
-        import json
-        with open(index_file, 'w') as f:
-            json.dump({
-                'shard_files': shard_files,
-                'total_samples': total_processed,
-                'batch_size': batch_size,
-                'num_shards': len(shard_files)
-            }, f, indent=2)
-        
+        # Generate metadata
         result = {
-            'shard_files': shard_files,
+            'output_dir': str(output_dir),
+            'checkpoints_dir': str(output_dir / "checkpoints"),
             'metadata': {
-                'num_samples': total_processed,
-                'num_shards': len(shard_files),
-                'streaming_mode': True
+                'streaming_mode': True,
+                'unified_pipeline': True,
+                'format': 'safetensors'
             }
         }
         
@@ -194,296 +234,7 @@ class BaseDatasetBuilder(ABC):
             self.encoder.eval()
             self.encoder.to('cuda' if torch.cuda.is_available() else 'cpu')
     
-    def _stream_encode_capsules(self, samples: List[DataSample]):
-        """Fast encoding with disk-cached text images (streaming mode available)."""
-        if len(samples) == 0:
-            return {'sketches': torch.empty(0, getattr(self.config, 'target_capsules', 12), getattr(self.config, 'hidden_size', 768))}
-        
-        # Initialize encoder once
-        self._init_encoder()
-        device = next(self.encoder.parameters()).device
-        
-        from torch.utils.data import Dataset, DataLoader
-        from tqdm import tqdm
-        import gc
-        import os
-        
-        # Initialize image cache (on Drive so it syncs to local 2TB SSD)
-        from dataset.image_cache import ImageCache
-        from pathlib import Path
-        import os
-        
-        # Use Drive path if available, otherwise local
-        if os.path.exists("/content/drive/MyDrive"):
-            cache_dir = "/content/drive/MyDrive/model_checkpoints/text_cache"
-            print(f"💾 Using Drive for text cache (will sync to 2TB SSD)")
-            print(f"   Cache: {cache_dir}")
-        else:
-            cache_dir = str(Path(self.config.output_dir) / "text_cache")
-            print(f"⚠️  Drive not mounted, using local cache (session-only)")
-        
-        cache = ImageCache(cache_dir=cache_dir)
-        
-        # Check if we should use streaming mode
-        use_streaming = getattr(self.config, 'streaming_mode', True)  # Default ON
-        
-        print("🗂️  Checking image cache...")
-        
-        # Sample across entire dataset to check cache status (not just first 1000)
-        import random
-        sample_size = min(1000, len(samples))
-        sample_indices = random.sample(range(len(samples)), sample_size)
-        existing_cached = sum(1 for idx in sample_indices if self._sample_is_cached(samples[idx], cache))
-        cache_hit_rate = existing_cached / sample_size
-        
-        print(f"📊 Cache status: {cache_hit_rate*100:.0f}% ({existing_cached}/{sample_size} samples)")
-        
-        # Always use streaming for first run to utilize GPU immediately
-        if use_streaming and cache_hit_rate < 0.95:
-            print(f"🌊 Using STREAMING mode (cache incomplete)")
-            print(f"   Strategy: CPU renders + GPU encodes simultaneously")
-            if cache_hit_rate * 100 < 5:
-                print(f"   GPU starts immediately (no cache found)")
-            else:
-                print(f"   GPU starts after 50k samples cached")
-            
-            if not getattr(self.config, 'drive_dir', None):
-                print(f"⚠️  Drive not mounted, progress won't be saved to Drive")
-            
-            from dataset.streaming_builder import StreamingCacheEncoder
-            device = next(self.encoder.parameters()).device
-            encoder = StreamingCacheEncoder(
-                cache=cache,
-                encoder=self.encoder,
-                device=device,
-                batch_size=256,
-                checkpoint_dir=str(Path(self.config.output_dir) / "stream_checkpoints"),
-                drive_dir=getattr(self.config, 'drive_dir', None)
-            )
-            result = encoder.stream_build(samples, self.text_renderer, initial_cache_percent=cache_hit_rate * 100)
-            
-            # Drive path for progress saves (if available)
-            drive_dir = "/content/drive/MyDrive/model_checkpoints/encoding_progress"
-            if os.path.exists("/content/drive/MyDrive"):
-                Path(drive_dir).mkdir(parents=True, exist_ok=True)
-            else:
-                drive_dir = None
-                print("⚠️  Drive not mounted, progress won't be saved to Drive")
-            
-            streamer = StreamingCacheEncoder(cache, self.encoder, device, batch_size=256, 
-                                            checkpoint_dir=checkpoint_dir, drive_dir=drive_dir)
-            return streamer.stream_build(samples, self.text_renderer, start_threshold=50000)
-        else:
-            print(f"💾 Using STANDARD mode (cache complete)")
-            cached_count, rendered_count = cache.populate_cache(samples, self.text_renderer)
-        
-            if rendered_count > 0:
-                print(f"✅ Rendered {rendered_count} new images (one-time cost)")
-            print(f"✅ Using {cached_count + rendered_count} cached images (10x faster than re-rendering)")
-        
-        # Force garbage collection before starting
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # Custom collate function to handle numpy arrays -> PyTorch tensors (CHW format)
-        def collate_images(batch):
-            """Convert batch of numpy images [H,W,C] to tensor [B,C,H,W]."""
-            batch_array = np.stack(batch, axis=0)  # [B, H, W, C]
-            batch_tensor = torch.from_numpy(batch_array).permute(0, 3, 1, 2)  # [B, C, H, W]
-            return batch_tensor.float() / 255.0  # Normalize to [0, 1]
-        
-        # Custom Dataset with cache support
-        class SampleDataset(Dataset):
-            def __init__(self, samples, image_converter, cache):
-                self.samples = samples
-                self.image_converter = image_converter
-                self.cache = cache
-            
-            def __len__(self):
-                return len(self.samples)
-            
-            def __getitem__(self, idx):
-                sample = self.samples[idx]
-                
-                # Handle both dict and Pydantic DataSample objects
-                if hasattr(sample, 'text'):
-                    text = sample.text
-                elif hasattr(sample, 'question'):
-                    text = sample.question
-                elif isinstance(sample, dict):
-                    text = sample.get('text', '') or sample.get('question', '') or str(sample)
-                else:
-                    text = str(sample)
-                
-                # Try cache first (instant)
-                cached_img = self.cache.get(text, 224, 224)
-                if cached_img is not None:
-                    return cached_img
-                
-                # Fallback to rendering (shouldn't happen after pre-population)
-                return self.image_converter(sample)
-        
-        # Create dataset and dataloader with cache
-        dataset = SampleDataset(samples, self._sample_to_image, cache)
-        
-        # OPTIMIZED: Parallel disk I/O with workers (safe with cached .npy files)
-        # - Workers now just load .npy files (fast, no memory leak)
-        # - Prefetching overlaps disk I/O with GPU encoding
-        # - Larger batch maxes out GPU
-        batch_size = 144  # Max VRAM (model 5GB + batch 9GB + buffer 1GB = 15GB)
-        num_workers = 4  # Parallel disk I/O (4 workers prefetch while GPU encodes)
-        
-        dataloader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            collate_fn=collate_images,
-            pin_memory=True,  # Fast CPU->GPU transfer
-            prefetch_factor=3,  # Each worker prefetches 3 batches (12 total ready)
-            persistent_workers=True  # Keep workers alive between epochs
-        )
-        
-        print(f"🚀 OPTIMIZED Pipeline (parallel disk I/O):")
-        print(f"   Batch size: {batch_size} | Workers: {num_workers} | Prefetch: 3")
-        print(f"   Strategy: 4 workers prefetch .npy files while GPU encodes")
-        print(f"   Disk I/O: Fully parallelized (no GPU idle time)")
-        print(f"   Memory: Consolidate every 400 batches (~1 min)")
-        print(f"   Checkpoints: Every 2000 batches (~5 min)")
-        print(f"   Speed: ~10 batches/sec (0.1s/batch, 144 samples/batch = ~1440 samples/sec)")
-        print(f"   Total ETA: ~22 minutes for 1.9M samples! (1 session)")
-        
-        # Storage for results
-        result_chunks = {'sketches': [], 'checksums': [], 'children': []}
-        temp_gpu_list = {'sketches': [], 'checksums': [], 'children': []}
-        
-        consolidate_every = 400  # Consolidate every 400 batches (~40 sec, less overhead)
-        checkpoint_every = 2000  # Checkpoint every 2000 batches (~3min at 0.1s/batch)
-        batch_count = 0
-        
-        # Memory management: track and limit result_chunks size
-        max_cpu_chunks = 3  # Keep max 3 chunks in CPU RAM before saving intermediate
-        
-        # Check for existing checkpoint to resume
-        from pathlib import Path
-        checkpoint_path = Path(self.config.output_dir) / "encoding_checkpoint.pt"
-        start_batch = 0
-        
-        if checkpoint_path.exists():
-            print(f"📂 Found checkpoint, attempting resume...")
-            try:
-                checkpoint = torch.load(checkpoint_path, map_location='cpu')
-                result_chunks = checkpoint['result_chunks']
-                start_batch = checkpoint['batch_count']
-                total_batches = len(dataloader)
-                print(f"✅ Resumed from batch {start_batch}/{total_batches} ({start_batch*batch_size}/{len(samples)} samples)")
-            except Exception as e:
-                print(f"⚠️  Checkpoint load failed: {e}, starting fresh")
-        
-        # Hybrid CPU/GPU processing
-        with torch.no_grad():
-            for batch_idx, batch_images in enumerate(tqdm(dataloader, desc="Encoding", initial=start_batch)):
-                # Skip already processed batches
-                if batch_idx < start_batch:
-                    continue
-                
-                # Move batch to GPU (workers already rendered on CPU)
-                batch_images = batch_images.to(device, non_blocking=True)
-                
-                # Encode on GPU
-                batch_result = self.encoder(images=batch_images, return_children=True)
-                
-                # Accumulate on GPU
-                for key in temp_gpu_list:
-                    if key in batch_result and batch_result[key] is not None:
-                        temp_gpu_list[key].append(batch_result[key])
-                
-                del batch_images, batch_result
-                batch_count += 1
-                
-                # Periodic light cleanup (every 100 batches, less overhead)
-                if batch_idx % 100 == 0:
-                    gc.collect()
-                
-                # Periodic consolidation (GPU -> CPU to free VRAM)
-                if batch_count >= consolidate_every:
-                    # Consolidate GPU tensors to CPU
-                    for key in temp_gpu_list:
-                        if temp_gpu_list[key]:
-                            consolidated = torch.cat(temp_gpu_list[key], dim=0)
-                            result_chunks[key].append(consolidated.half().cpu())
-                            temp_gpu_list[key].clear()
-                            del consolidated  # Explicit cleanup
-                    
-                    batch_count = 0
-                    
-                    # Aggressive memory cleanup
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    
-                    # If CPU RAM chunks getting too large, consolidate them too
-                    for key in result_chunks:
-                        if len(result_chunks[key]) > max_cpu_chunks:
-                            # Merge CPU chunks to free fragmented memory
-                            merged = torch.cat(result_chunks[key], dim=0)
-                            result_chunks[key] = [merged]
-                            gc.collect()
-                    
-                    # Save checkpoint
-                    if batch_idx > 0 and batch_idx % checkpoint_every == 0:
-                        # Force memory cleanup before checkpoint
-                        gc.collect()
-                        
-                        print(f"\n💾 Checkpoint at batch {batch_idx}/{len(dataloader)}...")
-                        torch.save({
-                            'result_chunks': result_chunks,
-                            'batch_count': batch_idx,
-                            'total_batches': len(dataloader)
-                        }, checkpoint_path)
-                        print(f"✅ Saved")
-                        
-                        # Sync to Drive
-                        try:
-                            import sys
-                            if 'google.colab' in sys.modules:
-                                drive_dir = Path("/content/drive/MyDrive/model-dqn-snn")
-                                if drive_dir.exists():
-                                    import shutil
-                                    shutil.copy2(checkpoint_path, drive_dir / checkpoint_path.name)
-                                    print(f"☁️  Synced to Drive")
-                        except:
-                            pass
-                        
-                        # Aggressive cleanup after checkpoint
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-        
-        # Final consolidation of remaining batches
-        for key in temp_gpu_list:
-            if temp_gpu_list[key]:
-                consolidated = torch.cat(temp_gpu_list[key], dim=0)
-                result_chunks[key].append(consolidated.half().cpu())
-                del consolidated
-        
-        del temp_gpu_list
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # Final concatenation on CPU (all chunks already in fp16)
-        result = {}
-        for key, chunk_list in result_chunks.items():
-            if chunk_list:
-                result[key] = torch.cat(chunk_list, dim=0)  # Concatenate fp16 chunks
-            else:
-                result[key] = torch.empty(0)
-        
-        del result_chunks
-        
-        return result
+
     
     def encode_to_capsules(self, samples: List[DataSample]) -> Dict[str, torch.Tensor]:
         """
@@ -496,9 +247,6 @@ class BaseDatasetBuilder(ABC):
         # Process in chunks to prevent RAM accumulation from text list
         batch_size = 4
         chunk_size = 500  # Consolidate every 500 samples
-        
-        from tqdm import tqdm
-        import gc
         
         # Initialize result tensors
         result_chunks = {'sketches': [], 'checksums': [], 'children': []}
@@ -555,7 +303,7 @@ class BaseDatasetBuilder(ABC):
     def _sample_to_image(self, sample: DataSample):
         """Convert any sample type to numpy array image for vision-unified encoder."""
         # Import TextRenderer lazily
-        if not hasattr(self, 'text_renderer'):
+        if self.text_renderer is None:
             from models.text_renderer import TextRenderer
             self.text_renderer = TextRenderer(
                 width=getattr(self.config, 'text_image_width', 224),
@@ -583,8 +331,6 @@ class BaseDatasetBuilder(ABC):
         
         # Fallback: blank image as numpy array
         return np.ones((224, 224, 3), dtype=np.uint8) * 255
-    
-    # Legacy token encoding removed - vision-unified only uses capsules
     
     def _grid_to_text(self, grid: np.ndarray) -> str:
         """Convert 2D grid to text representation."""
@@ -624,12 +370,9 @@ class BaseDatasetBuilder(ABC):
             total_puzzles=total_samples,
             sets=["all"]
         )
-
-# ... (rest of the code remains the same)
+    
+    def save_dataset(self, dataset: Dict, output_dir: str):
         """Save dataset to disk with parallel I/O."""
-        import os
-        from concurrent.futures import ThreadPoolExecutor
-        
         os.makedirs(output_dir, exist_ok=True)
         print(f"\n💾 Saving dataset to: {output_dir}")
         
@@ -689,11 +432,11 @@ class BaseDatasetBuilder(ABC):
             if test_error:
                 raise RuntimeError(f"Failed to save {test_name}: {test_error}")
         
-        print(f"✅ Saved {train_name} (float16 compressed): {train_saved}")
-        print(f"✅ Saved {test_name} (float16 compressed): {test_saved}")
+        print(f"Saved {train_name} (float16 compressed): {train_saved}")
+        print(f"Saved {test_name} (float16 compressed): {test_saved}")
         
         # Save metadata
         metadata_path = os.path.join(output_dir, 'dataset.json')
         with open(metadata_path, 'w') as f:
             json.dump(dataset.get('metadata', {}).__dict__ if hasattr(dataset.get('metadata'), '__dict__') else dataset.get('metadata', {}), f, indent=2)
-        print(f"✅ Saved metadata: {metadata_path}")
+        print(f"Saved metadata: {metadata_path}")
