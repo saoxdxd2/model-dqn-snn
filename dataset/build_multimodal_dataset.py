@@ -101,7 +101,7 @@ class MultimodalDatasetConfig(BaseModel):
     # Re-ARC infinite synthetic data (Winner Strategy)
     use_rearc_infinite: bool = True  # Infinite synthetic ARC tasks
     rearc_path: str = "dataset/re-arc"  # Path to re-arc repo
-    rearc_examples_per_task: int = 5  # Generate 5 examples per task (Fast mode for Colab)
+    rearc_examples_per_task: int = 10  # Generate 10 examples per task (Fast mode for Colab)
     
     # Problem Augmentation (Winner Strategy - Creates 10-20x more tasks)
     enable_problem_augmentation: bool = True  # Transform inputs/outputs separately
@@ -1414,7 +1414,7 @@ def build(config: MultimodalDatasetConfig):
     # in _check_resume_state() that will skip already-encoded samples
     if os.path.exists(checkpoint_dir):
         batch_files = list(Path(checkpoint_dir).glob('batch_*.pt'))
-        consolidated_files = list(Path(checkpoint_dir).glob('consolidated_*.pt'))
+        consolidated_files = list(Path(checkpoint_dir).glob('consolidated_*.pt')) + list(Path(checkpoint_dir).glob('consolidated_*.safetensors'))
         
         if batch_files or consolidated_files:
             print(f"\nFound existing progress: {len(batch_files)} batches + {len(consolidated_files)} chunks")
