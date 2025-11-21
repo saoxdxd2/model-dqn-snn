@@ -357,11 +357,17 @@ def load_datasets(config: PretrainConfig, rank: int, world_size: int, split: str
     epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
     
     try:
-        dataset = DistributedMMapDataset(dataset_paths, config.tokenizer_path, config.context_length, epochs=epochs_per_iter, sampler_config=SamplerConfig(
+        # Use PuzzleDataset for standard/token-based mode
+        puzzle_config = PuzzleDatasetConfig(
+            seed=42,
+            dataset_paths=dataset_paths,
+            global_batch_size=config.global_batch_size,
+            test_set_mode=(split != 'train'),
+            epochs_per_iter=epochs_per_iter,
             rank=rank,
-            num_replicas=world_size,
-            **kwargs
-        ), split=split)
+            num_replicas=world_size
+        )
+        dataset = PuzzleDataset(puzzle_config, split=split)
         
         # Check for empty dataset to trigger auto-build
         if dataset.metadata.total_puzzles == 0:
